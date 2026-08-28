@@ -249,8 +249,24 @@ beyond det/svd; memory pressure — 14.2 GiB peak of 64, flat, dying on the *fir
 installs process-global monkey-patches on `torch.linalg` and `F.linear`.
 
 So PLD2 does not try to prevent the crash; it makes it cheap. The trainer only ever writes FASTA.
-`src/fold_fasta.py` runs in its own single-rank process, fsyncs every scored sequence, and skips ids
-already present on restart — a crash 60 into 100 costs 40, not 100.
+`src/fold_fasta.py` runs in its own process, fsyncs every scored sequence, and skips work already
+done on restart — a crash 60 into 100 costs 40, not 100.
+
+It runs on **all 12 tiles of the fold node with no process group**. The distinction matters: what
+faulted was oneCCL's node-local Level-Zero IPC peer mappings, not rank count — 12 ranks *with* a
+process group died 3 for 3 in the IPC address range, while 1 rank (which returns before
+`init_process_group`) folded cleanly. `dist.init_distributed(no_dist=True)` reads the MPI topology
+and pins each tile without ever initialising oneCCL. Ranks need no collective: they partition by a
+stable CRC32 of each sequence id — *not* a stride over the todo list, which shifts under them in
+`--watch` mode as any rank writes — and each appends to its own `<out>.rankNNN.jsonl`, since
+concurrent appends to one file on Lustre can interleave mid-line. This is reasoned but not yet proven
+at 12 ranks; `FOLD_RANKS_PER_NODE=1` is the fallback with direct evidence behind it.
+
+**Resume is keyed on (id, sequence), not id.** An id is `<file stem>|<fasta header>` — pure position.
+Regenerating `natural.fasta` with entirely different sequences reuses `natural|natural_0…199`, so an
+id-only key silently reported "400 already scored | 0 to do" for two files whose contents had
+completely changed. The summary also keeps the newest record per id, so stale rows heal themselves
+rather than needing the JSONL deleted.
 
 ## Deviations from ProLoopDiff beyond the eight instructions
 

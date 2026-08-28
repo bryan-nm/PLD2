@@ -25,21 +25,43 @@ The summary groups by step (all ranks of one step are one row) and reports the l
 repetition statistic next to pLDDT/pTM -- the two numbers that together say whether the model is
 producing foldable, non-degenerate sequences.
 
+MULTI-RANK. Folding is one sequence at a time, so per-rank parallelism is the only parallelism
+available, and a whole eval node was running on one of its twelve tiles. This now runs N independent
+processes, each pinned to its own tile, splitting `todo` by a deterministic stride. It NEVER calls
+init_process_group -- dist.init_distributed(no_dist=True) reads the MPI topology and pins the device
+but stops short of oneCCL -- because oneCCL's node-local Level-Zero IPC peer mappings are what made
+multi-rank folding fault on Aurora (12 ranks WITH a process group died 3 for 3, always reading an
+unmapped page in the 0xff03ffff... IPC range, while 1 rank with no process group folded cleanly).
+Each rank appends to its OWN <out>.rankNNN.jsonl rather than sharing one file: concurrent appends to
+a single file on Lustre can interleave mid-line, and per-rank files cost nothing since every reader
+here already globs.
+
+THE RESUME KEY IS (id, sequence), NOT id. An id is "<file stem>|<fasta header>", which is derived
+entirely from POSITION -- so regenerating natural.fasta with completely different sequences produces
+the identical ids natural|natural_0 .. natural|natural_199, and the stale records silently suppress
+every one of the new ones. Observed exactly that after the holdout fix changed which sequences the
+baselines draw: "400 already scored | 0 to do" for a pair of files whose contents had entirely
+changed. Keying on content as well means a re-scored id is re-folded, while an unchanged rerun still
+skips instantly.
+
     python -m src.fold_fasta --watch                     # follow a training run
-    python -m src.fold_fasta --device xpu samples/*.fasta --out folds.jsonl
+    mpiexec -n 12 -ppn 12 python -m src.fold_fasta --watch --device xpu
     python -m src.fold_fasta --summarize --out folds.jsonl        # no GPU needed
 """
 from __future__ import annotations
 import argparse
-import glob as _glob
+import glob as glob_
 import json
+import zlib
 import os
 import re
+import sys
 import time
 
 import torch
 
 from config import CFG, ESMFOLD_WEIGHTS, FOLDS_JSONL, SAMPLES_DIR
+from .dist import init_distributed
 from .metrics import kmer_counts, kmer_fractions, lcr_counts
 from . import xpu_linalg_guard
 
@@ -81,41 +103,62 @@ def read_fasta(path):
     return out
 
 
-def done_ids(out_path):
-    """Ids already scored. Tolerates a truncated final line -- a crash mid-write leaves one."""
-    ids = set()
-    if not os.path.exists(out_path):
-        return ids
-    with open(out_path) as f:
-        for line in f:
-            try:
-                ids.add(json.loads(line)["id"])
-            except Exception:
-                continue
-    return ids
+def result_paths(base):
+    """Every results file for `base`, legacy single file first then per-rank shards in rank order.
+
+    The ordering matters for summarize(): it keeps the LAST record seen for an id, so a re-scored
+    sequence supersedes the stale one it replaced.
+    """
+    stem = base[:-6] if base.endswith(".jsonl") else base
+    return ([base] if os.path.exists(base) else []) + sorted(glob_.glob(stem + ".rank*.jsonl"))
 
 
-def summarize(out_path, ocfg):
+def rank_path(base, rank):
+    stem = base[:-6] if base.endswith(".jsonl") else base
+    return f"{stem}.rank{rank:03d}.jsonl"
+
+
+def read_records(base):
+    """All scored records across every results file, in `result_paths` order. Tolerates a truncated
+    final line -- a GPU fault aborts the process mid-write and leaves one."""
     recs = []
-    if os.path.exists(out_path):
-        with open(out_path) as f:
+    for path in result_paths(base):
+        with open(path) as f:
             for line in f:
                 try:
                     recs.append(json.loads(line))
                 except Exception:
                     continue
+    return recs
+
+
+def done_pairs(base):
+    """{(id, sequence)} already scored -- keyed on CONTENT as well as id. See the module docstring:
+    ids come from file position, so a regenerated FASTA reuses them for entirely different
+    sequences, and an id-only key would skip work that has never actually been done."""
+    return {(r["id"], r.get("seq", "")) for r in read_records(base) if "id" in r}
+
+
+def summarize(out_path, ocfg):
+    recs = read_records(out_path)
     if not recs:
-        print(f"[fold] {out_path}: nothing scored yet")
+        print(f"[fold] {out_path}: nothing scored yet", flush=True)
         return
-    groups = {}
+    # LAST record per id wins. Two things produce duplicate ids and both want the newest: a
+    # regenerated FASTA reusing position-derived ids for new sequences, and two ranks briefly
+    # disagreeing about the file list in --watch mode and folding the same entry.
+    by_id = {}
     for r in recs:
+        by_id[r["id"]] = r
+    groups = {}
+    for r in by_id.values():
         groups.setdefault(r["id"].split("|", 1)[0], []).append(r)
 
     ks = list(ocfg.kmer_ks)
     kh = "".join(f"{'k' + str(k):>8}" for k in ks)
     print(f"\n{'source':<26} {'n':>5} {'pLDDT':>7} {'>70':>6} {'pTM':>7} {'>.5':>6} "
-          f"{'LCR':>6} {'len':>6}{kh}   <- kmer rep_frac")
-    print("-" * (76 + 8 * len(ks)))
+          f"{'LCR':>6} {'len':>6}{kh}   <- kmer rep_frac", flush=True)
+    print("-" * (76 + 8 * len(ks)), flush=True)
     for name in sorted(groups):
         g = groups[name]
         n = len(g)
@@ -127,31 +170,54 @@ def summarize(out_path, ocfg):
               f"{sum(1 for r in g if r['plddt'] > ocfg.plddt_confident) / n:>5.0%} "
               f"{sum(r['ptm'] for r in g) / n:>7.3f} "
               f"{sum(1 for r in g if r['ptm'] > ocfg.ptm_confident) / n:>5.0%} "
-              f"{lcr / max(tot, 1):>5.1%} {sum(r['length'] for r in g) / n:>6.1f} {row}")
-    print("-" * (76 + 8 * len(ks)))
+              f"{lcr / max(tot, 1):>5.1%} {sum(r['length'] for r in g) / n:>6.1f} {row}",
+              flush=True)
+    print("-" * (76 + 8 * len(ks)), flush=True)
     print("Read every step row against the 'natural' and 'shuffled' rows (src.make_baselines): "
           "natural is the ceiling, shuffled the composition-matched floor. A step whose pLDDT sits "
-          "at or below shuffled has learned composition and not structure.")
+          "at or below shuffled has learned composition and not structure.", flush=True)
+
+
+def owns(sid: str, rank: int, world: int) -> bool:
+    """Does this rank own this sequence? A stable hash of the id, NOT a stride over the todo list.
+
+    Position-based striding looks equivalent and is not. In --watch mode each rank re-collects on its
+    own poll, and the list shrinks as ANY rank writes records, so two ranks polling seconds apart
+    partition different lists: `todo[rank::world]` then maps to different items, which both
+    duplicates work and leaves items owned by nobody that round. Hashing the id makes ownership a
+    property of the sequence alone -- stable no matter what else is in the list, or when.
+
+    zlib.crc32, not hash(): Python randomises str hashing per process unless PYTHONHASHSEED is set,
+    so hash() would give every rank a different partition of the same ids.
+    """
+    return world <= 1 or zlib.crc32(sid.encode()) % world == rank
 
 
 def collect(paths, out_path, lo, hi, limit=0):
-    """-> (todo, n_already, n_out_of_range) for the given FASTA paths."""
-    todo, skipped = [], 0
-    already = done_ids(out_path)
+    """-> (todo, n_already, n_out_of_range, n_superseded) for the given FASTA paths.
+
+    `todo` is in a deterministic order (sorted paths, then file order), but ranks partition it by
+    `owns()` rather than by position -- see there.
+    """
+    todo, skipped, superseded = [], 0, 0
+    already = done_pairs(out_path)
+    done_id_only = {i for i, _ in already}
     for p in paths:
         for sid, seq in read_fasta(p):
-            if sid in already:
+            if (sid, seq) in already:
                 continue
             if len(seq) < lo or len(seq) > hi:
                 skipped += 1
                 continue
+            if sid in done_id_only:
+                superseded += 1        # same id, different sequence: the FASTA was regenerated
             todo.append((sid, seq))
     if limit:
         todo = todo[:limit]
-    return todo, len(already), skipped
+    return todo, len(already), skipped, superseded
 
 
-def fold_all(todo, scorer, out_path, ocfg, t0):
+def fold_all(todo, scorer, out_path, ocfg, t0, tag=""):
     n_ok = 0
     with open(out_path, "a") as fh:
         for i, (sid, seq) in enumerate(todo):
@@ -165,7 +231,8 @@ def fold_all(todo, scorer, out_path, ocfg, t0):
             os.fsync(fh.fileno())
             n_ok += 1
             if (i + 1) % 25 == 0:
-                print(f"[fold] {i + 1}/{len(todo)} ({time.perf_counter() - t0:.0f}s)", flush=True)
+                print(f"[fold]{tag} {i + 1}/{len(todo)} ({time.perf_counter() - t0:.0f}s)",
+                      flush=True)
     return n_ok
 
 
@@ -190,6 +257,12 @@ def main():
     ap.add_argument("--no-ipex", action="store_true")
     args = ap.parse_args()
 
+    # Line-buffer stdout. Under PBS the job's output is a FILE, so Python block-buffers it, and
+    # every print without flush=True sits in a 8KB buffer until something else fills it. The
+    # progress lines passed flush=True and appeared promptly; the summary TABLE did not, so a
+    # finished fold round looked like it had produced nothing. One line fixes the whole module.
+    sys.stdout.reconfigure(line_buffering=True)
+
     if args.summarize:
         summarize(args.out, ocfg)
         return
@@ -199,19 +272,32 @@ def main():
     patterns = args.fasta or [os.path.join(args.dir, "*.fasta")]
 
     def current_paths():
-        return [p for pat in patterns for p in sorted(_glob.glob(pat))]
+        return [p for pat in patterns for p in sorted(glob_.glob(pat))]
+
+    # Topology WITHOUT a process group: this reads the MPI rank/size and pins this rank's tile, but
+    # never calls init_process_group, so oneCCL is never initialised in this process. That is the
+    # whole reason multi-rank folding is safe here -- see the module docstring.
+    env = init_distributed(args.device, no_dist=True)
+    rank, world, dev = env.rank, env.world_size, env.device
+    tag = f" r{rank}" if world > 1 else ""
+    my_out = rank_path(args.out, rank) if world > 1 else args.out
 
     paths = current_paths()
-    todo, n_done, n_skip = collect(paths, args.out, lo, hi, args.limit)
-    print(f"[fold] {len(paths)} file(s) | {n_done} already scored | {len(todo)} to do "
-          f"| {n_skip} outside [{lo},{hi}] | watch={args.watch}", flush=True)
-    if not todo and not args.watch:
-        summarize(args.out, ocfg)
+    todo_all, n_done, n_skip, n_super = collect(paths, args.out, lo, hi, args.limit)
+    todo = [x for x in todo_all if owns(x[0], rank, world)]      # no coordination needed
+    if rank == 0:
+        print(f"[fold] {len(paths)} file(s) | {n_done} already scored | {len(todo_all)} to do "
+              f"| {n_skip} outside [{lo},{hi}] | watch={args.watch} | {world} rank(s)", flush=True)
+        if n_super:
+            print(f"[fold] {n_super} entr(y/ies) have a stale record under the same id with a "
+                  f"DIFFERENT sequence -- a regenerated FASTA. Re-folding them; the summary keeps "
+                  f"the newest record per id.", flush=True)
+    if not todo_all and not args.watch:
+        if rank == 0:
+            summarize(args.out, ocfg)
         return
 
     from esmfold_scorer import StructureScorer
-    dev = torch.device(args.device if args.device != "auto" else
-                       ("xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cpu"))
     t0 = time.perf_counter()
     scorer = StructureScorer(args.esmfold_weights, device=dev.type,
                              num_sampling_steps=ocfg.fold_steps, num_loops=ocfg.fold_loops,
@@ -221,26 +307,31 @@ def main():
         # Extends EsmFold's own svd/det CPU round-trip to every other torch.linalg op, without
         # double-wrapping those two. An unpatched aten XPU->CPU fallback corrupts GPU memory on
         # Aurora's compute runtime; xpu_linalg_guard.report() names whichever ops actually fired.
-        xpu_linalg_guard.patch()
-    print(f"[fold] ESMFold loaded in {time.perf_counter() - t0:.0f}s on {dev}", flush=True)
+        xpu_linalg_guard.patch(verbose=(rank == 0))
+    print(f"[fold]{tag} ESMFold loaded in {time.perf_counter() - t0:.0f}s on {dev} "
+          f"| {len(todo)} of {len(todo_all)} sequences", flush=True)
 
     total = 0
     last_progress = time.perf_counter()
     while True:
         if todo:
-            total += fold_all(todo, scorer, args.out, ocfg, t0)
+            total += fold_all(todo, scorer, my_out, ocfg, t0, tag)
             last_progress = time.perf_counter()
-            summarize(args.out, ocfg)
+            # Only rank 0 prints the table; every rank's records are in it, because summarize()
+            # globs all the per-rank files. Twelve copies of the same table would bury the log.
+            if rank == 0:
+                summarize(args.out, ocfg)
         if not args.watch:
             break
         if args.max_idle and time.perf_counter() - last_progress > args.max_idle:
-            print(f"[fold] idle for {args.max_idle}s; exiting.", flush=True)
+            print(f"[fold]{tag} idle for {args.max_idle}s; exiting.", flush=True)
             break
         time.sleep(args.poll)
-        todo, _, _ = collect(current_paths(), args.out, lo, hi, args.limit)
+        todo = [x for x in collect(current_paths(), args.out, lo, hi, args.limit)[0]
+                if owns(x[0], rank, world)]
 
-    print(f"[fold] scored {total} sequence(s) this process", flush=True)
-    if dev.type == "xpu":
+    print(f"[fold]{tag} scored {total} sequence(s) this process", flush=True)
+    if dev.type == "xpu" and rank == 0:
         print(xpu_linalg_guard.report("[fold]"), flush=True)
 
 

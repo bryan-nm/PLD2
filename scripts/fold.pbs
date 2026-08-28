@@ -11,9 +11,13 @@
 # Standalone ESMFold pass over SAMPLES_DIR. Use this to catch up on a backlog of sample FASTAs, or
 # to fold a training run's output after the fact.
 #
-# ONE RANK, no mpiexec, no oneCCL -- dist.init_distributed is never even called here, so no process
-# group exists. That is the configuration EsmFold's own speed_test validated and the only one that
-# folds reliably on Aurora; see the note in scripts/train.pbs.
+# All 12 tiles by default, but with NO PROCESS GROUP: src.fold_fasta calls
+# dist.init_distributed(no_dist=True), which pins each rank's tile without ever initialising oneCCL.
+# oneCCL's IPC peer mappings are what made multi-rank folding fault on Aurora, not rank count; see
+# the longer note in scripts/train.pbs. Ranks partition work by a stable hash of each sequence id and
+# each appends to its own <out>.rankNNN.jsonl, so no collective and no shared-file writes.
+#
+#   qsub -v RANKS_PER_NODE=1 scripts/fold.pbs      # the fallback with direct evidence behind it
 #
 # Resumable: every scored sequence is fsynced to FOLDS_JSONL and a rerun skips ids already there, so
 # re-submitting after a GPU fault costs only the sequences that were in flight.
@@ -27,5 +31,5 @@ source ./scripts/pbs_common.sh
 job_banner "PLD2 ESMFold pass (src.fold_fasta)" FOLD_ARGS
 
 # shellcheck disable=SC2086  # FOLD_ARGS is deliberately word-split into separate flags
-python -m src.fold_fasta --device xpu ${FOLD_ARGS:-}
+"${MPI_LAUNCH[@]}" python -m src.fold_fasta --device xpu ${FOLD_ARGS:-}
 rc=$?; echo "[job] exit $rc"; exit $rc     # exit $rc so the EXIT trap reports the true code
