@@ -78,48 +78,96 @@ class ProteinShards:
     At ~100M+ sequences we must NOT build a per-sequence Python index. Only the per-shard offset
     arrays and a cumulative count are kept, and item i is located by searchsorted over the shards.
 
-    split: "train" = every shard but the last, "holdout" = the last shard only, "all" = everything.
-    A single-shard directory has no holdout to give; that is reported rather than silently ignored.
+    THE TRAIN/HOLDOUT SPLIT IS STRIDED, NOT BY SHARD, and that correction matters. An earlier version
+    reserved the LAST SHARD as the holdout, which is only unbiased if the corpus order is unbiased --
+    an assumption there was never any basis for. Shard order is FASTA order, and a length-sorted
+    FASTA (many distributions ship that way) puts the extreme tail of the length distribution in the
+    last shard. Observed on the real UniRef shards: a 200-sequence "natural" baseline came out at
+    33.9 +- 2.3 aa from a corpus filtered to 30-500, i.e. the shortest ~1% of the data, pinned
+    against the floor. Nothing in the reader was wrong; the split was.
+
+    Holding out every `holdout_stride`-th sequence GLOBALLY is order-agnostic -- it gives the same
+    ~1% sample whatever the FASTA is sorted by -- and both directions of the map are closed-form, so
+    the sampler still needs no materialised index:
+
+        holdout   j -> j * S
+        train     j -> (j // (S-1)) * S + (j % (S-1)) + 1
+
+    Only whole blocks of S are used, so the map has no edge cases; the trailing N % S sequences
+    (< 100 out of ~1e8) belong to neither split.
+
+    Run `python -m src.inspect_shards` to see the per-shard length distribution and confirm whether a
+    given corpus is ordered.
     """
 
-    def __init__(self, shard_dir, eos_id, split: str = "train"):
+    def __init__(self, shard_dir, eos_id, split: str = "train", holdout_stride: int = 100,
+                 verify: bool = True):
         assert split in ("train", "holdout", "all")
+        assert holdout_stride >= 2, "holdout_stride must be >= 2"
         self.eos_id = eos_id
         self.split = split
+        self.stride = int(holdout_stride)
         bins = sorted(glob.glob(os.path.join(shard_dir, "*.bin"))) \
             if shard_dir and os.path.isdir(shard_dir) else []
         self.n_shards_total = len(bins)
-        if split == "train" and len(bins) > 1:
-            bins = bins[:-1]
-        elif split == "holdout":
-            bins = bins[-1:] if len(bins) > 1 else []
 
         self.offsets, self.data = [], []
         for b in bins:
-            self.offsets.append(np.fromfile(b[:-4] + ".idx", dtype="int64"))
+            off = np.fromfile(b[:-4] + ".idx", dtype="int64")
+            if verify:
+                # A .bin/.idx pair from an interrupted or re-run preprocess is the realistic silent
+                # corruption here: numpy slices a memmap past its end WITHOUT error, returning a
+                # short array, so truncated sequences would flow into training as if they were real.
+                size = os.path.getsize(b)
+                if len(off) < 2 or int(off[-1]) != size:
+                    raise RuntimeError(
+                        f"{b}: .idx says {int(off[-1]) if len(off) else 0} bytes but the .bin is "
+                        f"{size}. The pair is mismatched (interrupted or re-run preprocess). "
+                        f"Slicing past a memmap's end silently returns short sequences, so this is "
+                        f"refused rather than trained on. Re-run src.preprocess_fasta.")
+            self.offsets.append(off)
             self.data.append(np.memmap(b, dtype="uint8", mode="r"))
         counts = [len(off) - 1 for off in self.offsets]
         self.cum = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64) if counts \
             else np.array([0], np.int64)
-        self._n = int(self.cum[-1])
+        self.n_total = int(self.cum[-1])
+
+        S = self.stride
+        blocks = self.n_total // S
+        if split == "all":
+            self._n = self.n_total
+        elif split == "holdout":
+            self._n = blocks
+        else:
+            self._n = blocks * (S - 1)
 
     def __len__(self):
         return self._n
+
+    def global_index(self, j: int) -> int:
+        """Split-local index -> global corpus index. Closed form, no materialised list."""
+        S = self.stride
+        if self.split == "all":
+            return int(j)
+        if self.split == "holdout":
+            return int(j) * S
+        return (int(j) // (S - 1)) * S + (int(j) % (S - 1)) + 1
 
     def _locate(self, i):
         s = int(np.searchsorted(self.cum, i, side="right") - 1)
         return s, i - int(self.cum[s])
 
-    def get(self, i) -> List[int]:
-        s, k = self._locate(i)
+    def get(self, j) -> List[int]:
+        s, k = self._locate(self.global_index(int(j)))
         a, b = int(self.offsets[s][k]), int(self.offsets[s][k + 1])
         return self.data[s][a:b].tolist() + [self.eos_id]
 
-    def lengths_array(self) -> np.ndarray:
-        """All sequence lengths (+EOS) as one int32 array, vectorised from the offset arrays."""
+    def all_lengths(self) -> np.ndarray:
+        """Every sequence's residue count, over ALL shards, straight from the offset arrays.
+        Materialises one int32 per sequence -- fine for diagnostics, not for the hot path."""
         if not self.offsets:
             return np.zeros(0, dtype=np.int32)
-        return np.concatenate([np.diff(off).astype(np.int32) + 1 for off in self.offsets])
+        return np.concatenate([np.diff(off).astype(np.int32) for off in self.offsets])
 
 
 class ShardDataset(Dataset):

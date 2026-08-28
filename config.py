@@ -55,7 +55,11 @@ class DataCfg:
     canvas: int = 512
     num_workers: int = 4
     prefetch_factor: int = 4         # batches prefetched per worker (only used when num_workers > 0)
-    holdout_last_shard: bool = True  # reserve the last shard for the fold/repetition baselines
+    # Every Nth sequence GLOBALLY is held out for the fold/repetition baselines. Strided, not
+    # by-shard: shard order is FASTA order, and reserving the last shard silently returned the
+    # shortest ~1% of a length-sorted corpus (observed: a "natural" baseline of 33.9 +- 2.3 aa from
+    # data filtered to 30-500). A stride is order-agnostic. 0 disables the holdout entirely.
+    holdout_stride: int = 100
 
 
 @dataclass

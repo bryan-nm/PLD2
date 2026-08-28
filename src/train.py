@@ -240,7 +240,8 @@ def main():
 
     # --- data ---
     shards = ProteinShards(UNIREF_SHARDS, mcfg.eos_token_id,
-                           split="train" if dcfg.holdout_last_shard else "all")
+                           split="train" if dcfg.holdout_stride else "all",
+                           holdout_stride=max(dcfg.holdout_stride, 2))
     if len(shards) == 0:
         raise RuntimeError(f"no shards in {UNIREF_SHARDS}. Run src.preprocess_fasta first "
                            f"(or set PLD2_UNIREF_SHARDS).")
@@ -291,8 +292,10 @@ def main():
         **({"prefetch_factor": dcfg.prefetch_factor, "persistent_workers": True} if nw > 0 else {}))
     if env.is_main:
         epochs = batch_size * env.world_size * total / max(len(shards), 1)
-        print(f"[train] corpus={len(shards):,} sequences in {shards.n_shards_total} shards "
-              f"(holdout={'last shard' if dcfg.holdout_last_shard else 'none'}) | "
+        print(f"[train] corpus={len(shards):,} of {shards.n_total:,} sequences in "
+              f"{shards.n_shards_total} shards "
+              f"(holdout=every {dcfg.holdout_stride}th)" if dcfg.holdout_stride else "(no holdout)")
+        print(f"[train] "
               f"canvas={dcfg.canvas} B={batch_size}/rank x {env.world_size} ranks | "
               f"{total} steps ~= {epochs:.1f} epochs", flush=True)
 

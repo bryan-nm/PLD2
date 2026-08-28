@@ -178,6 +178,7 @@ src/
   make_baselines.py   # held-out natural + shuffled reference FASTAs
   tests_sampler.py    # cross-product regression: well-formedness + exact forward count
   tests_corruption.py # the corruption math, checked against independent computations
+  inspect_shards.py   # shard length distribution, corpus ordering, .idx/.bin integrity
   fold_fasta.py       # ESMFold on FASTA -> JSONL, resumable, --watch mode
   preprocess_fasta.py # UniRef FASTA -> packed uint8 shards
   dist.py             # Aurora XPU + oneCCL bootstrap, grad/stat all-reduce buffers
@@ -212,8 +213,20 @@ python -m src.fold_fasta --summarize   # the results table, any time, no GPU
 30–500 aa filter, so there is nothing to preprocess. `src/preprocess_fasta.py` + `scripts/preprocess.pbs`
 rebuild them if you want a different size window.
 
-`data.ProteinShards` reserves the **last shard** as a held-out split, which `src/make_baselines.py`
-draws its reference sequences from. ProLoopDiff had no held-out split at all.
+`data.ProteinShards` holds out **every 100th sequence globally** (`holdout_stride`), which
+`src/make_baselines.py` draws its reference sequences from. ProLoopDiff had no held-out split at all.
+
+The stride is not incidental. An earlier version reserved the *last shard*, which is only unbiased
+if the corpus order is unbiased — and shard order is FASTA order. On the real UniRef shards that
+returned a "natural" baseline of **33.9 ± 2.3 aa** from a corpus filtered to 30–500: the shortest
+~1% of the data, pinned against the floor, with a spread far too tight for any random draw. The
+reader was fine; the split was wrong. A stride is order-agnostic.
+
+`python -m src.inspect_shards` reports the per-shard length distribution, a rank correlation between
+shard index and mean length (with an effect size, so a handful of near-identical shards isn't
+flagged as "sorted"), and each `.idx`'s final offset against its `.bin` size. That last check matters
+because numpy slices a memmap past its end **without error** — a mismatched pair would feed silently
+truncated sequences into training, and `ProteinShards` now refuses to open one.
 
 ## Folding is a separate process, always
 

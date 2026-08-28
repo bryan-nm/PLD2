@@ -1,7 +1,7 @@
 """Write the reference FASTAs the generated samples are read against.
 
-Two references, both from the HELD-OUT shard (data.ProteinShards(split="holdout")), so they are
-sequences the model has never been trained on:
+Two references, both from the held-out split (every Nth sequence globally; see data.ProteinShards),
+so they are sequences the model has never been trained on:
 
   natural.fasta   real UniRef sequences -- the best case for every metric.
   shuffled.fasta  the SAME sequences, each independently permuted. This preserves every sequence's
@@ -52,15 +52,19 @@ def main():
 
     mcfg = CFG.model_config()
     max_len = args.max_len or ocfg.eval_canvas
-    shards = ProteinShards(args.shards, mcfg.eos_token_id, split="holdout")
+    shards = ProteinShards(args.shards, mcfg.eos_token_id, split="holdout",
+                           holdout_stride=max(CFG.data.holdout_stride, 2))
     if len(shards) == 0:
-        raise SystemExit(
-            f"no held-out shard in {args.shards}. ProteinShards reserves the LAST shard file, so a "
-            f"single-shard directory has none to give -- re-run src.preprocess_fasta with a smaller "
-            f"--shard-size, or pass --shards at a directory that has more than one.")
+        raise SystemExit(f"no sequences found in {args.shards} -- run src.preprocess_fasta first.")
 
     rng = random.Random(args.seed)
     idx = rng.sample(range(len(shards)), min(args.n * 3, len(shards)))   # oversample, then filter
+    # The corpus-wide length distribution, straight from the offset arrays. Printed next to the
+    # drawn sample so a non-representative draw is visible IN THE LOG rather than having to be
+    # noticed by eye -- which is how the last-shard holdout bug survived until someone spotted that
+    # 33.9 +- 2.3 could not be a random draw from a 30-500 corpus.
+    corpus_len = shards.all_lengths()
+    c_mean, c_sd = float(corpus_len.mean()), float(corpus_len.std())
     natural = []
     for i in idx:
         s = _to_seq(shards.get(i), mcfg.eos_token_id)
@@ -86,6 +90,13 @@ def main():
         print(f"[baseline] {name:<9} n={len(seqs)} len {mean:.1f}+-{sd:.1f} "
               f"LCR {lcr / max(tot, 1):.1%} | {kmer_line(kmer_counts(seqs, ocfg.kmer_ks), ocfg.kmer_ks)}"
               f"\n           -> {path}", flush=True)
+        if name == "natural" and abs(mean - c_mean) > 3 * max(c_sd, 1e-6) / max(len(seqs), 1) ** 0.5:
+            print(f"[baseline] WARNING: the drawn sample (mean {mean:.1f}) does not match the "
+                  f"corpus length distribution (mean {c_mean:.1f} +- {c_sd:.1f} over "
+                  f"{len(corpus_len):,} sequences). The holdout is not representative -- run "
+                  f"`python -m src.inspect_shards` to see whether the corpus is ordered.", flush=True)
+    print(f"[baseline] corpus length distribution: {c_mean:.1f} +- {c_sd:.1f} over "
+          f"{len(corpus_len):,} sequences (the baselines above should match it)", flush=True)
     print("[baseline] read every later number against these two rows: natural is the ceiling, "
           "shuffled is the composition-matched floor.", flush=True)
 
