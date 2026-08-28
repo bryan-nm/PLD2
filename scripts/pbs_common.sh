@@ -13,7 +13,7 @@ fi
 
 module load frameworks                                     # torch + IPEX + oneCCL on Aurora
 # Create once: python -m venv --system-site-packages, then pip install -e deps. Edit to your env.
-source /flare/NLDesignProtein/bryan/envs/PLD2-env/bin/activate
+source /flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/bin/activate
 
 # --- topology: 12 tiles/node, one rank per tile ---
 RANKS_PER_NODE=${RANKS_PER_NODE:-12}
