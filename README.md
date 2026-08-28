@@ -31,7 +31,7 @@ touches only output logits and needs nothing from the architecture.
 | 5 | No cross-attention, no labelled data | no text pathway anywhere; `src/data.py` reads UniRef shards only |
 | 6 | Upweight EOS | `config.OptCfg.eos_loss_weight = 20.0`, applied in both loss branches |
 | 7 | Fixed 512 canvas | `config.DataCfg.canvas = 512`; length bucketing removed entirely |
-| 8 | Eval at T=0.5 → FASTA → ESMFold; repetition above the LCR scale | `src/train.generative_eval` + `src/fold_fasta.py` + `src/metrics.kmer_counts` |
+| 8 | Eval → FASTA → ESMFold; repetition above the LCR scale | `src/train.generative_eval` + `src/fold_fasta.py` + `src/metrics.kmer_counts` |
 
 ### 2 & 3 — one process with MASK absorbing, β as its parameter
 
@@ -98,8 +98,8 @@ therefore exactly as before — the cosine target is 0 at the final step.
 `subst_per_residue` is the budget, in expected edits per decodable position over the whole decode.
 The per-step allowance is constant, so early steps (few committed residues) spend little and late
 steps spend it all — the OADM-like → substitution-rich ramp falls out of the canvas filling up
-rather than needing a schedule. It defaults to **0.0** pending a real checkpoint; A/B it with
-`python -m src.sample --subst-per-residue 0` vs `1.0`.
+rather than needing a schedule. It defaults to **1.0** — one substitution opportunity per decodable position across the decode —
+so the training-time eval measures the decoder we actually intend to use.
 
 ### 6 — the EOS arithmetic
 
@@ -153,8 +153,20 @@ to convergence, so model forwards are exactly `1 (eos_first) + n_steps + n_corre
 else 1)` regardless of the substitution budget. `python -m src.tests_sampler` asserts that count
 alongside well-formedness across 36 option combinations.
 
-Temperature defaults to **0.5**: at ProLoopDiff's 181k checkpoint, T=1.0 folded to pLDDT 33.9 —
-*below* its 37.5 shuffled baseline — while T=0.5 gave 55.2 with 21% of samples over 70.
+**The eval samples the way we intend to generate**, which is the whole reason every `generate()`
+argument lives in `CFG.opt` rather than in the callers. Two defaults follow from that:
+
+*Temperature is **1.0*** — the model's own distribution, unmodified. ProLoopDiff needed T=0.5 (at
+its 181k checkpoint T=1.0 folded to pLDDT 33.9, *below* its own 37.5 shuffled baseline, while T=0.5
+gave 55.2 with 21% over 70), but that was a fix for ProLoopDiff's repetition pathology. Carrying it
+over as a default would quietly assume PLD2 inherits the same pathology — and the PB bottlenecks are
+gone, EOS is upweighted, and substitution is now a native decode move. Sample at 1.0, measure, turn
+it down only if the metrics say to.
+
+*`subst_per_residue` is **1.0***, not 0 — substitution is a first-class move in this model's
+process, so an absorbing-only eval would measure a decoder we do not plan to ship. It costs nothing
+(both move types come from the same forward pass). To attribute a bad repetition number to the
+decoder rather than the model, A/B with `python -m src.sample --subst-per-residue 0`.
 
 `n_steps` must stay ≈ the canvas width whenever the repetition penalty is on. The penalty scores each
 position against the canvas *before* that step's commits, so co-committed positions are invisible to

@@ -138,10 +138,13 @@ class OptCfg:
     # src.sample cannot drift apart. In ProLoopDiff they agreed only because hardcoded literals in
     # eval happened to equal sample.py's CLI defaults, so tuning either would have silently left the
     # eval sampling differently from the thing being shipped.
-    sample_temperature: float = 0.5  # instruction 8. At ProLoopDiff's 181k checkpoint T=1.0 folded
-                                     # to pLDDT 33.9 (BELOW its 37.5 shuffled baseline) while T=0.5
-                                     # gave 55.2 with 21% of samples over 70. Temperature was the
-                                     # difference between "folds like a shuffle" and "folds".
+    # 1.0 = the model's own distribution, unmodified. ProLoopDiff needed T=0.5 (at its 181k
+    # checkpoint T=1.0 folded to pLDDT 33.9, BELOW its own 37.5 shuffled baseline, while T=0.5 gave
+    # 55.2 with 21% over 70) -- but that was a fix for ProLoopDiff's repetition pathology, and
+    # carrying it over as a default would quietly assume PLD2 inherits the same pathology. It may
+    # not: the PB bottlenecks are gone, EOS is upweighted, and substitution is a native decode move.
+    # Sample at 1.0, measure, and turn it down only if the metrics say to.
+    sample_temperature: float = 1.0
     sample_eos_first: bool = True    # commit the boundary before any residue (see sampler.py)
     sample_min_len: int = 30         # corpus floor; also stops EOS at position 0 (the len=0 bug)
     sample_eos_temp: float = 1.0     # <1 sharpens the length draw, >1 widens it
@@ -158,14 +161,16 @@ class OptCfg:
     # of the training process. The scheduled unmask count is a guaranteed FLOOR so substitutions can
     # never starve the mask channel (see sampler.generate).
     #
-    # 0.0 disables substitution and recovers pure absorbing decoding bit-for-bit. Left at 0.0 for
-    # now: the right value depends on how much the model actually wants to revise itself, which is
-    # not knowable before a real checkpoint. A/B it once one exists --
-    #     python -m src.sample --n 128 --subst-per-residue 0   --out off.fasta
-    #     python -m src.sample --n 128 --subst-per-residue 1.0 --out on.fasta
-    # -- and compare the k-mer repetition columns and folded pLDDT. Setting it here turns it on for
-    # the training-time eval too, which then reports a `sub N/seq` column.
-    sample_subst_per_residue: float = 0.0
+    # NON-ZERO BY DEFAULT, because the training-time eval has to sample the way we intend to
+    # generate. Substitution is a first-class move in this model's process; an absorbing-only eval
+    # would measure a decoder we do not plan to ship, and every generation number in the log would
+    # describe something nobody runs. 1.0 = each decodable position gets, on average, one
+    # substitution opportunity across the decode.
+    #
+    # Costs nothing: both move types come from the same forward pass, so the eval's forward count is
+    # unchanged (src/tests_sampler.py asserts it). To attribute a bad repetition number to the
+    # decoder rather than the model, A/B it -- `python -m src.sample --subst-per-residue 0`.
+    sample_subst_per_residue: float = 1.0
 
     # --- structural eval (ESMFold2-Fast), run by src/fold_fasta.py in its OWN process ---
     # Folding NEVER shares a process with generation. ProLoopDiff established that the hard way:
