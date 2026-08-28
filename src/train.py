@@ -130,7 +130,7 @@ def _peak_mem_gb(dev):
 # Training-time generative eval
 # --------------------------------------------------------------------------------------
 @torch.no_grad()
-def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp):
+def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp, d3pm_sched=None):
     """Decode eval_n sequences per rank at temperature 0.5, write FASTA, aggregate the metrics.
 
     EVERY rank runs this, in lockstep, because the metric all-reduce is a collective. Only the first
@@ -145,6 +145,7 @@ def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp):
     rng_state = torch.get_rng_state()
     torch.manual_seed(ocfg.seed + 100003 * (step + 1) + env.rank)
 
+    gen_stats = {}
     with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
         canvas, lengths = generate(
             model, Lmax=ocfg.eval_canvas, batch_size=ocfg.eval_n, n_steps=ocfg.eval_steps,
@@ -153,7 +154,11 @@ def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp):
             n_corrector=ocfg.sample_corrector, corrector_type=ocfg.sample_corrector_type,
             eos_first=ocfg.sample_eos_first, min_len=ocfg.sample_min_len,
             eos_temp=ocfg.sample_eos_temp, rep_penalty=ocfg.sample_rep_penalty,
-            rep_periods=ocfg.sample_rep_periods, max_run=ocfg.sample_max_run)
+            rep_periods=ocfg.sample_rep_periods, max_run=ocfg.sample_max_run,
+            # The trainer already holds the schedule the objective uses, so a blended eval costs
+            # nothing to wire up. Off unless config.sample_d3pm_blend says otherwise.
+            d3pm_sched=d3pm_sched, d3pm_blend=ocfg.sample_d3pm_blend,
+            d3pm_t_start=ocfg.sample_d3pm_t_start or None, stats=gen_stats)
 
     seqs, _ = decode_seqs(canvas, mcfg)
     if env.rank < ocfg.eval_fasta_ranks:
@@ -166,24 +171,25 @@ def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp):
     lcr, lcr_tot = lcr_counts(seqs)
     n_no_eos = sum(1 for v in lengths if v >= ocfg.eval_canvas)
     head = [float(len(lengths)), float(sum(lengths)), float(sum(v * v for v in lengths)),
-            float(n_no_eos), float(lcr), float(lcr_tot)]
+            float(n_no_eos), float(lcr), float(lcr_tot), float(gen_stats.get("n_revised", 0))]
     flat = allreduce_stats(head + flatten_kmer(kmer_counts(seqs, ocfg.kmer_ks), ocfg.kmer_ks), dev)
 
-    n, s1, s2, no_eos, lcr, lcr_tot = flat[:6]
+    n, s1, s2, no_eos, lcr, lcr_tot, n_revised = flat[:7]
     torch.set_rng_state(rng_state)
     n = max(int(n), 1)
     mean = s1 / n
     var = s2 / n - mean * mean
     return {"n": n, "mean": mean, "sd": var ** 0.5 if var > 0 else 0.0,
-            "no_eos": int(no_eos), "lcr": lcr / max(lcr_tot, 1),
-            "kmer": unflatten_kmer(flat[6:], ocfg.kmer_ks),
+            "no_eos": int(no_eos), "lcr": lcr / max(lcr_tot, 1), "revised": n_revised / n,
+            "kmer": unflatten_kmer(flat[7:], ocfg.kmer_ks),
             "seconds": time.perf_counter() - t0}
 
 
 def _eval_line(step, m, ocfg):
+    rev = f" | rev {m['revised']:.0f}/seq" if ocfg.sample_d3pm_blend > 0 else ""
     return (f"[eval] step {step:>7} | len {m['mean']:.1f}+-{m['sd']:.1f} | "
             f"no-EOS {m['no_eos']}/{m['n']} | LCR {m['lcr']:.1%} | "
-            f"{kmer_line(m['kmer'], ocfg.kmer_ks)} | {m['seconds']:.1f}s")
+            f"{kmer_line(m['kmer'], ocfg.kmer_ks)}{rev} | {m['seconds']:.1f}s")
 
 
 # --------------------------------------------------------------------------------------
@@ -352,7 +358,8 @@ def main():
 
         if eval_every and step > 0 and step % eval_every == 0:
             te = time.perf_counter()
-            stats = generative_eval(model, dev, mcfg, ocfg, step, env, SAMPLES_DIR, use_amp)
+            stats = generative_eval(model, dev, mcfg, ocfg, step, env, SAMPLES_DIR, use_amp,
+                                    d3pm_sched=sched_d3pm)
             model.train()
             t_eval += time.perf_counter() - te
             if env.is_main:

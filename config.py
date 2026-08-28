@@ -145,6 +145,21 @@ class OptCfg:
                                      # commit-the-most-predictable-first loop that feeds repeats
     sample_corrector: int = 0        # post-decode corrector sweeps (see sampler._corrector_sweep)
     sample_corrector_type: str = "remask"   # or "substitution" (the D3PM branch trains for it)
+    # THE OADM -> D3PM BLEND (src/sampler.generate). Runs the D3PM reverse step on already-committed
+    # residues alongside the absorbing commits, in the same forward pass, with authority that grows
+    # as the canvas fills. Costs nothing extra and cannot break the decode guarantees (the D3PM
+    # state space has no MASK, so it can never re-mask a position).
+    #
+    # DEFAULT OFF, deliberately. The channel is a faithful amplifier of the model's x0 belief -- it
+    # repairs a good model and confidently corrupts a bad one -- so its value depends entirely on a
+    # checkpoint we do not have yet, and switching it on here would silently change what the
+    # training-time eval measures. A/B it first:
+    #     python -m src.sample --n 128 --d3pm-blend 0   --out off.fasta
+    #     python -m src.sample --n 128 --d3pm-blend 1.0 --out on.fasta
+    # and compare the k-mer repetition columns and the folded pLDDT. Setting this non-zero turns it
+    # on for the training-time eval too, which is the point of it living here rather than in a flag.
+    sample_d3pm_blend: float = 0.0
+    sample_d3pm_t_start: int = 0     # 0 -> sampler.default_t_start(T) = T//10, measured (see d3pm_timestep)
 
     # --- structural eval (ESMFold2-Fast), run by src/fold_fasta.py in its OWN process ---
     # Folding NEVER shares a process with generation. ProLoopDiff established that the hard way:
@@ -219,5 +234,8 @@ if __name__ == "__main__":
           f"({n_d} D3PM + {n_o} OADM rows at p_d3pm={CFG.opt.p_d3pm})")
     print(f"objective      : p_d3pm={CFG.opt.p_d3pm} transition={CFG.opt.d3pm_transition} "
           f"T={CFG.opt.d3pm_T} eos_w={CFG.opt.eos_loss_weight} pad_w={CFG.opt.pad_loss_weight}")
+    print(f"sampling       : T={CFG.opt.sample_temperature} steps={CFG.opt.eval_steps} "
+          f"eos_first={CFG.opt.sample_eos_first} d3pm_blend={CFG.opt.sample_d3pm_blend}"
+          f"{' (OADM-only decode)' if CFG.opt.sample_d3pm_blend <= 0 else ' (blended decode)'}")
     print(f"schedule       : {CFG.opt.total_steps} steps, warmup {CFG.opt.warmup_steps}, "
           f"lr {CFG.opt.lr}, eval every {CFG.opt.eval_every}, ckpt every {CFG.opt.ckpt_every}")

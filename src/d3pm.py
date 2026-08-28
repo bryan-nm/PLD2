@@ -180,6 +180,23 @@ class D3PMSchedule:
         return (r > cdf).sum(dim=-1).clamp_(max=self.K - 1)
 
     # -- reverse process -----------------------------------------------------
+    def p_reverse(self, xt: torch.Tensor, t: int, p_tilde: torch.Tensor) -> torch.Tensor:
+        """p_theta(x_{t-1} | x_t) for a SCALAR t shared by the whole batch. -> (B, L, K)
+
+        The training path (`posteriors`, below) takes a per-row t and pays for a bmm against a
+        (B,K,K) gather. The SAMPLER path is different: every row of the canvas is at the same point
+        in the same annealing schedule, so the matrices index once as (K,K) and the bmm collapses
+        into a broadcast matmul -- 64x512x22x22 ~ 16 MFLOPs, i.e. free next to the model forward
+        that produced p_tilde.
+
+        Only the model half of the pair is computable here. q(x_{t-1}|x_t,x_0) needs x_0, which at
+        sampling time is exactly what we do not have; that asymmetry is why this returns one
+        distribution and `posteriors` returns two.
+        """
+        a = self.QT[t][xt]                                  # (B,L,K)  a[j] = Q_t[j, x_t]
+        c = p_tilde @ self.Qbar[t - 1]                      # (B,L,K)  c[j] = sum_i p~[i] Qbar[i,j]
+        return _normalize(a * c)
+
     def posteriors(self, x0: torch.Tensor, xt: torch.Tensor, t: torch.Tensor,
                    p_tilde: torch.Tensor):
         """-> (q_post, p_post), both (B, L, K) and normalised.
@@ -202,6 +219,18 @@ def _rows(stack: torch.Tensor, t: torch.Tensor, idx: torch.Tensor) -> torch.Tens
 
 def _normalize(p: torch.Tensor, eps: float = 1e-30) -> torch.Tensor:
     return p / p.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+
+def sample_categorical(probs: torch.Tensor) -> torch.Tensor:
+    """Inverse-CDF draw over the last dim -> (..., ) long.
+
+    Same reasoning as q_sample: no torch.multinomial, which needs a 2-D reshape, makes the shape
+    data-dependent, and can return an out-of-range index on a float-rounding edge. This is exact,
+    allocation-stable, and cannot leave [0, K).
+    """
+    cdf = probs.cumsum(dim=-1)
+    r = torch.rand(probs.shape[:-1] + (1,), device=probs.device, dtype=probs.dtype)
+    return (r > cdf).sum(dim=-1).clamp_(max=probs.shape[-1] - 1)
 
 
 def kl_categorical(q: torch.Tensor, p: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:

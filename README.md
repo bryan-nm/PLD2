@@ -110,6 +110,72 @@ in `CFG.opt` so `src/train.py`'s eval and `src/sample.py` cannot drift apart.
 Temperature defaults to **0.5**: at ProLoopDiff's 181k checkpoint, T=1.0 folded to pLDDT 33.9 —
 *below* its 37.5 shuffled baseline — while T=0.5 gave 55.2 with 21% of samples over 70.
 
+### The OADM → D3PM blended decode
+
+Training both objectives but decoding with only the absorbing one leaves half the model unused at
+generation. `d3pm_blend > 0` runs **both channels in every step**:
+
+| channel | decides | mechanism |
+|---|---|---|
+| absorbing | *where* content exists | unchanged — cosine-scheduled confidence-ordered commits |
+| D3PM | *what* that content is | one reverse step `p_θ(x_{t-1}\|x_t)` on every already-committed residue |
+
+The balance shifts from OADM-like to D3PM-like on its own, from two ramps, neither hand-tuned:
+
+- **Coverage ramps up by itself** — the D3PM channel acts on committed positions, and that set grows
+  from ~0 to the whole canvas. Step 1 revises nothing; the last steps revise everything.
+- **Authority ramps up as `t` anneals `t_start → 1`**, which runs *opposite to intuition*. Measured
+  single-step `P(x_{t-1} ≠ x_t)`:
+
+  | t | 400 | 300 | 200 | 100 | 50 | 10 | 1 |
+  |---|---|---|---|---|---|---|---|
+  | model **disagrees** | 1.1% | 0.8% | 0.8% | 1.2% | 2.2% | 10.2% | **100%** |
+  | model **agrees** | 0.13% | 0.03% | 0.01% | 0.00% | 0.00% | 0.00% | **0.00%** |
+
+  At large `t`, `Q̄_{t-1}` is near-uniform so `c = p̃ Q̄_{t-1}` is flat and cannot outvote the
+  stay-mass in `Q_t`. At small `t` it is near-identity, so `c[x_t]` collapses the moment the model
+  points elsewhere. This is also why `t_start` defaults to `T//10 = 50` rather than `T`: a linear
+  `T → 1` ramp spends ~90% of the decode in the ~1% dead band.
+
+**Both guarantees hold by construction, not by tuning.**
+
+- *All masks decoded in exactly `n_steps`* — the absorbing schedule is untouched and its cosine
+  target is exactly 0 on the final step. The D3PM channel **cannot** interfere, because its state
+  space has no MASK to emit (`K = vocab_size − 1`). The channels are separable structurally.
+- *No extra compute* — both read the **same forward pass**. A blended decode costs an unblended one
+  plus one (22×22) matmul per step.
+
+Well-formedness is preserved by restricting revision to committed **residues** and constraining the
+posterior to residue columns. That second part is not redundant and cost a real bug: `p̃(EOS)=0`
+does *not* make the posterior zero at EOS, because `Q̄_{t-1}[i, EOS] > 0` for every `i` — the very
+property that lets the D3PM training branch learn boundary repair. A residue was revised into an
+EOS and the next step's `_enforce_eos` truncated the sequence to length 0.
+
+**The honest limit, and why it defaults to off.** This channel is a faithful amplifier of the
+model's own `x₀` belief. On a deliberately overfit toy (4 memorised sequences, 6 residues corrupted
+in each), two sequences went 6 errors → **0** and two went 6 → **26** and 6 → **15**. That looks
+like the sampler breaking things — but the model's own `argmax p̃` on those same inputs already
+differed from truth at 24/28 and 15/16 positions *before any revision ran*. The channel converged
+each sequence to the model's belief, exactly as designed; on two of them the belief was wrong.
+Flooring the anneal above `t=1` does not help (swept `t_end` = 1, 3, 5, 10, 20, 50 → 41, 41, 40, 40,
+37, 35 total errors, all dominated by the belief), which is why there is **no `t_end` knob** — it
+would look like a safety control without being one.
+
+So it cleans up a good model and confidently corrupts a bad one, and that cannot be settled from the
+mechanism alone. `sample_d3pm_blend` defaults to **0.0**; A/B it on the first real checkpoint:
+
+```bash
+python -m src.sample --n 128 --d3pm-blend 0   --out off.fasta
+python -m src.sample --n 128 --d3pm-blend 1.0 --out on.fasta
+```
+
+and compare the k-mer repetition columns and folded pLDDT. Note the specific risk for PLD2's failure
+mode: **repeats are high-likelihood**, so an unrestrained pull toward the model's belief could as
+easily drive samples *into* repetition as out of it. The repetition penalty is applied to the
+revision path for exactly this reason, and the k-mer metrics are what would show it either way.
+Setting `sample_d3pm_blend` in `config.py` turns it on for the training-time eval too (which reports
+a `rev N/seq` column), which is why it lives there rather than only behind a flag.
+
 `n_steps` must stay ≈ the canvas width whenever the repetition penalty is on. The penalty scores each
 position against the canvas *before* that step's commits, so co-committed positions are invisible to
 one another; measured at `max_run=5` on a 128 canvas, the longest homopolymer was 42 at 8
@@ -122,9 +188,9 @@ config.py             # owns ALL paths + model/data/opt config (python config.py
 src/
   model.py            # looped uniform-width transformer (no PB layers, no cross-attention)
   blosum.py           # BLOSUM62 -> substitution matrix + doubly-stochastic D3PM base (Sinkhorn)
-  d3pm.py             # calibrated beta schedule, Q/Qbar stacks, posteriors, KL
+  d3pm.py             # calibrated beta schedule, Q/Qbar stacks, posteriors, reverse step, KL
   objective.py        # OADM + D3PM losses, EOS/PAD weighting, one-forward training_step
-  sampler.py          # confidence-ordered decoding, EOS-first, repetition penalty, correctors
+  sampler.py          # confidence-ordered decoding, EOS-first, rep penalty, D3PM blend, correctors
   metrics.py          # SEG-LCR + long-range k-mer repetition (k > SEG window)
   data.py             # tokenizer, shard reader w/ holdout, stateless step-keyed batch sampler
   train.py            # training loop + training-time generative eval -> FASTA
