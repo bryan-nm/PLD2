@@ -551,11 +551,10 @@ def generate(model: LoopedDiffusionLM, Lmax: int, batch_size: int,
         n_mask_target = (n_active * math.cos(math.pi / 2 * frac)).round().long()
         n_commit = (is_masked.sum(dim=1) - n_mask_target).clamp(min=0)
 
-        # The D3PM channel acts on what was ALREADY committed at the top of this step -- residues
-        # only, so EOS/PAD and therefore well-formedness are untouched. Captured before the commits
-        # below, so a position is never both committed and revised in the same step: a token drawn
-        # from this step's logits has nothing to gain from being immediately revised against them.
-        revisable = (~is_masked) & (canvas < 20) if use_d3pm else None
+        # Snapshot of what was ALREADY committed at the top of this step. A position committed by
+        # THIS step is excluded from revision: it was just drawn from these very logits and has
+        # nothing to gain from being immediately revised against them.
+        was_committed = ~is_masked if use_d3pm else None
 
         commit = _topk_mask(conf_masked, n_commit, largest=True) & is_masked
         canvas[commit] = tok[commit]
@@ -563,13 +562,22 @@ def generate(model: LoopedDiffusionLM, Lmax: int, batch_size: int,
         _enforce_eos(canvas, is_masked, cfg)
 
         if use_d3pm:
+            # `revisable` is intersected with the canvas AFTER _enforce_eos, not before, and that
+            # ordering is load-bearing. When eos_first is off, a step can commit a new EOS, and
+            # _enforce_eos then turns every position to its right into PAD -- including positions
+            # that were committed residues when the snapshot was taken. Testing `canvas < 20` on the
+            # pre-enforcement canvas let revision write a residue back into that PAD region, i.e.
+            # [AA* EOS PAD* AA PAD*]. Measured: with eos_first=False and blend=1.0 that broke all 8
+            # rows of an 8-row batch. Re-reading the canvas here costs nothing and makes the
+            # restriction to committed RESIDUES true at the moment it is applied rather than one
+            # statement earlier.
+            revisable = was_committed & (canvas < 20)
             t = d3pm_timestep(step, n_steps, t_start)
             changed = _d3pm_revise(d3pm_sched, canvas, revisable,
                                    lg / max(temperature, 1e-6), t, d3pm_blend, greedy)
             n_revised += int(changed.sum())
-            # A revision can only rewrite a residue with another residue, so no EOS can appear or
-            # move and the [AA* EOS PAD*] invariant cannot be broken here. Re-enforcing would be a
-            # no-op; asserting it in the test suite is cheaper than doing it 512 times.
+            # Revision can only rewrite a residue with another residue, so no EOS can appear or move
+            # and the invariant cannot be broken below this line. Re-enforcing would be a no-op.
 
     # Correctors run under the SAME composed guidance: redecoding a tract without the repetition
     # penalty would just reproduce it -- the flanking context still supports it and confidence

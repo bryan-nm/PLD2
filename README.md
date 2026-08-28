@@ -137,13 +137,25 @@ The balance shifts from OADM-like to D3PM-like on its own, from two ramps, neith
   points elsewhere. This is also why `t_start` defaults to `T//10 = 50` rather than `T`: a linear
   `T → 1` ramp spends ~90% of the decode in the ~1% dead band.
 
-**Both guarantees hold by construction, not by tuning.**
+**Both guarantees hold by construction, not by tuning — and the second one is about wall time, not
+just step count.**
 
 - *All masks decoded in exactly `n_steps`* — the absorbing schedule is untouched and its cosine
   target is exactly 0 on the final step. The D3PM channel **cannot** interfere, because its state
   space has no MASK to emit (`K = vocab_size − 1`). The channels are separable structurally.
-- *No extra compute* — both read the **same forward pass**. A blended decode costs an unblended one
-  plus one (22×22) matmul per step.
+- *Bounded wall time* — the worry worth having about a predictor–corrector sampler is a corrector
+  that iterates to convergence, so the decode grinds on refining while masks remain. **Nothing here
+  iterates.** The D3PM channel is one gather, one (22×22) matmul and one categorical draw per step,
+  off logits the absorbing commit already needed. There is no inner loop and no convergence test, so
+  total model forwards are exactly
+
+  ```
+  forwards = 1 (eos_first) + n_steps + n_corrector × (2 if remask else 1)
+  ```
+
+  independent of the blend. Measured on a 96-wide canvas: **97 forwards at `blend=0` and 97 at
+  `blend=1.0`**, 1.07s vs 1.10s. `python -m src.tests_sampler` asserts the exact forward count
+  alongside well-formedness across all 36 option combinations.
 
 Well-formedness is preserved by restricting revision to committed **residues** and constraining the
 posterior to residue columns. That second part is not redundant and cost a real bug: `p̃(EOS)=0`
@@ -196,6 +208,7 @@ src/
   train.py            # training loop + training-time generative eval -> FASTA
   sample.py           # ad-hoc unconditional sampling -> FASTA
   make_baselines.py   # held-out natural + shuffled reference FASTAs
+  tests_sampler.py    # cross-product regression: well-formedness + exact forward count
   fold_fasta.py       # ESMFold on FASTA -> JSONL, resumable, --watch mode
   preprocess_fasta.py # UniRef FASTA -> packed uint8 shards
   dist.py             # Aurora XPU + oneCCL bootstrap, grad/stat all-reduce buffers
@@ -216,6 +229,7 @@ python -m src.model            # uniform widths; init cross-entropy ~ ln(23)
 python -m src.blosum <mat>     # row/doubly-stochastic checks; A->S I->V K->R W->Y
 python -m src.objective        # both objective branches wired up and optimising
 python -m src.metrics          # a hidden 20-mer repeat is invisible to LCR, visible at k13
+python -m src.tests_sampler    # 36 decode configs: well-formed, and exactly N forwards
 
 # Aurora
 qsub scripts/train.pbs                 # training + co-scheduled ESMFold watcher
