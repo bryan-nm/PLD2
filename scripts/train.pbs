@@ -1,0 +1,91 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N pld2_train
+#PBS -l walltime=06:00:00
+#PBS -l select=16
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q prod
+#PBS -j oe
+
+# PLD2 training, plus a co-scheduled ESMFold watcher on the last node.
+#
+# The trainer writes SAMPLES_DIR/step_XXXXXXXX.rankNNN.fasta every eval_every steps (temperature 0.5,
+# unconditional). src.fold_fasta --watch polls that directory and folds each new file, appending to
+# FOLDS_JSONL. Both write to the same PBS output stream; [train]/[eval]/[fold] prefixes distinguish
+# them.
+#
+# ONE RANK on the fold node, deliberately, not the 12 training uses. ESMFold faults on Aurora
+# whenever oneCCL has set up node-local Level-Zero IPC peer mappings: 12-rank folding died 3 for 3,
+# always reading an unmapped page in the 0xff03ffff... IPC range, while a 1-rank run -- where
+# dist.init_distributed returns before init_process_group and oneCCL is never initialised at all --
+# folded cleanly. The cost is statistics, not capability: one tile folds ~55 sequences/minute, and
+# each eval round produces eval_fasta_ranks * eval_n = 64. Raise it ONLY with evidence that the IPC
+# interaction is resolved.
+#
+# TRAINING IS NEVER AT RISK FROM FOLDING. The watcher runs in the background and training in the
+# foreground, so a fold crash cannot touch the training ranks; the job's exit code is training's.
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./scripts/pbs_common.sh
+
+if [ "$NNODES" -lt 2 ]; then
+    echo "FATAL: need >=2 nodes to co-schedule training and folding (got $NNODES). Submit" >&2
+    echo "       scripts/train.pbs with more nodes, or run folding separately via fold.pbs." >&2
+    exit 1
+fi
+
+FOLD_RANKS_PER_NODE=${FOLD_RANKS_PER_NODE:-1}
+TRAIN_NODES=$((NNODES - 1))
+TRAIN_RANKS=$((TRAIN_NODES * RANKS_PER_NODE))
+
+TRAIN_NODEFILE=$(mktemp); FOLD_NODEFILE=$(mktemp)
+head -n "$TRAIN_NODES" "$PBS_NODEFILE" > "$TRAIN_NODEFILE"
+tail -n 1 "$PBS_NODEFILE" > "$FOLD_NODEFILE"
+TRAIN_MASTER=$(head -n1 "$TRAIN_NODEFILE"); FOLD_MASTER=$(head -n1 "$FOLD_NODEFILE")
+
+job_banner "PLD2 training + ESMFold watcher" TRAIN_NODES TRAIN_RANKS FOLD_RANKS_PER_NODE
+
+# Natural + shuffled reference FASTAs from the held-out shard, written ONCE before training so the
+# watcher folds them first and every later step row has a ceiling and a floor to be read against.
+python -m src.make_baselines || echo "[job] WARNING: baselines failed; step rows will have no reference"
+
+# --- fold watcher (background, supervised, killed when training finishes) ---
+# A GPU fault ABORTS the process -- it is not a Python exception, so fold_fasta cannot catch and
+# continue. The supervisor restarts it, which matters because faults are likeliest EARLY: an
+# untrained model rarely places EOS, so its generations run the full 512 canvas and ESMFold cost and
+# memory both go as L^2. As EOS placement is learned the sequences shorten and folding gets cheaper
+# and safer. Every scored sequence is already fsynced to FOLDS_JSONL, so a restart resumes rather
+# than repeats. Bounded, so a permanently broken watcher cannot spin for the whole walltime.
+(
+    attempt=0
+    while [ "$attempt" -lt "${FOLD_MAX_RESTARTS:-20}" ]; do
+        attempt=$((attempt + 1))
+        echo "[fold-supervisor] starting src.fold_fasta --watch (attempt ${attempt}/${FOLD_MAX_RESTARTS:-20})"
+        # shellcheck disable=SC2086  # FOLD_ARGS is deliberately word-split into separate flags
+        MASTER_ADDR=$FOLD_MASTER MASTER_PORT=29501 \
+          mpiexec -n "$FOLD_RANKS_PER_NODE" -ppn "$FOLD_RANKS_PER_NODE" --pmi=pmix --cpu-bind depth -d 8 \
+          --hostfile "$FOLD_NODEFILE" \
+          python -m src.fold_fasta --device xpu --watch ${FOLD_ARGS:-}
+        frc=$?
+        echo "[fold-supervisor] src.fold_fasta exited rc=${frc}"
+        [ "$frc" -eq 0 ] && break            # clean exit (e.g. --max-idle): nothing to restart
+        sleep 30
+    done
+    echo "[fold-supervisor] not restarting further"
+) &
+fold_pid=$!
+
+# --- training (foreground) ---
+MASTER_ADDR=$TRAIN_MASTER MASTER_PORT=29500 \
+  mpiexec -n "$TRAIN_RANKS" -ppn "$RANKS_PER_NODE" --pmi=pmix --cpu-bind depth -d 8 \
+  --hostfile "$TRAIN_NODEFILE" \
+  python -m src.train --device xpu ${TRAIN_ARGS:-}
+rc=$?
+
+# Kill the supervisor FIRST so it cannot start another attempt, then the mpiexec it is waiting on
+# (killing the subshell alone would orphan that child).
+kill "$fold_pid" 2>/dev/null; wait "$fold_pid" 2>/dev/null
+pkill -f "src\.fold_fasta" 2>/dev/null
+python -m src.fold_fasta --summarize        # final table, no GPU needed
+rm -f "$TRAIN_NODEFILE" "$FOLD_NODEFILE"
+echo "[job] exit $rc"; exit $rc

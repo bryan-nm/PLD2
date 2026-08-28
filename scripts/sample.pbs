@@ -1,0 +1,24 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N pld2_sample
+#PBS -l walltime=00:20:00
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q debug
+#PBS -j oe
+
+# Unconditional sampling from the latest checkpoint. Single process on one tile (no mpiexec).
+# Defaults come from CFG.opt, so this samples exactly as the training-time eval does.
+#   qsub -v N=128,OUT=samples.fasta scripts/sample.pbs
+#   qsub -v SAMPLE_ARGS="--temperature 0.7 --corrector 2 --corrector-type substitution" scripts/sample.pbs
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./scripts/pbs_common.sh
+
+N=${N:-128}
+OUT=${OUT:-samples.fasta}
+job_banner "PLD2 unconditional sampling (src.sample)" N OUT SAMPLE_ARGS
+
+# shellcheck disable=SC2086
+python -m src.sample --device xpu --n "${N}" --out "${OUT}" ${SAMPLE_ARGS:-}
+rc=$?; echo "[job] exit $rc"; exit $rc

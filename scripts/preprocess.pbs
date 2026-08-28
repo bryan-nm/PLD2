@@ -1,0 +1,28 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N pld2_preprocess
+#PBS -l walltime=06:00:00
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q capacity
+#PBS -j oe
+
+# Tokenise the UniRef FASTA -> packed shards. SINGLE node, CPU only (no GPU, no mpiexec): one Python
+# process streams the FASTA. Paths come from config.py.
+#
+# YOU PROBABLY DO NOT NEED THIS. config.UNIREF_SHARDS points at the shards ProLoopDiff already built
+# with the same 30-500 aa filter; run this only to rebuild them (e.g. a different size window, or to
+# put back the SwissProt sequences that build excluded).
+#
+# NO --dedup: UniRef90 is already dereplicated at 90% identity, and --dedup's hash set is the
+# memory-heavy part at ~150M sequences. Add it back only for a non-UniRef corpus.
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./scripts/pbs_common.sh
+
+FASTA=$(python -c "from config import UNIREF_FASTA; print(UNIREF_FASTA)")
+OUT=$(python -c "from config import UNIREF_SHARDS; print(UNIREF_SHARDS)")
+job_banner "UniRef preprocess (src.preprocess_fasta)" FASTA OUT
+
+python -m src.preprocess_fasta "$FASTA" "$OUT" --min 30 --max 500
+rc=$?; echo "[job] exit $rc"; exit $rc

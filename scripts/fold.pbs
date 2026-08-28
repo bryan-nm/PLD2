@@ -1,0 +1,31 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N pld2_fold
+#PBS -l walltime=02:00:00
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q debug
+#PBS -j oe
+
+# Standalone ESMFold pass over SAMPLES_DIR. Use this to catch up on a backlog of sample FASTAs, or
+# to fold a training run's output after the fact.
+#
+# ONE RANK, no mpiexec, no oneCCL -- dist.init_distributed is never even called here, so no process
+# group exists. That is the configuration EsmFold's own speed_test validated and the only one that
+# folds reliably on Aurora; see the note in scripts/train.pbs.
+#
+# Resumable: every scored sequence is fsynced to FOLDS_JSONL and a rerun skips ids already there, so
+# re-submitting after a GPU fault costs only the sequences that were in flight.
+#
+#   qsub scripts/fold.pbs                                    # one pass over everything new
+#   qsub -v FOLD_ARGS="--watch --max-idle 1800" scripts/fold.pbs   # follow a running training job
+#   qsub -v FOLD_ARGS="--max-len 300" scripts/fold.pbs        # cap length (ESMFold cost is ~L^2)
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./scripts/pbs_common.sh
+
+job_banner "PLD2 ESMFold pass (src.fold_fasta)" FOLD_ARGS
+
+# shellcheck disable=SC2086  # FOLD_ARGS is deliberately word-split into separate flags
+python -m src.fold_fasta --device xpu ${FOLD_ARGS:-}
+rc=$?; echo "[job] exit $rc"; exit $rc     # exit $rc so the EXIT trap reports the true code
