@@ -5,10 +5,14 @@ Two different objects come out of the same file, for two different jobs:
   * blosum_sub_probs()  -- a 20x20 ROW-STOCHASTIC matrix with a zero diagonal: "if residue i is
     corrupted, what does it become". Used by the sampler's substitution corrector.
 
-  * d3pm_transition()   -- a KxK DOUBLY-STOCHASTIC matrix over the full non-MASK alphabet (20 AA +
-    EOS + PAD). Doubly stochastic is not a nicety: it is what makes the uniform distribution the
-    stationary distribution of the D3PM Markov chain, which is what the D3PM ELBO assumes when it
-    drops L_T. Built EvoDiff's way -- exponentiate the BLOSUM scores, then Sinkhorn-Knopp.
+  * substitution_kernel() -- an n x n ROW-STOCHASTIC kernel with a ZERO DIAGONAL over the non-MASK
+    alphabet (20 AA + EOS + PAD): "given that this position is being substituted, what does it
+    become". This is the B in corruption.CorruptionSchedule, and it is what PLD2 uses.
+
+  * blosum_transition() -- a doubly-stochastic variant, kept for reference. Double stochasticity
+    made UNIFORM the stationary distribution of a mask-free chain; PLD2's chain has MASK as an
+    absorbing state, so its stationary distribution is all-MASK regardless of the kernel and the
+    Sinkhorn step is no longer needed.
 
 Alphabet order: our canonical AA string (== token id), NOT BLOSUM column order
 (A R N D C Q E G H I L K M F P S T W Y V B Z X J O U -), so the file is reordered on load.
@@ -88,6 +92,40 @@ def sinkhorn_knopp(M: torch.Tensor, iters: int = 500, tol: float = 1e-9) -> torc
     return (M / M.sum(dim=1, keepdim=True)).float()
 
 
+def substitution_kernel(path: str, n: int, temp: float = 1.0, aa: str = AA) -> torch.Tensor:
+    """(n, n) row-stochastic substitution kernel with a ZERO DIAGONAL, over the non-MASK alphabet.
+
+    This is the B in corruption.CorruptionSchedule: "given that this position is being substituted,
+    what does it become". The zero diagonal is what makes that sentence true -- with a self-transition
+    the nominal substitution rate would overstate the real one, and beta would not mean what it says.
+
+    The amino-acid block is BLOSUM62/temp; EOS and PAD score 0 against everything, BLOSUM's neutral
+    point (EvoDiff does the same for its non-standard codes and GAP). Keeping them IN the alphabet is
+    deliberate: a substitution can move a boundary token, which is how the model is taught to repair
+    a misplaced EOS rather than only to place one.
+
+    NOT doubly stochastic, and it no longer needs to be. Sinkhorn was there to make uniform the
+    stationary distribution of a mask-free chain; with MASK absorbing, the stationary distribution is
+    all-MASK regardless of B, so the only job left for B is to say which substitutions are plausible.
+    """
+    assert n >= len(aa), f"n={n} is smaller than the amino-acid alphabet ({len(aa)})"
+    score, _ = load_blosum62(path)
+    S = torch.zeros(n, n)                               # 0 = BLOSUM-neutral, used for EOS/PAD
+    for i, ai in enumerate(aa):
+        for j, aj in enumerate(aa):
+            S[i, j] = float(score[(ai, aj)])
+    P = torch.exp(S / max(temp, 1e-6))
+    P.fill_diagonal_(0.0)                               # a substitution always changes the token
+    return P / P.sum(dim=1, keepdim=True)
+
+
+def uniform_substitution_kernel(n: int) -> torch.Tensor:
+    """The no-biology substitution kernel: uniform over the n-1 other tokens."""
+    P = torch.ones(n, n)
+    P.fill_diagonal_(0.0)
+    return P / P.sum(dim=1, keepdim=True)
+
+
 def uniform_transition(k: int) -> torch.Tensor:
     """The D3PM-Uniform base matrix: every token goes to every token equally often."""
     return torch.full((k, k), 1.0 / k)
@@ -135,3 +173,12 @@ if __name__ == "__main__":
     U = uniform_transition(K)
     print(f"d3pm unif        | rowsum err={float((U.sum(1)-1).abs().max()):.2e} "
           f"colsum err={float((U.sum(0)-1).abs().max()):.2e}")
+
+    for temp in (1.0, 3.0):
+        B = substitution_kernel(path, K, temp=temp)
+        top = {AA[i]: AA[int(B[i][:20].argmax())] for i in (AA.index("A"), AA.index("I"),
+                                                           AA.index("K"), AA.index("W"))}
+        print(f"sub kernel temp={temp:4.1f} | rowsum err={float((B.sum(1)-1).abs().max()):.2e} "
+              f"diag={float(B.diagonal().abs().max()):.1e} "
+              f"| P(AA->EOS/PAD)={float(B[:20, 20:].sum(1).mean()):.1%} "
+              f"| A->{top['A']} I->{top['I']} K->{top['K']} W->{top['W']}")

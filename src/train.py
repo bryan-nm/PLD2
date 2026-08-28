@@ -28,15 +28,15 @@ import time
 import torch
 
 from config import CFG, UNIREF_SHARDS, BLOSUM_MAT, CKPT_DIR, SAMPLES_DIR
-from .blosum import blosum_transition, uniform_transition
-from .d3pm import D3PMSchedule
+from .blosum import substitution_kernel, uniform_substitution_kernel
+from .corruption import CorruptionSchedule
 from .data import ProteinShards, ShardDataset, StepBatchSampler, make_collate
 from .dist import (init_distributed, barrier, cleanup, broadcast_parameters, average_gradients,
                    broadcast_checkpoint_bytes, preallocate_grad_buffer, preallocate_stats_buffer,
                    allreduce_stats)
 from .metrics import flatten_kmer, kmer_counts, kmer_line, lcr_counts, unflatten_kmer
 from .model import LoopedDiffusionLM, count_params
-from .objective import training_step, split_sizes
+from .objective import training_step
 from .sampler import decode_seqs, generate, write_fasta
 
 try:
@@ -56,22 +56,21 @@ def lr_lambda(step, warmup, total):
     return 0.5 * (1 + math.cos(math.pi * min(p, 1.0)))
 
 
-def build_d3pm_schedule(ocfg, mcfg, device):
-    """The D3PM base transition matrix -> Q/Qbar stacks. None when p_d3pm == 0."""
-    if ocfg.p_d3pm <= 0:
-        return None
-    K = mcfg.d3pm_vocab
-    if ocfg.d3pm_transition == "blosum":
+def build_schedule(ocfg, mcfg, device):
+    """The unified absorbing+substitution corruption process (src/corruption.py)."""
+    n = mcfg.vocab_size - 1                       # non-MASK states; MASK is the absorbing one
+    if ocfg.sub_kernel == "blosum":
         if not os.path.exists(BLOSUM_MAT):
             raise FileNotFoundError(
-                f"d3pm_transition='blosum' needs {BLOSUM_MAT}. Set PLD2_BLOSUM, or use "
-                f"d3pm_transition='uniform'.")
-        base = blosum_transition(BLOSUM_MAT, K, temp=ocfg.d3pm_blosum_temp)
-    elif ocfg.d3pm_transition == "uniform":
-        base = uniform_transition(K)
+                f"sub_kernel='blosum' needs {BLOSUM_MAT}. Set PLD2_BLOSUM, or use "
+                f"sub_kernel='uniform'.")
+        B = substitution_kernel(BLOSUM_MAT, n, temp=ocfg.sub_kernel_temp)
+    elif ocfg.sub_kernel == "uniform":
+        B = uniform_substitution_kernel(n)
     else:
-        raise ValueError(f"unknown d3pm_transition {ocfg.d3pm_transition!r}")
-    return D3PMSchedule(base, T=ocfg.d3pm_T, device=device)
+        raise ValueError(f"unknown sub_kernel {ocfg.sub_kernel!r}")
+    return CorruptionSchedule(B, mcfg.vocab_size, mcfg.mask_token_id,
+                              betas=ocfg.betas, T=ocfg.d3pm_T, device=device)
 
 
 # --- checkpointing (rank 0 writes; atomic via tmp+rename; latest.txt is the resume pointer) ---
@@ -81,13 +80,13 @@ def _atomic_save(obj, path):
     os.replace(tmp, path)
 
 
-def save_checkpoint(model, opt, sched, step, ckpt_dir, env, keep_last=3):
+def save_checkpoint(model, opt, lr_sched, step, ckpt_dir, env, keep_last=3):
     if not env.is_main:
         return
     os.makedirs(ckpt_dir, exist_ok=True)
     path = os.path.join(ckpt_dir, f"ckpt_{step:08d}.pt")
     _atomic_save({"model": model.state_dict(), "opt": opt.state_dict(),
-                  "sched": sched.state_dict(), "step": step}, path)
+                  "sched": lr_sched.state_dict(), "step": step}, path)
     tmp = os.path.join(ckpt_dir, "latest.txt.tmp")   # update the pointer only after a full write
     with open(tmp, "w") as f:
         f.write(os.path.basename(path))
@@ -130,7 +129,7 @@ def _peak_mem_gb(dev):
 # Training-time generative eval
 # --------------------------------------------------------------------------------------
 @torch.no_grad()
-def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp, d3pm_sched=None):
+def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp):
     """Decode eval_n sequences per rank at temperature 0.5, write FASTA, aggregate the metrics.
 
     EVERY rank runs this, in lockstep, because the metric all-reduce is a collective. Only the first
@@ -155,10 +154,7 @@ def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp, d3p
             eos_first=ocfg.sample_eos_first, min_len=ocfg.sample_min_len,
             eos_temp=ocfg.sample_eos_temp, rep_penalty=ocfg.sample_rep_penalty,
             rep_periods=ocfg.sample_rep_periods, max_run=ocfg.sample_max_run,
-            # The trainer already holds the schedule the objective uses, so a blended eval costs
-            # nothing to wire up. Off unless config.sample_d3pm_blend says otherwise.
-            d3pm_sched=d3pm_sched, d3pm_blend=ocfg.sample_d3pm_blend,
-            d3pm_t_start=ocfg.sample_d3pm_t_start or None, stats=gen_stats)
+            subst_per_residue=ocfg.sample_subst_per_residue, stats=gen_stats)
 
     seqs, _ = decode_seqs(canvas, mcfg)
     if env.rank < ocfg.eval_fasta_ranks:
@@ -171,22 +167,22 @@ def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp, d3p
     lcr, lcr_tot = lcr_counts(seqs)
     n_no_eos = sum(1 for v in lengths if v >= ocfg.eval_canvas)
     head = [float(len(lengths)), float(sum(lengths)), float(sum(v * v for v in lengths)),
-            float(n_no_eos), float(lcr), float(lcr_tot), float(gen_stats.get("n_revised", 0))]
+            float(n_no_eos), float(lcr), float(lcr_tot), float(gen_stats.get("n_subst", 0))]
     flat = allreduce_stats(head + flatten_kmer(kmer_counts(seqs, ocfg.kmer_ks), ocfg.kmer_ks), dev)
 
-    n, s1, s2, no_eos, lcr, lcr_tot, n_revised = flat[:7]
+    n, s1, s2, no_eos, lcr, lcr_tot, n_subst = flat[:7]
     torch.set_rng_state(rng_state)
     n = max(int(n), 1)
     mean = s1 / n
     var = s2 / n - mean * mean
     return {"n": n, "mean": mean, "sd": var ** 0.5 if var > 0 else 0.0,
-            "no_eos": int(no_eos), "lcr": lcr / max(lcr_tot, 1), "revised": n_revised / n,
+            "no_eos": int(no_eos), "lcr": lcr / max(lcr_tot, 1), "subst": n_subst / n,
             "kmer": unflatten_kmer(flat[7:], ocfg.kmer_ks),
             "seconds": time.perf_counter() - t0}
 
 
 def _eval_line(step, m, ocfg):
-    rev = f" | rev {m['revised']:.0f}/seq" if ocfg.sample_d3pm_blend > 0 else ""
+    rev = f" | sub {m['subst']:.0f}/seq" if ocfg.sample_subst_per_residue > 0 else ""
     return (f"[eval] step {step:>7} | len {m['mean']:.1f}+-{m['sd']:.1f} | "
             f"no-EOS {m['no_eos']}/{m['n']} | LCR {m['lcr']:.1%} | "
             f"{kmer_line(m['kmer'], ocfg.kmer_ks)}{rev} | {m['seconds']:.1f}s")
@@ -230,16 +226,17 @@ def main():
     broadcast_parameters(model)
 
     # --- objective ---
-    sched_d3pm = build_d3pm_schedule(ocfg, mcfg, dev)
+    sched = build_schedule(ocfg, mcfg, dev)
     batch_size = 2 if args.smoke else CFG.batch_size
-    n_d, n_o = split_sizes(batch_size, ocfg.p_d3pm)
     if env.is_main:
-        if sched_d3pm is not None:
-            print(f"[train] D3PM: transition={ocfg.d3pm_transition} K={sched_d3pm.K} "
-                  f"T={sched_d3pm.T} | TV(Qbar_T, uniform)={sched_d3pm.stationary_tv():.3f} "
-                  f"| unchanged fraction {sched_d3pm.corruption_curve()}", flush=True)
-        print(f"[train] rows/batch: {n_d} D3PM + {n_o} OADM (p_d3pm={ocfg.p_d3pm}) | "
-              f"eos_w={ocfg.eos_loss_weight} pad_w={ocfg.pad_loss_weight}", flush=True)
+        print(f"[train] corruption: kernel={ocfg.sub_kernel} T={sched.T} betas={sched.betas} "
+              f"| eos_w={ocfg.eos_loss_weight} pad_w={ocfg.pad_loss_weight} "
+              f"lambda={ocfg.ce_weight}", flush=True)
+        for bi, b in enumerate(sched.betas):
+            print(f"[train]   beta={b:<5} P(x_T=MASK)={sched.terminal_mask_fraction(bi):.4f} "
+                  f"(L_T ~ 0) | mask fraction {sched.mask_fraction(bi)} "
+                  f"| substituted among survivors at T/2: {sched.substitution_fraction(bi):.1%}",
+                  flush=True)
 
     # --- data ---
     shards = ProteinShards(UNIREF_SHARDS, mcfg.eos_token_id,
@@ -266,7 +263,7 @@ def main():
               f"requested={use_ipex}, ipex={'available' if ipex is not None else 'missing'})",
               flush=True)
     # Built AFTER ipex.optimize so it binds to the optimizer that actually steps.
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_lambda(s, ocfg.warmup_steps, total))
+    lr_sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_lambda(s, ocfg.warmup_steps, total))
 
     if raw is not None:
         ck = torch.load(io.BytesIO(raw), map_location=dev, weights_only=True)
@@ -277,7 +274,7 @@ def main():
         except Exception as ex:
             if env.is_main:
                 print(f"[ckpt] optimizer state not restored ({ex}); re-warming moments.", flush=True)
-        sched.load_state_dict(ck["sched"])
+        lr_sched.load_state_dict(ck["sched"])
         start_step = int(ck["step"]) + 1
         if env.is_main:
             print(f"[ckpt] resumed from {ckpt_path}: continuing at step {start_step}", flush=True)
@@ -317,12 +314,10 @@ def main():
         n_tok = batch["tokens"].numel()
         opt.zero_grad(set_to_none=True)
         with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
-            loss, m = training_step(model, batch, sched_d3pm, p_d3pm=ocfg.p_d3pm,
+            loss, m = training_step(model, batch, sched,
                                     eos_loss_weight=ocfg.eos_loss_weight,
                                     pad_loss_weight=ocfg.pad_loss_weight,
-                                    d3pm_ce_weight=ocfg.d3pm_ce_weight,
-                                    d3pm_vb_weight=ocfg.d3pm_vb_weight,
-                                    oadm_weight=ocfg.oadm_weight)
+                                    ce_weight=ocfg.ce_weight)
         loss.backward()
         nonfinite = average_gradients(model)
         if nonfinite:
@@ -339,7 +334,7 @@ def main():
             skip_streak = 0
             torch.nn.utils.clip_grad_norm_(model.parameters(), ocfg.grad_clip)
             opt.step()
-        sched.step()
+        lr_sched.step()
         tok_win += n_tok
         steps_win += 1
 
@@ -348,8 +343,9 @@ def main():
             dt = max(time.perf_counter() - t_win, 1e-9)
             peak = _peak_mem_gb(dev)
             print(f"step {step:>7} | loss {float(m['loss']):.3f} "
-                  f"(oadm {float(m['oadm']):.3f} vb {float(m['d3pm_vb']):.4f} "
-                  f"ce {float(m['d3pm_ce']):.3f}) | lr {sched.get_last_lr()[0]:.2e} | "
+                  f"(vb {float(m['vb']):.4f} ce {float(m['ce']):.3f}) "
+                  f"| corrupt {float(m['masked']):.0%}m {float(m['subst']):.0%}s "
+                  f"| lr {lr_sched.get_last_lr()[0]:.2e} | "
                   f"{tok_win / dt / 1e3:.0f}k tok/s | {dt / steps_win:.2f}s/step"
                   f"{f' | peak {peak:.1f}GB' if peak else ''}"
                   f"{f' | eval {100 * t_eval / (t_eval + dt):.1f}% of wall' if t_eval else ''}"
@@ -358,20 +354,19 @@ def main():
 
         if eval_every and step > 0 and step % eval_every == 0:
             te = time.perf_counter()
-            stats = generative_eval(model, dev, mcfg, ocfg, step, env, SAMPLES_DIR, use_amp,
-                                    d3pm_sched=sched_d3pm)
+            stats = generative_eval(model, dev, mcfg, ocfg, step, env, SAMPLES_DIR, use_amp)
             model.train()
             t_eval += time.perf_counter() - te
             if env.is_main:
                 print(_eval_line(step, stats, ocfg), flush=True)
 
         if step > 0 and step % ocfg.ckpt_every == 0:
-            save_checkpoint(model, opt, sched, step, CKPT_DIR, env)
+            save_checkpoint(model, opt, lr_sched, step, CKPT_DIR, env)
         step += 1
         if step >= total:
             break
 
-    save_checkpoint(model, opt, sched, step - 1, CKPT_DIR, env)     # final checkpoint
+    save_checkpoint(model, opt, lr_sched, step - 1, CKPT_DIR, env)     # final checkpoint
     if env.is_main:
         print(f"[train] done at step {step}", flush=True)
     barrier()

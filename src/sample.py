@@ -17,7 +17,6 @@ import torch
 
 from config import CFG, CKPT_DIR
 from .dist import init_distributed
-from .sampler import default_t_start
 from .metrics import kmer_counts, kmer_line, lcr_counts, length_stats
 from .model import LoopedDiffusionLM
 from .sampler import decode_seqs, generate, write_fasta
@@ -52,14 +51,10 @@ def main():
     ap.add_argument("--max-run", type=int, default=ocfg.sample_max_run,
                     help="hard cap on identical consecutive residues (0 disables). Needs "
                          "--steps ~= --canvas to bite; see the sampler's n_steps warning")
-    ap.add_argument("--d3pm-blend", type=float, default=ocfg.sample_d3pm_blend,
-                    help="OADM->D3PM blend: 0 = absorbing-only decode (bit-identical to the old "
-                         "sampler), 1 = revise every committed residue every step. The channel "
-                         "amplifies the model's x0 belief, so A/B it against 0 on the metrics "
-                         "before trusting it -- see src/sampler.generate")
-    ap.add_argument("--d3pm-t-start", type=int, default=ocfg.sample_d3pm_t_start or 0,
-                    help="where the revision anneal begins (0 = T//10, chosen from the measured "
-                         "authority curve). Higher weakens the channel, lower makes it bite sooner")
+    ap.add_argument("--subst-per-residue", type=float, default=ocfg.sample_subst_per_residue,
+                    help="substitution budget as expected edits per decodable position over the "
+                         "whole decode. 0 = pure absorbing decoding. The decoder ranks unmask and "
+                         "substitute edits on one confidence scale; see src/sampler.generate")
     ap.add_argument("--recurrence", type=int, default=None,
                     help="override the number of loop passes (adaptive compute at inference)")
     ap.add_argument("--seed", type=int, default=0)
@@ -83,14 +78,9 @@ def main():
     # Seed HERE, immediately before decoding. Seeding before the model is built would make --seed
     # control model-init-plus-sampling: the ~55M random draws load_state_dict throws away still
     # advance the RNG, so any architecture change would silently shift the sample stream.
-    # The blend needs the same Q/Qbar stacks the objective uses; build them only if asked.
-    d3pm_sched = None
-    if args.d3pm_blend > 0:
-        from .train import build_d3pm_schedule
-        d3pm_sched = build_d3pm_schedule(CFG.opt, mcfg, dev)
-        t0 = args.d3pm_t_start or default_t_start(d3pm_sched.T)
-        print(f"[sample] blended decode: d3pm_blend={args.d3pm_blend} t {t0} -> 1 over "
-              f"{args.steps or args.canvas} steps ({ocfg.d3pm_transition} transition)", flush=True)
+    if args.subst_per_residue > 0:
+        print(f"[sample] unified edit decode: unmask + substitute on one confidence scale, "
+              f"budget {args.subst_per_residue} substitutions per decodable position", flush=True)
 
     torch.manual_seed(args.seed)
 
@@ -104,13 +94,12 @@ def main():
             eos_first=not args.no_eos_first, min_len=args.min_len, eos_temp=args.eos_temp,
             rep_penalty=args.rep_penalty, max_run=args.max_run,
             rep_periods=ocfg.sample_rep_periods, n_recurrence=args.recurrence,
-            d3pm_sched=d3pm_sched, d3pm_blend=args.d3pm_blend,
-            d3pm_t_start=args.d3pm_t_start or None, stats=gen_stats)
+            subst_per_residue=args.subst_per_residue, stats=gen_stats)
 
     seqs, _ = decode_seqs(canvas, mcfg)
     mean, sd = length_stats([len(s) for s in seqs])
     lcr, tot = lcr_counts(seqs)
-    rev = f" | rev {gen_stats.get('revisions_per_seq', 0):.0f}/seq" if args.d3pm_blend > 0 else ""
+    rev = f" | sub {gen_stats.get('subst_per_seq', 0):.0f}/seq" if args.subst_per_residue > 0 else ""
     print(f"[sample] len {mean:.1f}+-{sd:.1f} | no-EOS {sum(1 for v in lengths if v >= args.canvas)}"
           f"/{len(lengths)} | LCR {lcr / max(tot, 1):.1%} | "
           f"{kmer_line(kmer_counts(seqs, ocfg.kmer_ks), ocfg.kmer_ks)}{rev}", flush=True)

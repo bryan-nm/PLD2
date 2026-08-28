@@ -46,8 +46,8 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 @dataclass
 class Config:
     # Vocab: 20 AA (ids 0..19) + EOS + PAD + MASK. MASK is deliberately the LAST id, so the D3PM
-    # alphabet -- which has no absorbing state -- is exactly logits[..., :vocab_size-1]. d3pm.py
-    # relies on that; assert_vocab() below is the contract.
+    # non-MASK state space -- the states x_0 can actually take -- is exactly
+    # logits[..., :vocab_size-1]. corruption.py relies on that; assert_vocab() below is the contract.
     vocab_size: int = 23
     eos_token_id: int = 20    # length marker: the model predicts EOS; its position = sequence length
     pad_token_id: int = 21    # post-EOS filler; MODELLED and attended, not attention filler
@@ -76,8 +76,8 @@ class Config:
         return self
 
     @property
-    def d3pm_vocab(self) -> int:
-        """Size of the D3PM state space: everything except the absorbing MASK state."""
+    def n_states(self) -> int:
+        """Number of states x_0 can take: everything except the absorbing MASK state."""
         return self.vocab_size - 1
 
 

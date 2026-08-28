@@ -25,41 +25,81 @@ touches only output logits and needs nothing from the architecture.
 | # | Instruction | Where |
 |---|---|---|
 | 1 | All layers the same width | `src/model.py` — `PBBlock`/`PBConditioning`/`PBCrossAttention` deleted; one `Block` type at `d_model` |
-| 2 | Keep the OADM ↔ D3PM slider | `config.OptCfg.p_d3pm` (0 = pure OADM, 1 = pure D3PM) |
-| 3 | Train on **both** objectives | `src/objective.training_step` — a fixed row split runs both in one forward pass |
+| 2 | Keep the OADM ↔ substitution slider | `config.OptCfg.betas` — β is a parameter of one corruption process |
+| 3 | Train on **both** move types | `src/objective.training_step` — one ELBO covers unmasking *and* substitution |
 | 4 | ~50k steps | `config.OptCfg.total_steps = 50_000`, cosine after 2k warmup |
 | 5 | No cross-attention, no labelled data | no text pathway anywhere; `src/data.py` reads UniRef shards only |
 | 6 | Upweight EOS | `config.OptCfg.eos_loss_weight = 20.0`, applied in both loss branches |
 | 7 | Fixed 512 canvas | `config.DataCfg.canvas = 512`; length bucketing removed entirely |
 | 8 | Eval at T=0.5 → FASTA → ESMFold; repetition above the LCR scale | `src/train.generative_eval` + `src/fold_fasta.py` + `src/metrics.kmer_counts` |
 
-### 2 & 3 — the slider is now real
+### 2 & 3 — one process with MASK absorbing, β as its parameter
 
-ProLoopDiff's `beta` mixed the **corruption** per position (MASK vs substitution) while always
-scoring with the absorbing-state surrogate cross-entropy. The D3PM half of the model was therefore
-trained against the wrong likelihood; its own README listed "tight D3PM KL-ELBO" as the missing
-piece. PLD2 implements it (`src/d3pm.py`), and `p_d3pm` switches the **loss along with the
-corruption**:
+PLD2 is **a single diffusion whose absorbing state is MASK**. Per step, a non-MASK position
 
-- **OADM rows** — absorbing corruption, `n ~ U(1, 512)` positions → MASK, scored by the reweighted
-  mean cross-entropy (the ARDM/OADM ELBO term, exact).
-- **D3PM rows** — `t ~ U(1, T)`, `x_t ~ Cat(x_0 Q̄_t)` over the 22-token non-MASK alphabet, scored by
-  `KL(q(x_{t-1}|x_t,x_0) ‖ p_θ(x_{t-1}|x_t))` plus EvoDiff's optional λ·CE term.
+    stays          with probability 1 − c_t
+    → MASK         with probability β · c_t          (absorbing)
+    → substitute   with probability (1 − β) · c_t    (BLOSUM-weighted, zero diagonal)
 
-Both run in **one forward pass**: rows `[0, n_d3pm)` are D3PM, the rest OADM, with `n_d3pm` a Python
-int fixed for the run — one static graph, no boolean gathers, no host syncs.
+so β is literally *"of the corruption events that happen, what fraction are maskings"*. β=1 is
+exactly OADM's corruption; β<1 enriches **the same trajectories** with substitution moves.
 
-Two details worth knowing:
+**Why MASK-absorbing rather than EvoDiff's D3PM.** EvoDiff's D3PM corrupts toward a *uniform*
+stationary distribution with no mask state, so it cold-starts generation from uniform-random amino
+acids and never gets the clean "this position is definitely unknown" signal or the implicit
+known-count signal. That is a large part of why it lost to OADM and failed to scale. Here MASK is
+absorbing and reachable from every state at every β > 0, so:
 
-- **EOS and PAD are in the D3PM state space.** A D3PM row has its boundary corrupted like anything
-  else, so this branch trains the model to *repair a misplaced EOS* — directly on ProLoopDiff's
-  failure (53% of its samples never placed EOS at all).
-- **The β-schedule is calibrated, not copied.** Sohl-Dickstein's `β_t = 1/(T-t+1)` is exactly linear
-  for a *uniform* base but not for BLOSUM, which is strongly self-preferring: borrowing it leaves
-  44% of tokens unchanged at `t = T`, nowhere near the stationary distribution the ELBO assumes when
-  it drops `L_T`. `d3pm.calibrate_betas` solves numerically for the schedule that puts BLOSUM on the
-  uniform case's corruption curve — and reproduces `1/(T-t+1)` to 1e-6 for a uniform base, so
-  there is one code path. `D3PMSchedule.stationary_tv()` reports the residual and warns if it is large.
+- the stationary distribution is **all-MASK for the whole family** — generation always cold-starts
+  from a fully-masked canvas, and β does not change what the sampler starts from;
+- the known-count signal that makes OADM scale is preserved;
+- `L_T` is genuinely ~0 rather than dropped on credit — measured `P(x_T = MASK)` is 0.999–1.000 at
+  every β, i.e. `q(x_T|x_0)` *is* the canvas the sampler starts from;
+- and the BLOSUM-graded substitution channel is enriched into those same trajectories, buying the
+  learned token→token repair that pure absorbing genuinely lacks.
+
+**One ELBO, not two objectives.** `L = L_vb + λ·L_ce` over the unified `Q`. `L_vb` covers *both*
+move types in one term — unmasking an absorbed position and substituting a placed one — which is the
+whole point of doing it this way. At `t=1` it reduces to `L_0 = −log p_θ(x_0|x_1)` with no special
+case. `λ` defaults to 1 (EvoDiff used 0) because at β=1 that term *is* the OADM cross-entropy, so
+the objective that demonstrably works remains a component rather than being replaced.
+
+**The β-schedule is closed-form, not calibrated.** Pinning the cumulative mask fraction to the
+linear target `t/T` gives `β·c_t = 1/(T−t+1)`, hence `c_t = min(1, 1/(β(T−t+1)))`. The clamp binds
+only over the last ⌈1/β⌉ steps, where survival is already ~1e-3. Measured mask fraction at every β:
+`{0: 0.0, 100: 0.2, 250: 0.5, 400: 0.8, 500: ≈1.0}` — exactly linear. The numerical Sinkhorn +
+bisection calibration an earlier version needed is gone along with the uniform-stationary
+requirement that motivated it.
+
+**A distribution over β is the default**, `(1.0, 0.9, 0.75, 0.5)`, assigned round-robin across rows.
+This is only coherent *because* there is one process: β selects which transition matrix a row is
+corrupted by, and one ELBO scores them all. Mixing β under a two-objective design would blur two
+different bounds together — which is exactly ProLoopDiff's mistake. Measured substitution footprint
+among still-unmasked positions at `t=T/2`: **0%, 7.4%, 20.3%, 47.8%**.
+
+### Decoding mirrors the process
+
+Every step, each position proposes exactly one candidate edit — **unmask** if masked, **substitute**
+if already committed — and the highest-confidence edits win. No staged decode-then-correct pass, no
+second schedule: substitution is a first-class move throughout, which is what the objective trains.
+
+Both are scored by the model's probability for the token being written. Substitutions are *drawn*
+from a distribution with the incumbent removed (an edit has to change something) but *scored* under
+the original — that asymmetry is the mechanism. A position the model is already happy with has all
+its mass on the current token, so its best alternative scores near zero and never wins a slot.
+Renormalising would destroy exactly that signal.
+
+**The unmask quota is a floor, and has to be.** A single global ranking can starve the mask channel:
+if substitutions keep out-scoring unmask edits, masks never commit and the canvas never resolves.
+So the cosine schedule's unmask count is taken first and guaranteed, and only the remaining budget is
+ranked globally (where an unmask can still win, so the floor is never a cap). Termination is
+therefore exactly as before — the cosine target is 0 at the final step.
+
+`subst_per_residue` is the budget, in expected edits per decodable position over the whole decode.
+The per-step allowance is constant, so early steps (few committed residues) spend little and late
+steps spend it all — the OADM-like → substitution-rich ramp falls out of the canvas filling up
+rather than needing a schedule. It defaults to **0.0** pending a real checkpoint; A/B it with
+`python -m src.sample --subst-per-residue 0` vs `1.0`.
 
 ### 6 — the EOS arithmetic
 
@@ -104,89 +144,17 @@ repeats; the question is never "is `rep_frac > 0`" but "how far above natural, a
 ## Sampling
 
 Confidence-ordered (MaskGIT) decoding with **EOS committed first**, a repetition penalty over
-periods 1–5 with a hard run cap, and optional remask / substitution corrector sweeps. Defaults live
-in `CFG.opt` so `src/train.py`'s eval and `src/sample.py` cannot drift apart.
+periods 1–5 with a hard run cap, and — when `subst_per_residue > 0` — substitution as a first-class
+move alongside unmasking (see *Decoding mirrors the process*). Optional post-decode corrector sweeps
+remain. Defaults live in `CFG.opt` so `src/train.py`'s eval and `src/sample.py` cannot drift apart.
+
+**Bounded wall time.** Both move types are chosen from the *same* forward pass and nothing iterates
+to convergence, so model forwards are exactly `1 (eos_first) + n_steps + n_corrector × (2 if remask
+else 1)` regardless of the substitution budget. `python -m src.tests_sampler` asserts that count
+alongside well-formedness across 36 option combinations.
 
 Temperature defaults to **0.5**: at ProLoopDiff's 181k checkpoint, T=1.0 folded to pLDDT 33.9 —
 *below* its 37.5 shuffled baseline — while T=0.5 gave 55.2 with 21% of samples over 70.
-
-### The OADM → D3PM blended decode
-
-Training both objectives but decoding with only the absorbing one leaves half the model unused at
-generation. `d3pm_blend > 0` runs **both channels in every step**:
-
-| channel | decides | mechanism |
-|---|---|---|
-| absorbing | *where* content exists | unchanged — cosine-scheduled confidence-ordered commits |
-| D3PM | *what* that content is | one reverse step `p_θ(x_{t-1}\|x_t)` on every already-committed residue |
-
-The balance shifts from OADM-like to D3PM-like on its own, from two ramps, neither hand-tuned:
-
-- **Coverage ramps up by itself** — the D3PM channel acts on committed positions, and that set grows
-  from ~0 to the whole canvas. Step 1 revises nothing; the last steps revise everything.
-- **Authority ramps up as `t` anneals `t_start → 1`**, which runs *opposite to intuition*. Measured
-  single-step `P(x_{t-1} ≠ x_t)`:
-
-  | t | 400 | 300 | 200 | 100 | 50 | 10 | 1 |
-  |---|---|---|---|---|---|---|---|
-  | model **disagrees** | 1.1% | 0.8% | 0.8% | 1.2% | 2.2% | 10.2% | **100%** |
-  | model **agrees** | 0.13% | 0.03% | 0.01% | 0.00% | 0.00% | 0.00% | **0.00%** |
-
-  At large `t`, `Q̄_{t-1}` is near-uniform so `c = p̃ Q̄_{t-1}` is flat and cannot outvote the
-  stay-mass in `Q_t`. At small `t` it is near-identity, so `c[x_t]` collapses the moment the model
-  points elsewhere. This is also why `t_start` defaults to `T//10 = 50` rather than `T`: a linear
-  `T → 1` ramp spends ~90% of the decode in the ~1% dead band.
-
-**Both guarantees hold by construction, not by tuning — and the second one is about wall time, not
-just step count.**
-
-- *All masks decoded in exactly `n_steps`* — the absorbing schedule is untouched and its cosine
-  target is exactly 0 on the final step. The D3PM channel **cannot** interfere, because its state
-  space has no MASK to emit (`K = vocab_size − 1`). The channels are separable structurally.
-- *Bounded wall time* — the worry worth having about a predictor–corrector sampler is a corrector
-  that iterates to convergence, so the decode grinds on refining while masks remain. **Nothing here
-  iterates.** The D3PM channel is one gather, one (22×22) matmul and one categorical draw per step,
-  off logits the absorbing commit already needed. There is no inner loop and no convergence test, so
-  total model forwards are exactly
-
-  ```
-  forwards = 1 (eos_first) + n_steps + n_corrector × (2 if remask else 1)
-  ```
-
-  independent of the blend. Measured on a 96-wide canvas: **97 forwards at `blend=0` and 97 at
-  `blend=1.0`**, 1.07s vs 1.10s. `python -m src.tests_sampler` asserts the exact forward count
-  alongside well-formedness across all 36 option combinations.
-
-Well-formedness is preserved by restricting revision to committed **residues** and constraining the
-posterior to residue columns. That second part is not redundant and cost a real bug: `p̃(EOS)=0`
-does *not* make the posterior zero at EOS, because `Q̄_{t-1}[i, EOS] > 0` for every `i` — the very
-property that lets the D3PM training branch learn boundary repair. A residue was revised into an
-EOS and the next step's `_enforce_eos` truncated the sequence to length 0.
-
-**The honest limit, and why it defaults to off.** This channel is a faithful amplifier of the
-model's own `x₀` belief. On a deliberately overfit toy (4 memorised sequences, 6 residues corrupted
-in each), two sequences went 6 errors → **0** and two went 6 → **26** and 6 → **15**. That looks
-like the sampler breaking things — but the model's own `argmax p̃` on those same inputs already
-differed from truth at 24/28 and 15/16 positions *before any revision ran*. The channel converged
-each sequence to the model's belief, exactly as designed; on two of them the belief was wrong.
-Flooring the anneal above `t=1` does not help (swept `t_end` = 1, 3, 5, 10, 20, 50 → 41, 41, 40, 40,
-37, 35 total errors, all dominated by the belief), which is why there is **no `t_end` knob** — it
-would look like a safety control without being one.
-
-So it cleans up a good model and confidently corrupts a bad one, and that cannot be settled from the
-mechanism alone. `sample_d3pm_blend` defaults to **0.0**; A/B it on the first real checkpoint:
-
-```bash
-python -m src.sample --n 128 --d3pm-blend 0   --out off.fasta
-python -m src.sample --n 128 --d3pm-blend 1.0 --out on.fasta
-```
-
-and compare the k-mer repetition columns and folded pLDDT. Note the specific risk for PLD2's failure
-mode: **repeats are high-likelihood**, so an unrestrained pull toward the model's belief could as
-easily drive samples *into* repetition as out of it. The repetition penalty is applied to the
-revision path for exactly this reason, and the k-mer metrics are what would show it either way.
-Setting `sample_d3pm_blend` in `config.py` turns it on for the training-time eval too (which reports
-a `rev N/seq` column), which is why it lives there rather than only behind a flag.
 
 `n_steps` must stay ≈ the canvas width whenever the repetition penalty is on. The penalty scores each
 position against the canvas *before* that step's commits, so co-committed positions are invisible to
@@ -200,15 +168,16 @@ config.py             # owns ALL paths + model/data/opt config (python config.py
 src/
   model.py            # looped uniform-width transformer (no PB layers, no cross-attention)
   blosum.py           # BLOSUM62 -> substitution matrix + doubly-stochastic D3PM base (Sinkhorn)
-  d3pm.py             # calibrated beta schedule, Q/Qbar stacks, posteriors, reverse step, KL
-  objective.py        # OADM + D3PM losses, EOS/PAD weighting, one-forward training_step
-  sampler.py          # confidence-ordered decoding, EOS-first, rep penalty, D3PM blend, correctors
+  corruption.py       # the unified process: absorbing MASK + BLOSUM substitution, Q/Qbar, ELBO
+  objective.py        # the single ELBO (L_vb + lambda L_ce), EOS/PAD weighting, training_step
+  sampler.py          # unified edit decoding (unmask|substitute), EOS-first, rep penalty
   metrics.py          # SEG-LCR + long-range k-mer repetition (k > SEG window)
   data.py             # tokenizer, shard reader w/ holdout, stateless step-keyed batch sampler
   train.py            # training loop + training-time generative eval -> FASTA
   sample.py           # ad-hoc unconditional sampling -> FASTA
   make_baselines.py   # held-out natural + shuffled reference FASTAs
   tests_sampler.py    # cross-product regression: well-formedness + exact forward count
+  tests_corruption.py # the corruption math, checked against independent computations
   fold_fasta.py       # ESMFold on FASTA -> JSONL, resumable, --watch mode
   preprocess_fasta.py # UniRef FASTA -> packed uint8 shards
   dist.py             # Aurora XPU + oneCCL bootstrap, grad/stat all-reduce buffers
@@ -227,9 +196,10 @@ PLD2_UNIREF_SHARDS=/path/to/shards python -m src.train --smoke --fresh --device 
 # self-tests, each with a stated expectation
 python -m src.model            # uniform widths; init cross-entropy ~ ln(23)
 python -m src.blosum <mat>     # row/doubly-stochastic checks; A->S I->V K->R W->Y
-python -m src.objective        # both objective branches wired up and optimising
+python -m src.objective        # one loss trains both move types; corruption line shows both
 python -m src.metrics          # a hidden 20-mer repeat is invisible to LCR, visible at k13
 python -m src.tests_sampler    # 36 decode configs: well-formed, and exactly N forwards
+python -m src.tests_corruption # MASK absorbing, L_T ~ 0, Qbar vs explicit product, KL identities
 
 # Aurora
 qsub scripts/train.pbs                 # training + co-scheduled ESMFold watcher
