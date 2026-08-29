@@ -284,6 +284,20 @@ def main():
         if env.is_main:
             print(f"[ckpt] resumed from {ckpt_path}: continuing at step {start_step}", flush=True)
 
+    # A checkpoint at or past total_steps yields ZERO batches, so the job would load the old
+    # weights, train nothing, re-save, and exit 0 -- burning a queue slot and looking like success.
+    # Refuse instead. This is the shape of the mistake that follows every completed run: the next
+    # experiment is launched into a CKPT_DIR that still holds the finished one.
+    if start_step >= total:
+        raise RuntimeError(
+            f"checkpoint is already at step {start_step - 1} and total_steps is {total}, so this "
+            f"run would train 0 steps and exit successfully. Pick one:\n"
+            f"  --fresh                      start over, ignoring {CKPT_DIR}\n"
+            f"  --max-steps N (N > {start_step})   continue the SAME run for longer\n"
+            f"  archive {CKPT_DIR} first     start a new run and keep the old one for comparison\n"
+            f"NOTE: those weights were trained under whatever objective was current then; "
+            f"continuing them is not a test of any change made since.")
+
     # The sampler is a pure function of (seed, step, rank), so a resumed run walks EXACTLY the batch
     # sequence the original would have. ProLoopDiff's epoch-seeded permutation did not, which is why
     # its resumed jobs could fault a few steps past a checkpoint the original had sailed through.

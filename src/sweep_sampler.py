@@ -63,13 +63,15 @@ def configurations(ocfg):
         return d
     off = dict(rep_penalty=0.0, max_run=0)
     return {
-        "default":        v(),                                   # reference: the shipped config
-        # --- which half of the anti-repetition machinery mattered? ---
-        "no_reppen":      v(**off),                              # both off: the known-good point
-        "penalty_off":    v(rep_penalty=0.0),                    # ...but keep the hard run cap
-        "maxrun_off":     v(max_run=0),                          # ...but keep the periodic penalty
-        "reppen_soft":    v(rep_penalty=0.3),                    # is a light touch harmless?
-        "periods_1_2":    v(rep_periods=(1, 2)),                 # leave helical 3/4 periodicity alone
+        "default":        v(),                                   # the shipped config, now the good one
+        # --- anti-repetition, stated ABSOLUTELY rather than relative to the base. The base has
+        #     since moved to rep_penalty=0 / max_run=5, and configurations written as deltas from it
+        #     silently collapsed onto each other (default==penalty_off, no_reppen==maxrun_off) --
+        #     two of twelve tiles doing duplicate work.
+        "reppen_1.5":     v(rep_penalty=1.5, max_run=5),         # the OLD default: negative control
+        "reppen_soft":    v(rep_penalty=0.3, max_run=5),         # is a light touch harmless?
+        "no_maxrun":      v(rep_penalty=0.0, max_run=0),         # is the run cap doing anything?
+        "periods_1_2":    v(rep_penalty=1.5, max_run=5, rep_periods=(1, 2)),  # spare helical 3/4
         # --- everything else, built ON TOP of rep_penalty=0 ---
         "nr_t0.8":        v(**off, temperature=0.8),
         "nr_t1.2":        v(**off, temperature=1.2),
