@@ -191,6 +191,8 @@ src/
   tests_sampler.py    # cross-product regression: well-formedness + exact forward count
   tests_corruption.py # the corruption math, checked against independent computations
   inspect_shards.py   # shard length distribution, corpus ordering, .idx/.bin integrity
+  ce_curve.py         # held-out CE by corruption level vs uniform/unigram -- what the loss hides
+  sweep_sampler.py    # one FASTA per sampler config, scored side by side by the fold pipeline
   fold_fasta.py       # ESMFold on FASTA -> JSONL, resumable, --watch mode
   preprocess_fasta.py # UniRef FASTA -> packed uint8 shards
   dist.py             # Aurora XPU + oneCCL bootstrap, grad/stat all-reduce buffers
@@ -213,6 +215,10 @@ python -m src.objective        # one loss trains both move types; corruption lin
 python -m src.metrics          # a hidden 20-mer repeat is invisible to LCR, visible at k13
 python -m src.tests_sampler    # 36 decode configs: well-formed, and exactly N forwards
 python -m src.tests_corruption # MASK absorbing, L_T ~ 0, Qbar vs explicit product, KL identities
+
+# diagnosis, when generations fold at the floor
+python -m src.ce_curve         # does the model know anything at COLD START, or only composition?
+python -m src.sweep_sampler    # is the sampler destroying what it does know?
 
 # Aurora
 qsub scripts/train.pbs                 # training + co-scheduled ESMFold watcher
@@ -302,5 +308,13 @@ The `[eval]` line every 1000 steps carries the whole story:
 - **`LCR`** catches short-range degeneration, **`k13/k20/k30 rep`** catches the long-range kind the
   sampler's penalty cannot touch, and **`shar`** catches collapse across samples.
 - **pLDDT / pTM** arrive separately in the `[fold]` table. The number that matters is not pLDDT
-  itself but pLDDT *relative to the shuffled row*: ProLoopDiff's 181k checkpoint at T=1.0 scored
-  below its own shuffled baseline, which is what "learned composition, not structure" looks like.
+  itself but pLDDT *relative to the shuffled row*: a checkpoint scoring below its own shuffled
+  baseline is what "learned composition, not structure" looks like.
+- **LCR below the *shuffled* row is a red flag, not a good sign.** Chance alone produces ~4.7%;
+  anything under that means the sampler is suppressing local compositional structure that real
+  proteins have. The first PLD2 run posted 0.0% across 17k residues — see `src/sweep_sampler.py`.
+
+If pLDDT sits at the floor and does not move with training, two very different things can cause it
+and they need different fixes. `python -m src.ce_curve` asks whether the model knows anything at the
+100%-corrupted end where generation actually starts; `python -m src.sweep_sampler` asks whether the
+sampler is destroying what it does know. Run both before changing anything.
