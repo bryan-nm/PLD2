@@ -15,6 +15,20 @@ Aurora aborts the process outright with a GPU page fault often enough that it mu
 take the trainer with it, and it installs process-global monkey-patches on torch.linalg and F.linear
 that have no business inside an ipex-optimised training process.
 
+GRADIENT ACCUMULATION. `step` throughout this file means an OPTIMIZER step: the LR schedule, the
+eval cadence, checkpointing and total_steps all count those. Each one runs `grad_accum` forward/
+backward micro-batches, and the single coalesced all-reduce happens once at the end of them. That
+decouples two things that were previously the same knob:
+
+  * the global batch, which wants to be large enough for the model (a 1.35B model on a 0.7M-token
+    batch is under-batched), and
+  * how often the full fp32 gradient crosses the fabric, which is what actually caps model size
+    here -- traffic goes as params / step-time, so a 25x parameter increase at a smaller
+    micro-batch would have pushed ~16x the bytes per second of the 55M run.
+
+The log reports the measured all-reduce share of each step, because that number decides whether
+grad_accum is tuned right and it was previously invisible.
+
 Launch (Aurora): scripts/train.pbs. Local smoke:
     PLD2_UNIREF_SHARDS=/path/to/shards python -m src.train --smoke
 """
@@ -207,12 +221,18 @@ def main():
     if args.grad_checkpoint is not None:
         mcfg.grad_checkpoint = args.grad_checkpoint
     if args.smoke:
-        # A smoke run exercises every code path -- both objective branches, the eval, the FASTA
-        # write, checkpoint save/resume -- at the REAL model dimensions, on a canvas small enough to
-        # finish on a laptop CPU. Only the shapes shrink; nothing is stubbed out.
+        # A smoke run exercises every code path -- the objective, gradient accumulation, the eval,
+        # the FASTA write, checkpoint save/resume -- on a laptop CPU. Unlike earlier versions this
+        # SHRINKS THE MODEL too: the real config is 1.35B parameters, which is 5.4GB of weights
+        # before optimizer state and not something to instantiate on a workstation. `python
+        # config.py` reports the real shape and parameter count; the job validates it for real.
+        mcfg.d_model, mcfg.n_heads, mcfg.d_ff = 256, 4, 768
+        mcfg.n_upstream, mcfg.n_middle, mcfg.n_downstream = 2, 6, 2
+        mcfg.checkpoint_chunk = 3
         dcfg.canvas, dcfg.num_workers = 128, 0
         ocfg.eval_n, ocfg.eval_canvas, ocfg.eval_steps = 2, 128, 32
         ocfg.eval_fasta_ranks, ocfg.sample_min_len, ocfg.warmup_steps = 1, 10, 5
+        ocfg.grad_accum = 2
 
     # Before anything else touches the allocator, so oneCCL's cached registration for the one buffer
     # it reduces every eval is taken from a clean heap and held for the life of the run.
@@ -227,7 +247,7 @@ def main():
 
     # --- objective ---
     sched = build_schedule(ocfg, mcfg, dev)
-    batch_size = 2 if args.smoke else CFG.batch_size
+    batch_size = 4 if args.smoke else CFG.batch_size
     if env.is_main:
         print(f"[train] corruption: kernel={ocfg.sub_kernel} T={sched.T} betas={sched.betas} "
               f"| eos_w={ocfg.eos_loss_weight} pad_w={ocfg.pad_loss_weight}", flush=True)
@@ -298,18 +318,32 @@ def main():
             f"NOTE: those weights were trained under whatever objective was current then; "
             f"continuing them is not a test of any change made since.")
 
-    # The sampler is a pure function of (seed, step, rank), so a resumed run walks EXACTLY the batch
-    # sequence the original would have. ProLoopDiff's epoch-seeded permutation did not, which is why
-    # its resumed jobs could fault a few steps past a checkpoint the original had sailed through.
+    # The sampler indexes MICRO-batches, so a resumed run walks exactly the micro-batch sequence the
+    # original would have -- the reproducibility property survives accumulation only if the sampler
+    # counts the same thing the data loader does.
+    accum = max(1, int(ocfg.grad_accum))
+    # objective.training_step assigns betas round-robin over the MICRO-batch, so a micro-batch that
+    # is not a multiple of len(betas) gives some betas more rows than others -- a silently skewed
+    # corruption mix rather than the balanced one the round-robin exists to guarantee.
+    if batch_size % len(ocfg.betas) and env.is_main:
+        print(f"[train] WARNING: micro-batch {batch_size} is not a multiple of "
+              f"len(betas)={len(ocfg.betas)}, so the beta mix is skewed "
+              f"({[sum(1 for i in range(batch_size) if i % len(ocfg.betas) == b) for b in range(len(ocfg.betas))]} "
+              f"rows per beta). Pick a micro-batch divisible by {len(ocfg.betas)}.", flush=True)
     sampler = StepBatchSampler(len(ds), batch_size, rank=env.rank, world=env.world_size,
-                               seed=ocfg.seed, start_step=start_step, total_steps=total)
+                               seed=ocfg.seed, start_step=start_step * accum,
+                               total_steps=total * accum)
     nw = dcfg.num_workers
     loader = torch.utils.data.DataLoader(
         ds, batch_sampler=sampler, num_workers=nw,
         collate_fn=make_collate(mcfg, dcfg.canvas),
         **({"prefetch_factor": dcfg.prefetch_factor, "persistent_workers": True} if nw > 0 else {}))
     if env.is_main:
-        epochs = batch_size * env.world_size * total / max(len(shards), 1)
+        epochs = batch_size * accum * env.world_size * total / max(len(shards), 1)
+        print(f"[train] batch: {batch_size}/rank x {accum} accum x {env.world_size} ranks = "
+              f"{batch_size * accum * env.world_size:,} sequences "
+              f"({batch_size * accum * env.world_size * dcfg.canvas / 1e6:.1f}M tokens) per "
+              f"optimizer step", flush=True)
         print(f"[train] corpus={len(shards):,} of {shards.n_total:,} sequences in "
               f"{shards.n_shards_total} shards "
               f"(holdout=every {dcfg.holdout_stride}th)" if dcfg.holdout_stride else "(no holdout)")
@@ -326,22 +360,39 @@ def main():
     eval_every = (10 if args.smoke else ocfg.eval_every)
     use_amp = dev.type in ("xpu", "cuda")
     step = start_step
-    tok_win, steps_win, t_win, t_eval = 0, 0, time.perf_counter(), 0.0
+    tok_win, steps_win, t_win, t_eval, t_comm = 0, 0, time.perf_counter(), 0.0, 0.0
     skipped, skip_streak = 0, 0
+    n_micro = 0
+    acc = {}
     model.train()
+    opt.zero_grad(set_to_none=True)
 
     for batch in loader:
         batch = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in batch.items()}
-        n_tok = batch["tokens"].numel()
-        opt.zero_grad(set_to_none=True)
+        tok_win += batch["tokens"].numel()
         with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
             loss, m = training_step(model, batch, sched,
                                     eos_loss_weight=ocfg.eos_loss_weight,
                                     pad_loss_weight=ocfg.pad_loss_weight,
                                     ce_weight=ocfg.ce_weight, vb_weight=ocfg.vb_weight,
                                     ce_uncorrupted_weight=ocfg.ce_uncorrupted_weight)
-        loss.backward()
+        # Scale so the accumulated gradient equals one pass over the full effective batch, rather
+        # than `accum` times it -- otherwise the effective learning rate scales with grad_accum.
+        (loss / accum).backward()
+        for k, v in m.items():
+            acc[k] = acc.get(k, 0.0) + float(v) / accum
+        n_micro += 1
+        if n_micro < accum:
+            continue
+        n_micro = 0
+
+        # ONE all-reduce per optimizer step. Timed behind a device sync so the number is the
+        # collective itself and not queued compute draining into it.
+        _device_sync(dev)
+        t_c = time.perf_counter()
         nonfinite = average_gradients(model)
+        t_comm += time.perf_counter() - t_c
+
         if nonfinite:
             skipped += 1
             skip_streak += 1
@@ -357,22 +408,23 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), ocfg.grad_clip)
             opt.step()
         lr_sched.step()
-        tok_win += n_tok
+        opt.zero_grad(set_to_none=True)
         steps_win += 1
 
         if env.is_main and step % log_every == 0:
-            _device_sync(dev)                       # finish queued work before reading the clock
+            _device_sync(dev)
             dt = max(time.perf_counter() - t_win, 1e-9)
             peak = _peak_mem_gb(dev)
-            print(f"step {step:>7} | loss {float(m['loss']):.3f} "
-                  f"(vb {float(m['vb']):.3f}[{float(m['vb_step']):.5f}/step] ce {float(m['ce']):.3f}) "
-                  f"| corrupt {float(m['masked']):.0%}m {float(m['subst']):.0%}s "
-                  f"| lr {lr_sched.get_last_lr()[0]:.2e} | "
-                  f"{tok_win / dt / 1e3:.0f}k tok/s | {dt / steps_win:.2f}s/step"
+            print(f"step {step:>7} | loss {acc['loss']:.3f} "
+                  f"(vb {acc['vb']:.3f}[{acc['vb_step']:.5f}/step] ce {acc['ce']:.3f}) "
+                  f"| corrupt {acc['masked']:.0%}m {acc['subst']:.0%}s "
+                  f"| lr {lr_sched.get_last_lr()[0]:.2e} | {tok_win / dt / 1e3:.0f}k tok/s "
+                  f"| {dt / steps_win:.2f}s/step | comm {100 * t_comm / dt:.0f}%"
                   f"{f' | peak {peak:.1f}GB' if peak else ''}"
-                  f"{f' | eval {100 * t_eval / (t_eval + dt):.1f}% of wall' if t_eval else ''}"
+                  f"{f' | eval {100 * t_eval / dt:.0f}%' if t_eval else ''}"
                   f"{f' | skipped {skipped}' if skipped else ''}", flush=True)
-            tok_win, steps_win, t_win, t_eval = 0, 0, time.perf_counter(), 0.0
+            tok_win, steps_win, t_win, t_eval, t_comm = 0, 0, time.perf_counter(), 0.0, 0.0
+        acc = {}
 
         if eval_every and step > 0 and step % eval_every == 0:
             te = time.perf_counter()

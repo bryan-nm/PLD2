@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
 #PBS -N pld2_train
-#PBS -l walltime=06:00:00
+#PBS -l walltime=24:00:00
 #PBS -l select=16
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fs
@@ -33,6 +33,11 @@
 #
 # TRAINING IS NEVER AT RISK FROM FOLDING. The watcher runs in the background and training in the
 # foreground, so a fold crash cannot touch the training ranks; the job's exit code is training's.
+# WALL CLOCK. At the 1.35B shape a micro-batch is ~1.41s and grad_accum is 4, so an optimizer step
+# is ~5.6s plus comm and ~4% eval: 12,000 steps is roughly 21h. If the queue cuts it short, just
+# resubmit -- the run resumes from latest.txt at the right optimizer step and keeps the SAME cosine
+# schedule, because total_steps is unchanged. Do NOT pass --max-steps to continue it; that would
+# reshape the LR schedule.
 cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./scripts/pbs_common.sh
 

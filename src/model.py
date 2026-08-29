@@ -63,6 +63,13 @@ class Config:
     n_recurrence: int = 3         # passes through the middle stack (adaptive-compute knob)
 
     grad_checkpoint: bool = True
+    # How many middle layers form ONE checkpoint segment. 0 = the whole stack as a single unit,
+    # which is what the looped design implied (n_middle=8 recomputed per recurrence pass) and what
+    # n_recurrence=1 with a deep middle stack makes wrong: 36 layers recomputed in one go holds all
+    # 36 sets of activations at peak. Segmenting stores one boundary tensor per segment (a few tens
+    # of MB) and caps the recompute peak at `checkpoint_chunk` layers, for identical total FLOPs.
+    # sqrt(n_middle) is the classic optimum; 6 for a 36-layer stack.
+    checkpoint_chunk: int = 6
 
     rope_base: float = 10000.0
     dropout: float = 0.0
@@ -211,6 +218,13 @@ class Block(nn.Module):
 # --------------------------------------------------------------------------------------
 # Model
 # --------------------------------------------------------------------------------------
+def _run_segment(layers, x, keep_mask):
+    """Run a contiguous run of blocks. Module-level so torch_checkpoint can call it directly."""
+    for l in layers:
+        x = l(x, keep_mask)
+    return x
+
+
 def _init_weights(m):
     if isinstance(m, nn.Linear):
         nn.init.normal_(m.weight, mean=0.0, std=0.02)
@@ -276,17 +290,16 @@ class LoopedDiffusionLM(nn.Module):
             x = l(x, keep_mask)
         h_up = x                                                # upstream output for re-injection
 
-        def _recurrence_pass(x, h_up, keep_mask):
-            x = x + torch.tanh(self.reinject_gate) * h_up
-            for l in self.mid_layers:
-                x = l(x, keep_mask)
-            return x
-
+        ckpt = cfg.grad_checkpoint and self.training
+        chunk = cfg.checkpoint_chunk or len(self.mid_layers)
         for _ in range(N):
-            if cfg.grad_checkpoint and self.training:
-                x = torch_checkpoint(_recurrence_pass, x, h_up, keep_mask, use_reentrant=False)
-            else:
-                x = _recurrence_pass(x, h_up, keep_mask)
+            x = x + torch.tanh(self.reinject_gate) * h_up
+            for i in range(0, len(self.mid_layers), chunk):
+                seg = self.mid_layers[i:i + chunk]
+                if ckpt:
+                    x = torch_checkpoint(_run_segment, seg, x, keep_mask, use_reentrant=False)
+                else:
+                    x = _run_segment(seg, x, keep_mask)
 
         for l in self.down_layers:
             x = l(x, keep_mask)

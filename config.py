@@ -64,11 +64,34 @@ class DataCfg:
 
 @dataclass
 class OptCfg:
-    # Per-rank token budget per step -> batch size B = global_batch_tokens // canvas = 64 at 512.
-    global_batch_tokens: int = 32768
-    lr: float = 3e-4
-    warmup_steps: int = 2000
-    total_steps: int = 50_000        # instruction 4
+    # Per-rank MICRO-batch, as a token budget -> B = global_batch_tokens // canvas = 8 at 512.
+    global_batch_tokens: int = 4096
+    # Micro-batches per optimizer step. Everything else in this file counts OPTIMIZER steps.
+    #
+    # This is what makes a 1.35B model reachable on this cluster. The trainer all-reduces the full
+    # fp32 gradient once per optimizer step, so fabric traffic goes as params / step-time: at 8
+    # sequences per rank the 1.35B model would push ~3.8 GB/s per rank against the 55M run's 0.24,
+    # and if the all-reduce were even 10% of a step there it would spend longer communicating than
+    # computing. Accumulating 4 micro-batches divides that by 4 AND lifts the global batch from
+    # 0.7M to 2.9M tokens, which is the right size for a model this large. Two problems, one knob.
+    #
+    # The log now reports the measured comm share of each step. If it comes back small, 16 x accum 2
+    # is the same effective batch with half the micro-step overhead; if large, raise accum.
+    #
+    # Estimated peak ~31GB of the 64GB tile: 27GB of weights + Adam + gradient + all-reduce buffer
+    # (20 B/param at 1.35B), and only ~4GB of activations because checkpoint_chunk=6 caps the
+    # recompute peak at 6 middle layers instead of all 36. Memory is not the binding constraint
+    # here; communication is, which is what this knob is for.
+    grad_accum: int = 4
+    # 2e-4 for 1.35B at a 2.9M-token batch, near GPT-3-1.3B's 2e-4 at 1M. The 3e-4 that a 55M model
+    # tolerated is not safe at 25x the parameters, especially now that the T-scaled vb term is live.
+    lr: float = 2e-4
+    warmup_steps: int = 3_000
+    # OPTIMIZER steps. ~17h at an estimated 5.6s/step (4 micro x 1.41s); resume extends it, and the
+    # first log lines give the real figure. 12k steps x 2.9M tokens = 35B token-slots = 17B real
+    # residues, against the ~27B a 1.35B model wants -- undertrained by design, since the previous
+    # run was 129x PAST that point at 55M and the diagnosis was capacity, not data.
+    total_steps: int = 12_000
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     # A non-finite gradient norm makes clip_grad_norm_'s coefficient NaN, which turns every parameter
@@ -129,8 +152,8 @@ class OptCfg:
     # and measure. Cost: eval runs eval_steps forwards on (eval_n, eval_canvas) while a training step
     # is ~3 forward-units on (B, canvas). At 512/8/512 vs 64/512 that is ~21 training steps, so
     # eval_every=1000 predicts ~2% of wall time (the trainer measures and logs the real figure).
-    eval_every: int = 1000           # 0 disables; aligned with ckpt_every so every ckpt gets numbers
-    eval_n: int = 8                  # sequences per RANK per eval (x world = the real sample count)
+    eval_every: int = 500            # 0 disables
+    eval_n: int = 4                  # sequences per RANK per eval (x world = the real sample count)
     eval_canvas: int = 512           # the training canvas = the model's length prior
     # Decoding steps. MUST stay ~= eval_canvas while the repetition penalty is on: the penalty scores
     # each position against the canvas BEFORE that step's commits, so positions committed in the same
@@ -230,7 +253,9 @@ class OptCfg:
 
     # bookkeeping
     log_every: int = 50
-    ckpt_every: int = 1000           # crashes are common on many tiles; save often
+    # A 1.35B checkpoint is ~16GB (fp32 weights + Adam moments), so this is no longer free: at
+    # keep_last=2 that is 32GB resident on flare and ~a minute of Lustre write per save.
+    ckpt_every: int = 1000
     seed: int = 0
 
 
@@ -244,10 +269,23 @@ class RunCfg:
         # Same dims as ProLoopDiff (~55M params) so the two runs are comparable. What changed is
         # what is NOT here: no pb_layers, no pb_dim, no n_pb_heads, no text_dim. Every layer is
         # d_model wide (instruction 1) and there is no conditioning pathway (instruction 5).
+        # 1.35B: d=1536, 44 distinct layers, NO loop. The 55M run was undersized, not
+        # undertrained -- it saw 142B residues, 129x past 20-per-parameter, and the compute already
+        # spent implies a Chinchilla-optimal ~0.9-1.3B.
+        #
+        # n_recurrence=1 is the substantive change beyond width. The loop spends n_recurrence x the
+        # middle stack's COMPUTE to avoid n_recurrence x its PARAMETERS -- the right trade when
+        # memory-bound, and the 55M run used 22% of a 64GB tile. At this width, 4+12x3+4 would cost
+        # 1.35B params' worth of FLOPs per token and keep only 613M of capacity; 4+36x1+4 has the
+        # same applied depth and the same cost, and keeps all 1.35B.
+        #
+        # 24 heads keeps head_dim at 64 (1536/24), the value ESM-2 uses at every scale. Leaving it
+        # at 8 would give 192-wide heads. d_ff stays 3x d_model.
         return ModelConfig(
             vocab_size=23, eos_token_id=20, pad_token_id=21, mask_token_id=22,
-            d_model=512, n_heads=8, d_ff=1536,
-            n_upstream=4, n_middle=8, n_downstream=4, n_recurrence=3,
+            d_model=1536, n_heads=24, d_ff=4608,
+            n_upstream=4, n_middle=36, n_downstream=4, n_recurrence=1,
+            checkpoint_chunk=6,
         )
 
     @property
@@ -270,8 +308,12 @@ if __name__ == "__main__":
     print(f"model          : d_model={m.d_model} d_ff={m.d_ff} heads={m.n_heads} "
           f"layers={m.n_upstream}+{m.n_middle}(x{m.n_recurrence})+{m.n_downstream} "
           f"vocab={m.vocab_size} (eos={m.eos_token_id} pad={m.pad_token_id} mask={m.mask_token_id})")
-    print(f"batch          : canvas={CFG.data.canvas} B={CFG.batch_size}/rank "
-          f"(rows split round-robin across {len(CFG.opt.betas)} betas)")
+    n_par = 13 * m.d_model ** 2 * (m.n_upstream + m.n_middle + m.n_downstream) / 1e6
+    print(f"params         : ~{n_par:.0f}M in {m.n_upstream + m.n_middle + m.n_downstream} distinct "
+          f"layers, {m.n_upstream + m.n_middle * m.n_recurrence + m.n_downstream} applied/token "
+          f"(head_dim={m.d_model // m.n_heads}, checkpoint_chunk={m.checkpoint_chunk})")
+    print(f"batch          : canvas={CFG.data.canvas} micro={CFG.batch_size}/rank x "
+          f"accum {CFG.opt.grad_accum} (rows split round-robin across {len(CFG.opt.betas)} betas)")
     print(f"objective      : betas={CFG.opt.betas} T={CFG.opt.d3pm_T} "
           f"kernel={CFG.opt.sub_kernel} | L = {CFG.opt.vb_weight}*T*E[KL] + "
           f"{CFG.opt.ce_weight}*L_ce(corrupted, uncorr_w={CFG.opt.ce_uncorrupted_weight}) | "
