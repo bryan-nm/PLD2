@@ -170,13 +170,20 @@ class OptCfg:
     #     >70      0% -> 6%
     # An LCR of exactly 0.0% across 17k residues, against 4.7% for a random shuffle, was the tell:
     # the penalty was suppressing local composition BELOW chance -- manufacturing the pathology it
-    # existed to prevent. scripts/sweep.pbs re-tests both halves separately (penalty_off vs
-    # maxrun_off); restore the run cap if it turns out to be harmless insurance.
+    # existed to prevent. The sweep then separated the two halves cleanly:
+    #     penalty_off (penalty off, run cap KEPT)  45.3  ~= no_reppen 45.4  -> cap is harmless
+    #     maxrun_off  (penalty on,  run cap off)   35.8  ~= default   35.7  -> penalty was ALL of it
+    # So the periodic logit penalty is off and the hard run cap stays as free insurance.
     sample_rep_penalty: float = 0.0  # per-period logit penalty for continuing a repeat
-    sample_max_run: int = 0          # hard cap on identical consecutive residues (0 disables)
+    sample_max_run: int = 5          # hard cap on identical consecutive residues (0 disables)
     sample_rep_periods: tuple = (1, 2, 3, 4, 5)   # repeat periods scored (1 = homopolymer)
-    sample_gumbel_temp: float = 0.1  # noise on the COMMIT ORDER; raising it breaks the
-                                     # commit-the-most-predictable-first loop that feeds repeats
+    # Noise on the COMMIT ORDER. THIS is the anti-repetition mechanism that works, and it is
+    # load-bearing: the sweep's gumbel_temp=0 configuration scored the HIGHEST pLDDT of all (69.0,
+    # 66% over 70) with 98.7% of residues inside a repeated 13-mer. Committing strictly
+    # most-confident-first is exactly the loop the sampler docstring warns about -- a repeat is
+    # maximally predictable, so it wins every slot and extends itself. Order noise breaks that; the
+    # logit penalty tried to and only flattened the composition.
+    sample_gumbel_temp: float = 0.1
     sample_corrector: int = 0        # post-decode corrector sweeps (see sampler._corrector_sweep)
     sample_corrector_type: str = "remask"   # or "substitution"
     # SUBSTITUTION BUDGET AT DECODE TIME, as expected edits per decodable position over the whole

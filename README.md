@@ -148,6 +148,34 @@ periods 1–5 with a hard run cap, and — when `subst_per_residue > 0` — subs
 move alongside unmasking (see *Decoding mirrors the process*). Optional post-decode corrector sweeps
 remain. Defaults live in `CFG.opt` so `src/train.py`'s eval and `src/sample.py` cannot drift apart.
 
+### What the sampler sweep measured (50k checkpoint)
+
+| configuration | pLDDT | >70 | LCR | k13 | len | |
+|---|---|---|---|---|---|---|
+| natural | 81.8 | 80% | 7.9% | 0.5% | 250 | |
+| `nr_no_gumbel` | **69.0** | **66%** | 100% | **98.7%** | 272 | **degenerate** |
+| `nr_t0.8` | 54.1 | 17% | 35.4% | 7.4% | 272 | **degenerate** |
+| `nr_no_eos_1st` | 50.2 | 2% | 6.3% | 0.0% | **67** | length artifact |
+| `no_reppen` / `penalty_off` / `nr_recur6` | ~45.4 | 2% | 7.5% | 0.0% | 272 | **best clean** |
+| shuffled | 39.0 | 2% | 4.7% | 0.0% | 250 | |
+| `maxrun_off` / `default` | ~35.7 | 0% | 0.0% | 0.0% | 272 | |
+
+**The two highest-pLDDT rows are both traps.** `nr_no_gumbel` scores 69.0 with 66% of samples over
+70 — and 98.7% of its residues sit inside a repeated 13-mer. ESMFold is confident about simple
+repetitive structure, so on pLDDT alone that reads as a 34-point win. The k-mer metric
+(instruction 8) is the only thing that makes it visible; the summary now flags such rows as
+`DEGENERATE` against the natural row's own rate. `nr_no_eos_1st`'s 50.2 is a length artifact — its
+chains are 67 residues, and short chains score higher.
+
+This also casts doubt on ProLoopDiff's "T=0.5 beats T=1.0 on pLDDT" finding, which was never checked
+against a repetition metric: `nr_t0.8` reproduces exactly that trade here (+9 pLDDT, k13 0.0% → 7.4%).
+
+Three clean conclusions: the **periodic logit penalty was the entire damage** (`maxrun_off` 35.8 ≈
+`default` 35.7 vs `penalty_off` 45.3 ≈ `no_reppen` 45.4), so the hard run cap stays as free
+insurance; **gumbel commit-order noise is the anti-repetition mechanism that actually works**; and
+**inference-time recurrence buys nothing** (`nr_recur6` 45.5 vs 45.4), so decode compute is not the
+binding constraint.
+
 The **anti-repetition penalty defaults to off** (`sample_rep_penalty=0`, `sample_max_run=0`). It
 came from ProLoopDiff, whose samples had homopolymer runs of 42; PLD2 shows no such pathology, and
 measured on the 50k checkpoint the penalty cost ~8 pLDDT and every sample above 70 while driving SEG
