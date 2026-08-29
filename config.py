@@ -98,8 +98,21 @@ class OptCfg:
     ce_weight: float = 1.0           # EvoDiff's lambda on the x0 cross-entropy. They used 0; at
                                      # beta=1 this term IS the OADM cross-entropy, so keeping it
                                      # means the objective that demonstrably works is still a
-                                     # component rather than replaced. The KL alone is numerically
-                                     # tiny at small t.
+                                     # component rather than replaced.
+    vb_weight: float = 1.0           # multiplier on the (T-scaled) variational term. L_vb is a SUM
+                                     # over t = 1..T and one t is sampled, so the unbiased estimator
+                                     # of that sum multiplies by T -- src/objective.py does this now.
+                                     # The first run omitted it: vb sat at 0.005 against ce ~1.3, so
+                                     # the term that makes this a diffusion model rather than a
+                                     # masked LM carried 0.4% of the gradient. Lower this only if
+                                     # training destabilises with both terms live.
+    # Weight on UNCORRUPTED positions in L_ce. 0.0 scores only positions the model cannot copy the
+    # answer for, which is what OADM does. The first run used the D3PM convention of scoring every
+    # position; with mask fraction ~ U(0,1) that put about half the objective's weight on a copy
+    # task solved in the first few hundred steps, and made the logged number uninterpretable. The
+    # "keep this token" signal is not lost -- it lives in L_vb, whose posterior at an uncorrupted
+    # position is peaked on the current token. 1.0 restores the old behaviour.
+    ce_uncorrupted_weight: float = 0.0
     # EOS UPWEIGHTING. One EOS per 512-wide canvas is 0.2% of an unweighted loss, and ProLoopDiff
     # duly learned everything except where to stop (53% of its samples at 181k steps never placed
     # EOS at all). At 20.0 against ~350 residues at 1.0 and ~160 PAD at 0.1, EOS becomes ~5% of the
@@ -242,7 +255,8 @@ if __name__ == "__main__":
     print(f"batch          : canvas={CFG.data.canvas} B={CFG.batch_size}/rank "
           f"(rows split round-robin across {len(CFG.opt.betas)} betas)")
     print(f"objective      : betas={CFG.opt.betas} T={CFG.opt.d3pm_T} "
-          f"kernel={CFG.opt.sub_kernel} lambda={CFG.opt.ce_weight} "
+          f"kernel={CFG.opt.sub_kernel} | L = {CFG.opt.vb_weight}*T*E[KL] + "
+          f"{CFG.opt.ce_weight}*L_ce(corrupted, uncorr_w={CFG.opt.ce_uncorrupted_weight}) | "
           f"eos_w={CFG.opt.eos_loss_weight} pad_w={CFG.opt.pad_loss_weight}")
     print(f"sampling       : T={CFG.opt.sample_temperature} steps={CFG.opt.eval_steps} "
           f"eos_first={CFG.opt.sample_eos_first} "

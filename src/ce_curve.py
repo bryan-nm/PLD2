@@ -71,15 +71,32 @@ except Exception:
 
 
 def masked_ce(model, tokens, mask_pos, n_aa=20):
-    """Mean CE over the masked AMINO-ACID positions only. EOS/PAD are excluded: they are trivially
-    predictable from the canvas geometry and would dilute exactly the number we are asking about."""
+    """-> (full-vocab CE, AA-only CE, n) over the masked AMINO-ACID positions.
+
+    BOTH numbers are needed and they answer different questions.
+
+      full   CE under the model's whole 23-way distribution. On a canvas where the length is
+             unknown this is dominated by PAD: the canvas is 512 wide and the mean protein 246 aa,
+             so hedging most of the mass onto PAD is CORRECT for the modelled distribution -- and
+             scoring only true-AA positions then charges the model for being right. Measured 4.93
+             nats at 100% corruption, which is 1.9 nats WORSE than uniform-over-20 and impossible
+             for a calibrated 20-way choice; that gap IS the PAD mass, ~87% of it.
+
+      AA     CE after renormalising over the 20 residues, which is EXACTLY what the sampler sees:
+             _step_logits sets MASK and PAD to -inf, so decoding never sees that mass at all. This
+             is the number that says whether cold-start generation is informed. Comparing it to the
+             unigram ceiling is the honest version of the test.
+    """
     corrupted = torch.where(mask_pos, torch.full_like(tokens, model.cfg.mask_token_id), tokens)
     with torch.no_grad():
-        lg = model(corrupted)
-    ce = F.cross_entropy(lg.reshape(-1, lg.shape[-1]).float(), tokens.reshape(-1),
-                         reduction="none").reshape(tokens.shape)
+        lg = model(corrupted).float()
     score = mask_pos & (tokens < n_aa)
-    return float((ce * score).sum() / score.sum().clamp_min(1)), int(score.sum())
+    n = score.sum().clamp_min(1)
+    ce_full = F.cross_entropy(lg.reshape(-1, lg.shape[-1]), tokens.reshape(-1),
+                              reduction="none").reshape(tokens.shape)
+    ce_aa = F.cross_entropy(lg[..., :n_aa].reshape(-1, n_aa), tokens.clamp(max=n_aa - 1).reshape(-1),
+                            reduction="none").reshape(tokens.shape)
+    return (float((ce_full * score).sum() / n), float((ce_aa * score).sum() / n), int(score.sum()))
 
 
 def main():
@@ -126,51 +143,59 @@ def main():
     ce_by_frac = {}
     with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
         for frac in fracs:
-            tot, n = 0.0, 0
+            tf, ta, n = 0.0, 0.0, 0
             for t in batches:
                 # Training-shaped corruption: every canvas position is a candidate, so at frac=1.0
                 # EOS and PAD are masked too -- exactly what q_sample does at t=T.
                 mp = torch.rand(t.shape, device=dev) < frac
-                ce, k = masked_ce(model, t, mp)
-                tot += ce * k
+                cf, ca, k = masked_ce(model, t, mp)
+                tf += cf * k
+                ta += ca * k
                 n += k
-            ce_by_frac[frac] = (tot / max(n, 1), n)
+            ce_by_frac[frac] = (tf / max(n, 1), ta / max(n, 1), n)
 
         # --- the canvas the sampler actually cold-starts from ---
-        tot, n = 0.0, 0
+        tf, ta, n = 0.0, 0.0, 0
         for t in batches:
             mp = t < 20                       # every residue masked; EOS and PAD left REVEALED
-            ce, k = masked_ce(model, t, mp)
-            tot += ce * k
+            cf, ca, k = masked_ce(model, t, mp)
+            tf += cf * k
+            ta += ca * k
             n += k
-        sampler_ce = tot / max(n, 1)
+        sampler_ce, sampler_ce_aa = tf / max(n, 1), ta / max(n, 1)
 
-    base = ce_by_frac[1.0][0]                 # the model's OWN no-context level
-    print(f"\n{'corruption':>11} {'CE (nats)':>11} {'perplexity':>11} {'context gain':>13} "
-          f"{'n masked':>10}")
-    print("-" * 60)
+    base = ce_by_frac[1.0][1]                 # AA-only no-context level: what the sampler sees
+    print(f"\n{'corruption':>11} {'CE full':>9} {'CE aa-only':>11} {'ppl (aa)':>9} "
+          f"{'gain (aa)':>10} {'PAD mass':>9} {'n masked':>10}")
+    print("-" * 74)
     for frac in fracs:
-        ce, n = ce_by_frac[frac]
-        print(f"{frac:>10.0%} {ce:>11.3f} {math.exp(ce):>11.2f} {base - ce:>+13.3f} {n:>10,}")
-    print("-" * 60)
-    mean_ce = sum(ce_by_frac[f][0] for f in fracs) / len(fracs)
-    print(f"{'unigram':>10}  {unigram:>10.3f} {math.exp(unigram):>11.2f}"
-          f"{'':>14}  <- composition ceiling")
-    print(f"{'uniform':>10}  {uniform:>10.3f} {math.exp(uniform):>11.2f}"
-          f"{'':>14}  <- knows nothing (only {uniform - unigram:.2f} nats above unigram)")
-    print(f"\nmean CE across the curve = {mean_ce:.3f} nats (ppl {math.exp(mean_ce):.1f})")
+        cf, ca, n = ce_by_frac[frac]
+        pad = 1 - math.exp(-(cf - ca))        # the mass the sampler discards by banning MASK/PAD
+        print(f"{frac:>10.0%} {cf:>9.3f} {ca:>11.3f} {math.exp(ca):>9.2f} {base - ca:>+10.3f} "
+              f"{pad:>8.1%} {n:>10,}")
+    print("-" * 74)
+    mean_ce = sum(ce_by_frac[f][1] for f in fracs) / len(fracs)
+    print(f"{'unigram':>10} {'':>9} {unigram:>11.3f} {math.exp(unigram):>9.2f}"
+          f"{'':>10}{'':>9}  <- composition ceiling")
+    print(f"{'uniform':>10} {'':>9} {uniform:>11.3f} {math.exp(uniform):>9.2f}"
+          f"{'':>10}{'':>9}  <- knows nothing ({uniform - unigram:.2f} above unigram)")
+    print(f"\nAll gains and the mean below use the AA-ONLY column, because that is the distribution "
+          f"the sampler decodes from.")
+    print(f"mean CE across the curve = {mean_ce:.3f} nats (ppl {math.exp(mean_ce):.1f})")
     edge = unigram - mean_ce
     print(f"  By the ARDM identity this IS the model's per-token generative NLL. Composition "
           f"ceiling {unigram:.3f} -> the model is "
           f"{abs(edge):.3f} nats {'BETTER than' if edge > 0 else 'WORSE than'} composition."
           + ("  A generative model within ~0.1 of the ceiling samples from composition."
              if edge < 0.1 else ""))
-    print(f"\nsampler cold-start canvas (all residues MASK, EOS/PAD revealed): "
-          f"CE {sampler_ce:.3f} (ppl {math.exp(sampler_ce):.2f})")
-    print(f"  vs training-shaped corruption at 100%:                        "
-          f"CE {base:.3f} (ppl {math.exp(base):.2f})")
+    print(f"\nsampler cold-start canvas (all residues MASK, EOS/PAD revealed):")
+    print(f"  full {sampler_ce:.3f} | aa-only {sampler_ce_aa:.3f} (ppl {math.exp(sampler_ce_aa):.2f})"
+          f" | vs unigram {unigram - sampler_ce_aa:+.3f}")
+    print(f"  training-shaped 100%:  full {ce_by_frac[1.0][0]:.3f} | aa-only {base:.3f}")
+    print(f"  The aa-only pair is what matters: the length is revealed in the first and not the "
+          f"second, so a model that USES the boundary should be better on the first.")
 
-    gain = base - ce_by_frac[0.05][0]
+    gain = base - ce_by_frac[0.05][1]
     print("\nREADING (the slope, not the intercept -- CE ~ unigram at 100% is CORRECT, there is no")
     print("         context to use there, and uniform is only 0.11 nats above unigram anyway):")
     if gain < 0.2:

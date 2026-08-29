@@ -15,17 +15,37 @@ every beta shares OADM's cold-start entry point.
 
     L = L_vb + ce_weight * L_ce
 
-  L_vb   E_t KL( q(x_{t-1}|x_t,x_0) || p_theta(x_{t-1}|x_t) ), the D3PM variational bound over the
-         unified Q. It covers BOTH move types in one term -- unmasking an absorbed position and
-         substituting an already-placed one -- which is the whole reason for doing it this way. At
-         t=1 it reduces to L_0 = -log p_theta(x_0|x_1) with no special case (Qbar_0 = I).
-         L_T is dropped, and here that is free rather than an approximation: P(x_T = MASK) measures
-         0.999-1.000 at every beta, so q(x_T|x_0) IS the all-MASK canvas the sampler starts from.
+  L_vb   T * E_t KL( q(x_{t-1}|x_t,x_0) || p_theta(x_{t-1}|x_t) ) -- the D3PM variational bound over
+         the unified Q. It covers BOTH move types in one term (unmasking an absorbed position and
+         substituting a placed one), and at t=1 reduces to L_0 = -log p_theta(x_0|x_1) with no
+         special case (Qbar_0 = I). L_T is dropped, and here that is free rather than an
+         approximation: P(x_T = MASK) measures 0.999-1.000 at every beta.
 
-  L_ce   -log p~_theta(x_0 | x_t), EvoDiff's lambda term. They set lambda=0; PLD2 defaults it to 1.
-         The KL is numerically tiny at small t while the x0 cross-entropy is well-conditioned
-         everywhere, and at beta=1 this term IS the OADM cross-entropy -- so keeping it means the
-         objective that demonstrably works is still present as a component rather than replaced.
+         THE FACTOR OF T IS NOT COSMETIC. L_vb is a SUM over t = 1..T; sampling one t ~ U(1,T) and
+         taking the KL estimates the MEAN, so the unbiased estimator of the sum multiplies by T.
+         The first PLD2 run omitted it and the consequence was severe: the reported vb sat at 0.005
+         against a ce of ~1.3, so the variational term -- the entire reason this is a diffusion
+         model rather than a masked LM -- contributed 0.4% of the gradient and the run was, in
+         effect, trained on the auxiliary cross-entropy alone. At T=500 the scaled term lands near
+         2.5, comparable to L_ce, which is what the ELBO says it should be.
+
+  L_ce   -log p~_theta(x_0 | x_t) over the CORRUPTED positions, EvoDiff's lambda term. They set
+         lambda=0; PLD2 keeps it at 1 because at beta=1 it IS the OADM cross-entropy, so the
+         objective that demonstrably works stays present as a component.
+
+         SCORED ON CORRUPTED POSITIONS ONLY, which the first run did not do. Mask fraction is
+         U(0,1), so about half of every row is a position whose answer is VISIBLE in the input --
+         a copy, solved within the first few hundred steps, and worth no gradient thereafter.
+         Scoring it spent roughly half the objective's weight on nothing and made the reported
+         number uninterpretable (it mixes ~0-cost copies with real predictions, which is why
+         estimating the true masked-position CE from the log took three assumptions). A position
+         counts as corrupted when x_t != x_0, which is exactly "the model cannot copy the answer":
+         MASK always qualifies, and a substitution that happened to land on the original token
+         correctly does not. `ce_uncorrupted_weight` restores the old behaviour at 1.0.
+
+         Note the "keep this token" signal is not lost by restricting L_ce -- it lives in L_vb,
+         whose posterior at an uncorrupted position is peaked on the current token and which the
+         factor of T now makes count.
 
 A DISTRIBUTION OVER BETA IS NOW COHERENT, and is the default. Under the old design mixing beta
 would have blurred two different bounds together -- the mistake ProLoopDiff made. Here beta only
@@ -77,8 +97,10 @@ def _weighted_row_mean(per_pos: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 # The loss
 # --------------------------------------------------------------------------------------
 def diffusion_loss(logits, x0, xt, flat_idx, flat_prev, sched: CorruptionSchedule,
-                   weights, ce_weight: float = 1.0):
-    """L_vb + ce_weight * L_ce over the unified absorbing+substitution process.
+                   weights, ce_weight: float = 1.0, vb_weight: float = 1.0,
+                   ce_uncorrupted_weight: float = 0.0):
+    """vb_weight * T * E_t[KL] + ce_weight * L_ce over the unified process. See the module docstring
+    for why the T and the corrupted-only restriction both matter.
 
     AUTOCAST OFF for the whole posterior computation. The trainer runs under bf16 autocast and
     torch.bmm is on autocast's lower-precision list, so `p_tilde @ Qbar_{t-1}` would be done in bf16
@@ -89,15 +111,21 @@ def diffusion_loss(logits, x0, xt, flat_idx, flat_prev, sched: CorruptionSchedul
     with torch.autocast(device_type=logits.device.type, enabled=False):
         p_tilde = x0_probs(logits, sched.n)                     # (B,L,n) over non-MASK states
         q_post, p_post = sched.posteriors(x0, xt, flat_idx, flat_prev, p_tilde)
-        vb = _weighted_row_mean(kl_categorical(q_post, p_post), weights)
+        # Per-step KL, then scaled to the SUM over t that the ELBO actually is.
+        vb_step = _weighted_row_mean(kl_categorical(q_post, p_post), weights)
+        vb = sched.T * vb_step
+        # Corrupted == the model cannot copy the answer out of its own input.
+        corrupted = (xt != x0).float()
+        ce_w = weights * (corrupted + ce_uncorrupted_weight * (1.0 - corrupted))
         ce = _weighted_row_mean(
-            -p_tilde.gather(-1, x0.unsqueeze(-1)).squeeze(-1).clamp_min(1e-12).log(), weights)
-    return vb + ce_weight * ce, vb.detach(), ce.detach()
+            -p_tilde.gather(-1, x0.unsqueeze(-1)).squeeze(-1).clamp_min(1e-12).log(), ce_w)
+    return (vb_weight * vb + ce_weight * ce, vb.detach(), vb_step.detach(), ce.detach())
 
 
 def training_step(model: LoopedDiffusionLM, batch: dict, sched: CorruptionSchedule,
                   eos_loss_weight: float = 1.0, pad_loss_weight: float = 1.0,
-                  ce_weight: float = 1.0):
+                  ce_weight: float = 1.0, vb_weight: float = 1.0,
+                  ce_uncorrupted_weight: float = 0.0):
     """batch: {"tokens": (B, L) long}. Returns (loss, metrics).
 
     Metrics are on-device 0-d tensors: converting them here would force a device->host sync every
@@ -116,9 +144,10 @@ def training_step(model: LoopedDiffusionLM, batch: dict, sched: CorruptionSchedu
     logits = model(xt, canvas_mask=canvas_mask)
 
     w = position_weights(x0, cfg.eos_token_id, cfg.pad_token_id, eos_loss_weight, pad_loss_weight)
-    loss, vb, ce = diffusion_loss(logits, x0, xt, flat_idx, flat_prev, sched, w, ce_weight)
+    loss, vb, vb_step, ce = diffusion_loss(logits, x0, xt, flat_idx, flat_prev, sched, w,
+                                           ce_weight, vb_weight, ce_uncorrupted_weight)
 
-    return loss, {"loss": loss.detach(), "vb": vb, "ce": ce,
+    return loss, {"loss": loss.detach(), "vb": vb, "vb_step": vb_step, "ce": ce,
                   # What the corruption actually did this step -- the cheapest guard against a
                   # schedule that silently stops masking or stops substituting.
                   "masked": (xt == cfg.mask_token_id).float().mean(),
@@ -180,7 +209,7 @@ if __name__ == "__main__":
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if step % 300 == 0:
-            print(f"step {step:4d} | loss {float(m['loss']):.3f} (vb {float(m['vb']):.4f} "
+            print(f"step {step:4d} | loss {float(m['loss']):.3f} (vb {float(m['vb']):.3f} "
                   f"ce {float(m['ce']):.3f}) | corruption: {float(m['masked']):.0%} masked "
                   f"{float(m['subst']):.0%} substituted | masked-NLL {_eval_oadm(model, tokens, cfg):.3f}")
 

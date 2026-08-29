@@ -230,8 +230,12 @@ def main():
     batch_size = 2 if args.smoke else CFG.batch_size
     if env.is_main:
         print(f"[train] corruption: kernel={ocfg.sub_kernel} T={sched.T} betas={sched.betas} "
-              f"| eos_w={ocfg.eos_loss_weight} pad_w={ocfg.pad_loss_weight} "
-              f"lambda={ocfg.ce_weight}", flush=True)
+              f"| eos_w={ocfg.eos_loss_weight} pad_w={ocfg.pad_loss_weight}", flush=True)
+        print(f"[train] objective: L = {ocfg.vb_weight} * T*E_t[KL] + {ocfg.ce_weight} * L_ce"
+              f" | L_ce on corrupted positions"
+              f"{'' if ocfg.ce_uncorrupted_weight == 0 else f' (+{ocfg.ce_uncorrupted_weight} on uncorrupted)'}"
+              f" | vb is T-scaled (T={sched.T}), so vb and ce should be COMPARABLE -- a vb three "
+              f"orders below ce means the scaling was lost", flush=True)
         for bi, b in enumerate(sched.betas):
             print(f"[train]   beta={b:<5} P(x_T=MASK)={sched.terminal_mask_fraction(bi):.4f} "
                   f"(L_T ~ 0) | mask fraction {sched.mask_fraction(bi)} "
@@ -320,7 +324,8 @@ def main():
             loss, m = training_step(model, batch, sched,
                                     eos_loss_weight=ocfg.eos_loss_weight,
                                     pad_loss_weight=ocfg.pad_loss_weight,
-                                    ce_weight=ocfg.ce_weight)
+                                    ce_weight=ocfg.ce_weight, vb_weight=ocfg.vb_weight,
+                                    ce_uncorrupted_weight=ocfg.ce_uncorrupted_weight)
         loss.backward()
         nonfinite = average_gradients(model)
         if nonfinite:
@@ -346,7 +351,7 @@ def main():
             dt = max(time.perf_counter() - t_win, 1e-9)
             peak = _peak_mem_gb(dev)
             print(f"step {step:>7} | loss {float(m['loss']):.3f} "
-                  f"(vb {float(m['vb']):.4f} ce {float(m['ce']):.3f}) "
+                  f"(vb {float(m['vb']):.3f}[{float(m['vb_step']):.5f}/step] ce {float(m['ce']):.3f}) "
                   f"| corrupt {float(m['masked']):.0%}m {float(m['subst']):.0%}s "
                   f"| lr {lr_sched.get_last_lr()[0]:.2e} | "
                   f"{tok_win / dt / 1e3:.0f}k tok/s | {dt / steps_win:.2f}s/step"
