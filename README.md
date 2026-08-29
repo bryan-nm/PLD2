@@ -148,6 +148,12 @@ periods 1–5 with a hard run cap, and — when `subst_per_residue > 0` — subs
 move alongside unmasking (see *Decoding mirrors the process*). Optional post-decode corrector sweeps
 remain. Defaults live in `CFG.opt` so `src/train.py`'s eval and `src/sample.py` cannot drift apart.
 
+The **anti-repetition penalty defaults to off** (`sample_rep_penalty=0`, `sample_max_run=0`). It
+came from ProLoopDiff, whose samples had homopolymer runs of 42; PLD2 shows no such pathology, and
+measured on the 50k checkpoint the penalty cost ~8 pLDDT and every sample above 70 while driving SEG
+low-complexity to exactly 0.0% — *below* the 4.7% a random shuffle produces. Turning it off put LCR
+at 7.4% against natural's 7.9%. `scripts/sweep.pbs` re-tests the two halves separately.
+
 **Bounded wall time.** Both move types are chosen from the *same* forward pass and nothing iterates
 to convergence, so model forwards are exactly `1 (eos_first) + n_steps + n_corrector × (2 if remask
 else 1)` regardless of the substitution budget. `python -m src.tests_sampler` asserts that count

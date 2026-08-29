@@ -29,10 +29,17 @@ WHAT HEALTHY LOOKS LIKE (a 55M any-order model on UniRef90). Absolute values mat
 and protein sequence is genuinely high-entropy, so the whole usable dynamic range is about a nat:
 
     corruption   100%    90%    50%    20%    10%     5%
-    CE          ~2.9   ~2.8   ~2.4   ~2.1   ~2.0   ~1.9      healthy: falls steadily
-    gain         0.0   ~0.1   ~0.5   ~0.8   ~0.9   ~1.0
     CE          ~2.9   ~2.9   ~2.8   ~2.8   ~2.8   ~2.8      broken: flat, context unused
     gain         0.0   ~0.0   ~0.1   ~0.1   ~0.1   ~0.1
+    CE         2.876  2.697  2.268  2.201  2.188  2.209      MEASURED, PLD2 50k (aa-only)
+    gain       0.000  0.179  0.609  0.676  0.689  0.668      mean CE 2.390, ppl 10.9
+
+The measured row is the calibration point, not an ideal -- it is what a 54.6M-parameter model looks
+like after 50k steps on UniRef90. Note two things about it. Cold start lands on 2.876 against a
+unigram of 2.875, i.e. EXACTLY composition, which is the correct answer where there is no context
+and confirms the model is calibrated once PAD mass is removed. And the curve is nearly flat below
+50% corruption (0.609 -> 0.689), so almost all of the learnable signal this model captures is
+already available from half the sequence; it is not using long-range context.
 
 The single number to look at is the context gain at 5-10% corruption -- given ~90% of a real protein,
 how much better than no context at all. Below ~0.2 nats the model is not using sequence context;
@@ -211,14 +218,17 @@ def main():
         print(f"  * Context gain at 5% corruption is {gain:+.3f} nats, so the model HAS learned "
               f"real sequence constraints. If generations still fold at the floor, the sampler is "
               f"losing that information -- run src/sweep_sampler.py.")
-    d = sampler_ce - base
+    d = sampler_ce_aa - base          # BOTH aa-only; mixing scales here was a real bug
     if d > 0.05:
-        print(f"  * The sampler's cold-start canvas is {d:.3f} nats WORSE than training-shaped "
-              f"corruption at the same level, despite revealing strictly MORE (the length). That is "
-              f"an off-distribution input: eos_first builds a canvas training almost never shows.")
+        print(f"  * The sampler's cold-start canvas is {d:.3f} nats WORSE (aa-only) than "
+              f"training-shaped corruption at the same level, despite revealing strictly MORE (the "
+              f"length). That is an off-distribution input: eos_first builds a canvas training "
+              f"almost never shows.")
     else:
-        print(f"  * The sampler's cold-start canvas is fine ({d:+.3f} nats vs training-shaped), and "
-              f"a healthy model should be slightly BETTER here since the length is revealed.")
+        print(f"  * The sampler's cold-start canvas is fine ({d:+.3f} nats aa-only vs "
+              f"training-shaped), so eos_first is not handing the model an off-distribution input. "
+              f"A model that USED the revealed length would be meaningfully better here, not merely "
+              f"equal, so this also says the boundary is barely informing residue choice.")
 
 
 if __name__ == "__main__":

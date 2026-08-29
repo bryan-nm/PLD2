@@ -161,8 +161,19 @@ class OptCfg:
     sample_eos_first: bool = True    # commit the boundary before any residue (see sampler.py)
     sample_min_len: int = 30         # corpus floor; also stops EOS at position 0 (the len=0 bug)
     sample_eos_temp: float = 1.0     # <1 sharpens the length draw, >1 widens it
-    sample_rep_penalty: float = 1.5  # per-period logit penalty for continuing a repeat
-    sample_max_run: int = 5          # hard cap on identical consecutive residues (0 disables)
+    # ANTI-REPETITION: OFF. It was inherited from ProLoopDiff, whose samples contained homopolymer
+    # runs of 42, and PLD2 shows no sign of that pathology. Measured on the 50k checkpoint, turning
+    # it off moved four statistics at once and all toward natural:
+    #     LCR    0.0% -> 7.4%   (natural 7.9%)   -- matching, not merely "better"
+    #     k13    0.0% -> 0.3%   (natural 0.5%)
+    #     pLDDT  35.0 -> 43.4   crossing the shuffled baseline of 39.0 for the first time
+    #     >70      0% -> 6%
+    # An LCR of exactly 0.0% across 17k residues, against 4.7% for a random shuffle, was the tell:
+    # the penalty was suppressing local composition BELOW chance -- manufacturing the pathology it
+    # existed to prevent. scripts/sweep.pbs re-tests both halves separately (penalty_off vs
+    # maxrun_off); restore the run cap if it turns out to be harmless insurance.
+    sample_rep_penalty: float = 0.0  # per-period logit penalty for continuing a repeat
+    sample_max_run: int = 0          # hard cap on identical consecutive residues (0 disables)
     sample_rep_periods: tuple = (1, 2, 3, 4, 5)   # repeat periods scored (1 = homopolymer)
     sample_gumbel_temp: float = 0.1  # noise on the COMMIT ORDER; raising it breaks the
                                      # commit-the-most-predictable-first loop that feeds repeats
