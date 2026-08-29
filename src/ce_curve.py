@@ -3,21 +3,40 @@
     python -m src.ce_curve --device xpu
 
 WHY. The training loss draws t ~ U(1, T), so the single reported figure averages the whole corruption
-range, and those ends are not equally relevant. Sampling COLD-STARTS from an all-MASK canvas and
-commits its first -- and most structurally decisive -- positions there, so generation quality is
-governed almost entirely by the ~100%-corrupted end, while the average is dominated by the easy low
-end where most of the sequence is visible and the task is near-copying. A model that infills well and
-cold-starts at composition posts a healthy-looking loss and still generates sequences that fold no
-better than a shuffle. ProLoopDiff had exactly this diagnostic; PLD2 shipped without it.
+range and hides the shape. The shape is the thing: it says how much the model gains from CONTEXT, at
+every level of context.
 
-Read the LAST rows. Two reference points are computed from the SAME data:
+WHAT THE CURVE MEANS, AND WHAT IT DOES NOT.
 
-    uniform   ln(20) = 3.00 nats -- a model that knows nothing
-    unigram   the empirical residue distribution -- a model that knows only composition
+  CE at 100% corruption is NOT a defect signal. There is no context on an all-MASK canvas, so the
+  per-position marginal is the correct answer, and the marginal is approximately the unigram. Worse,
+  the unigram line is a nearly meaningless bar for proteins: uniform over 20 residues is 3.00 nats
+  and the empirical unigram is 2.89, so the entire span between "knows nothing" and "knows
+  composition" is 0.11 nats. An earlier version of this file tested exactly that and it was wrong.
 
-If CE at 90-100% corruption sits at the unigram line, the model is drawing its opening commitments
-from composition alone. No amount of sampler work fixes that, and it is the signature of samples that
-have the right amino-acid frequencies and no structure.
+  THE SLOPE IS THE SIGNAL. A model that has learned protein sequence constraints should get steadily
+  better as the rest of the sequence is revealed. The reported CONTEXT GAIN column is
+  CE(100%) - CE(frac): how many nats the model buys from seeing the rest. A curve that stays flat
+  near its own 100% value means context is not being used at any level -- which is a far stronger
+  and more general statement than anything about cold start.
+
+  THE AREA IS THE MODEL. By the ARDM identity the OADM/any-order bound on log p(x) is D times the
+  MEAN of this curve, so mean CE across the corruption range IS the model's per-token generative
+  NLL. Compare it to the 2.89 unigram ceiling: a mean within ~0.1 of it describes a sampler that
+  draws from composition, whatever it does at any individual level.
+
+WHAT HEALTHY LOOKS LIKE (a 55M any-order model on UniRef90). Absolute values matter less than shape,
+and protein sequence is genuinely high-entropy, so the whole usable dynamic range is about a nat:
+
+    corruption   100%    90%    50%    20%    10%     5%
+    CE          ~2.9   ~2.8   ~2.4   ~2.1   ~2.0   ~1.9      healthy: falls steadily
+    gain         0.0   ~0.1   ~0.5   ~0.8   ~0.9   ~1.0
+    CE          ~2.9   ~2.9   ~2.8   ~2.8   ~2.8   ~2.8      broken: flat, context unused
+    gain         0.0   ~0.0   ~0.1   ~0.1   ~0.1   ~0.1
+
+The single number to look at is the context gain at 5-10% corruption -- given ~90% of a real protein,
+how much better than no context at all. Below ~0.2 nats the model is not using sequence context;
+above ~0.5 it clearly is, and a floor-level pLDDT then points at the sampler instead.
 
 IT ALSO CHECKS THE SAMPLER'S ACTUAL COLD-START CANVAS, which is not the same shape as anything
 training produces. After eos_first commits the boundary, the canvas is [MASK x n, EOS, PAD x ...] --
@@ -103,12 +122,10 @@ def main():
 
     use_amp = dev.type in ("xpu", "cuda")
     torch.manual_seed(args.seed)
-    print(f"\n{'corruption':>12} {'CE (nats)':>11} {'perplexity':>11} {'vs unigram':>11}  "
-          f"{'n masked':>10}")
-    print("-" * 62)
-    rows = []
+    fracs = (1.0, 0.95, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.05, 0.02)
+    ce_by_frac = {}
     with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
-        for frac in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0):
+        for frac in fracs:
             tot, n = 0.0, 0
             for t in batches:
                 # Training-shaped corruption: every canvas position is a candidate, so at frac=1.0
@@ -117,10 +134,7 @@ def main():
                 ce, k = masked_ce(model, t, mp)
                 tot += ce * k
                 n += k
-            ce = tot / max(n, 1)
-            rows.append((frac, ce))
-            print(f"{frac:>11.0%} {ce:>11.3f} {math.exp(ce):>11.2f} "
-                  f"{ce - unigram:>+11.3f}  {n:>10,}")
+            ce_by_frac[frac] = (tot / max(n, 1), n)
 
         # --- the canvas the sampler actually cold-starts from ---
         tot, n = 0.0, 0
@@ -131,35 +145,55 @@ def main():
             n += k
         sampler_ce = tot / max(n, 1)
 
-    print("-" * 62)
-    print(f"{'unigram':>11}  {unigram:>10.3f} {math.exp(unigram):>11.2f} {0.0:>+11.3f}   "
-          f"<- knows only composition")
-    print(f"{'uniform':>11}  {uniform:>10.3f} {math.exp(uniform):>11.2f} "
-          f"{uniform - unigram:>+11.3f}   <- knows nothing")
+    base = ce_by_frac[1.0][0]                 # the model's OWN no-context level
+    print(f"\n{'corruption':>11} {'CE (nats)':>11} {'perplexity':>11} {'context gain':>13} "
+          f"{'n masked':>10}")
+    print("-" * 60)
+    for frac in fracs:
+        ce, n = ce_by_frac[frac]
+        print(f"{frac:>10.0%} {ce:>11.3f} {math.exp(ce):>11.2f} {base - ce:>+13.3f} {n:>10,}")
+    print("-" * 60)
+    mean_ce = sum(ce_by_frac[f][0] for f in fracs) / len(fracs)
+    print(f"{'unigram':>10}  {unigram:>10.3f} {math.exp(unigram):>11.2f}"
+          f"{'':>14}  <- composition ceiling")
+    print(f"{'uniform':>10}  {uniform:>10.3f} {math.exp(uniform):>11.2f}"
+          f"{'':>14}  <- knows nothing (only {uniform - unigram:.2f} nats above unigram)")
+    print(f"\nmean CE across the curve = {mean_ce:.3f} nats (ppl {math.exp(mean_ce):.1f})")
+    edge = unigram - mean_ce
+    print(f"  By the ARDM identity this IS the model's per-token generative NLL. Composition "
+          f"ceiling {unigram:.3f} -> the model is "
+          f"{abs(edge):.3f} nats {'BETTER than' if edge > 0 else 'WORSE than'} composition."
+          + ("  A generative model within ~0.1 of the ceiling samples from composition."
+             if edge < 0.1 else ""))
     print(f"\nsampler cold-start canvas (all residues MASK, EOS/PAD revealed): "
           f"CE {sampler_ce:.3f} (ppl {math.exp(sampler_ce):.2f})")
     print(f"  vs training-shaped corruption at 100%:                        "
-          f"CE {rows[-1][1]:.3f} (ppl {math.exp(rows[-1][1]):.2f})")
+          f"CE {base:.3f} (ppl {math.exp(base):.2f})")
 
-    top = rows[-1][1]
-    print("\nREADING:")
-    if top > unigram - 0.05:
-        print(f"  * At full corruption the model is at or above the unigram line "
-              f"({top:.3f} vs {unigram:.3f}). It opens generation from COMPOSITION ONLY, so its "
-              f"first and most structurally decisive commitments carry no information. Samples will "
-              f"fold like a shuffle no matter what the sampler does.")
+    gain = base - ce_by_frac[0.05][0]
+    print("\nREADING (the slope, not the intercept -- CE ~ unigram at 100% is CORRECT, there is no")
+    print("         context to use there, and uniform is only 0.11 nats above unigram anyway):")
+    if gain < 0.2:
+        print(f"  * Context gain at 5% corruption is only {gain:+.3f} nats. Given ~95% of a real "
+              f"protein the model is barely better than with nothing at all -- it is not using "
+              f"sequence context AT ANY LEVEL. That is a model/objective problem, and no sampler "
+              f"change will fix it.")
+    elif gain < 0.5:
+        print(f"  * Context gain at 5% corruption is {gain:+.3f} nats -- weak. The model uses "
+              f"context but has learned much less than it should. Expect generations near "
+              f"composition; treat the sampler as a secondary effect.")
     else:
-        print(f"  * At full corruption the model beats unigram by {unigram - top:.3f} nats, so it "
-              f"DOES know something at cold start. If generations still fold at the floor, the "
-              f"sampler is losing that information -- see src/sweep_sampler.py.")
-    d = sampler_ce - rows[-1][1]
+        print(f"  * Context gain at 5% corruption is {gain:+.3f} nats, so the model HAS learned "
+              f"real sequence constraints. If generations still fold at the floor, the sampler is "
+              f"losing that information -- run src/sweep_sampler.py.")
+    d = sampler_ce - base
     if d > 0.05:
         print(f"  * The sampler's cold-start canvas is {d:.3f} nats WORSE than training-shaped "
-              f"corruption at the same level, despite revealing strictly more (the length). That is "
+              f"corruption at the same level, despite revealing strictly MORE (the length). That is "
               f"an off-distribution input: eos_first builds a canvas training almost never shows.")
     else:
-        print(f"  * The sampler's cold-start canvas is fine ({d:+.3f} nats vs training-shaped), so "
-              f"eos_first is not handing the model an off-distribution input.")
+        print(f"  * The sampler's cold-start canvas is fine ({d:+.3f} nats vs training-shaped), and "
+              f"a healthy model should be slightly BETTER here since the length is revealed.")
 
 
 if __name__ == "__main__":
