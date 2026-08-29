@@ -86,12 +86,20 @@ class OptCfg:
     # 2e-4 for 1.35B at a 2.9M-token batch, near GPT-3-1.3B's 2e-4 at 1M. The 3e-4 that a 55M model
     # tolerated is not safe at 25x the parameters, especially now that the T-scaled vb term is live.
     lr: float = 2e-4
-    warmup_steps: int = 3_000
-    # OPTIMIZER steps. ~17h at an estimated 5.6s/step (4 micro x 1.41s); resume extends it, and the
-    # first log lines give the real figure. 12k steps x 2.9M tokens = 35B token-slots = 17B real
-    # residues, against the ~27B a 1.35B model wants -- undertrained by design, since the previous
-    # run was 129x PAST that point at 55M and the diagnosis was capacity, not data.
-    total_steps: int = 12_000
+    warmup_steps: int = 2_000        # ~10% of the run; generous, and cheap insurance for the
+                                     # T-scaled vb term. Raise it if `skipped` climbs early.
+    # OPTIMIZER steps. MEASURED at 3.85s/step on Aurora (2.83s compute + 1.02s all-reduce), not the
+    # 5.63s the linear FLOP extrapolation predicted -- d=1536 GEMMs run far closer to peak than the
+    # d=512 ones the estimate was calibrated on, so the model came out 1.5x faster than planned.
+    #
+    # 18k x 2.9M tokens = 26B real residues, which is ~0.95x the 20-per-parameter point for 1.35B,
+    # in ~20h against a 24h walltime. The previous 55M run was 129x PAST that point, which is what
+    # made capacity rather than data the diagnosis.
+    #
+    # A COMPLETED cosine beats an interrupted one: if the queue cuts this short, resubmit and it
+    # resumes on the same schedule. Do not raise this to fill the walltime exactly -- the margin is
+    # what stops the LR being left mid-anneal.
+    total_steps: int = 18_000
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     # A non-finite gradient norm makes clip_grad_norm_'s coefficient NaN, which turns every parameter
