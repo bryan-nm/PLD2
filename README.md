@@ -197,7 +197,7 @@ src/
   preprocess_fasta.py # UniRef FASTA -> packed uint8 shards
   dist.py             # Aurora XPU + oneCCL bootstrap, grad/stat all-reduce buffers
   xpu_linalg_guard.py # CPU round-trip for torch.linalg ops that lack XPU kernels
-scripts/              # pbs_common.sh, train.pbs, fold.pbs, sample.pbs, preprocess.pbs
+scripts/              # pbs_common.sh, train.pbs, fold.pbs, sweep.pbs, sample.pbs, preprocess.pbs
 ```
 
 ## Run
@@ -219,6 +219,7 @@ python -m src.tests_corruption # MASK absorbing, L_T ~ 0, Qbar vs explicit produ
 # diagnosis, when generations fold at the floor
 python -m src.ce_curve         # does the model know anything at COLD START, or only composition?
 python -m src.sweep_sampler    # is the sampler destroying what it does know?
+qsub scripts/sweep.pbs         # ...the same thing on Aurora: generate, fold, one table
 
 # Aurora
 qsub scripts/train.pbs                 # training + co-scheduled ESMFold watcher

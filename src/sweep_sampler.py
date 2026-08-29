@@ -23,6 +23,7 @@ the penalty is removing structure that real proteins have, not just degeneracy t
 from __future__ import annotations
 import argparse
 import os
+import sys
 
 import torch
 
@@ -42,7 +43,15 @@ except Exception:
 
 
 def configurations(ocfg):
-    """name -> generate() overrides. The first is the shipped default, as the reference row."""
+    """name -> generate() overrides.
+
+    Centred on `no_reppen`, not on the shipped default, because the default is already known bad:
+    at the 50k checkpoint it gave pLDDT 35.0 with LCR 0.0%, while rep_penalty=0 gave 43.4 with LCR
+    7.4% against natural's 7.9% -- four statistics moving to natural at once. So `default` is kept
+    only as the reference row, `nr_*` build on rep_penalty=0, and two configurations disentangle
+    WHICH half of the anti-repetition machinery did the damage (the periodic logit penalty, or the
+    hard run cap) since the earlier test removed both together.
+    """
     base = dict(temperature=ocfg.sample_temperature, gumbel_temp=ocfg.sample_gumbel_temp,
                 rep_penalty=ocfg.sample_rep_penalty, max_run=ocfg.sample_max_run,
                 rep_periods=ocfg.sample_rep_periods,
@@ -52,22 +61,25 @@ def configurations(ocfg):
         d = dict(base)
         d.update(kw)
         return d
+    off = dict(rep_penalty=0.0, max_run=0)
     return {
-        "default":        v(),
-        # --- the anti-repetition machinery, which measurably pushes LCR below chance ---
-        "no_reppen":      v(rep_penalty=0.0, max_run=0),
-        "reppen_soft":    v(rep_penalty=0.3),
-        "periods_1_2":    v(rep_periods=(1, 2)),          # leave helical 3/4 periodicity alone
-        "no_maxrun":      v(max_run=0),
-        # --- the other decode knobs ---
-        "no_subst":       v(subst_per_residue=0.0),
-        "subst_only":     v(rep_penalty=0.0, max_run=0, subst_per_residue=4.0),
-        "t0.5":           v(temperature=0.5),
-        "t0.8":           v(temperature=0.8),
-        "no_gumbel":      v(gumbel_temp=0.0),
-        "no_eos_first":   v(eos_first=False),
-        # --- everything off: the plainest possible confidence-ordered decode ---
-        "bare":           v(rep_penalty=0.0, max_run=0, subst_per_residue=0.0, gumbel_temp=0.0),
+        "default":        v(),                                   # reference: the shipped config
+        # --- which half of the anti-repetition machinery mattered? ---
+        "no_reppen":      v(**off),                              # both off: the known-good point
+        "penalty_off":    v(rep_penalty=0.0),                    # ...but keep the hard run cap
+        "maxrun_off":     v(max_run=0),                          # ...but keep the periodic penalty
+        "reppen_soft":    v(rep_penalty=0.3),                    # is a light touch harmless?
+        "periods_1_2":    v(rep_periods=(1, 2)),                 # leave helical 3/4 periodicity alone
+        # --- everything else, built ON TOP of rep_penalty=0 ---
+        "nr_t0.8":        v(**off, temperature=0.8),
+        "nr_t1.2":        v(**off, temperature=1.2),
+        "nr_no_subst":    v(**off, subst_per_residue=0.0),
+        "nr_subst4":      v(**off, subst_per_residue=4.0),
+        "nr_no_gumbel":   v(**off, gumbel_temp=0.0),
+        "nr_no_eos_1st":  v(**off, eos_first=False),
+        # Adaptive compute at inference: the looped trunk takes an n_recurrence override, so this
+        # costs nothing but a flag and is the one knob that adds model capacity at decode time.
+        "nr_recur6":      v(**off, n_recurrence=6),
     }
 
 
@@ -83,6 +95,7 @@ def main():
     ap.add_argument("--only", default=None, help="comma-separated subset of configuration names")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    sys.stdout.reconfigure(line_buffering=True)
 
     env = init_distributed(args.device, no_dist=True)
     dev = env.device
@@ -107,9 +120,15 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     use_amp = dev.type in ("xpu", "cuda")
 
-    print(f"\n{'configuration':<16} {'len':>13} {'no-EOS':>8} {'LCR':>7}   k-mer repeat coverage")
-    print("-" * 88)
-    for name, kw in cfgs.items():
+    # One rank per configuration where there are ranks to spare. No process group is ever created
+    # (init_distributed(no_dist=True) above), configurations write disjoint filenames, and nothing
+    # needs aggregating -- the fold summary does that later from the FASTAs themselves.
+    rank, world = env.rank, env.world_size
+    mine = {k: v for i, (k, v) in enumerate(cfgs.items()) if i % world == rank}
+    if rank == 0:
+        print(f"\n{'configuration':<16} {'len':>13} {'no-EOS':>8} {'LCR':>7}   k-mer repeat coverage")
+        print("-" * 88, flush=True)
+    for name, kw in mine.items():
         torch.manual_seed(args.seed)                      # same noise draw for every configuration
         with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
             cv, lengths = generate(model, Lmax=canvas, batch_size=args.n, n_steps=steps,
@@ -126,6 +145,8 @@ def main():
               f"{sum(1 for v in lengths if v >= canvas):>4}/{len(lengths):<3} "
               f"{lcr / max(tot, 1):>6.1%}   {kmer_line(kmer_counts(seqs, ocfg.kmer_ks), ocfg.kmer_ks)}",
               flush=True)
+    if rank != 0:
+        return
     print("-" * 88)
     print(f"wrote {len(cfgs)} FASTA(s) to {args.out_dir}. Fold them with `qsub scripts/fold.pbs` "
           f"(or `python -m src.fold_fasta --device xpu`); each becomes its own row in the summary "
