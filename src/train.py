@@ -83,8 +83,8 @@ def build_schedule(ocfg, mcfg, device):
         B = uniform_substitution_kernel(n)
     else:
         raise ValueError(f"unknown sub_kernel {ocfg.sub_kernel!r}")
-    return CorruptionSchedule(B, mcfg.vocab_size, mcfg.mask_token_id,
-                              betas=ocfg.betas, T=ocfg.d3pm_T, device=device)
+    return CorruptionSchedule(B, mcfg.vocab_size, mcfg.mask_token_id, betas=ocfg.betas,
+                              T=ocfg.d3pm_T, span_width=ocfg.span_width, device=device)
 
 
 # --- checkpointing (rank 0 writes; atomic via tmp+rename; latest.txt is the resume pointer) ---
@@ -250,7 +250,17 @@ def main():
     batch_size = 4 if args.smoke else CFG.batch_size
     if env.is_main:
         print(f"[train] corruption: kernel={ocfg.sub_kernel} T={sched.T} betas={sched.betas} "
+              f"span_width={sched.span_width} "
               f"| eos_w={ocfg.eos_loss_weight} pad_w={ocfg.pad_loss_weight}", flush=True)
+        if sched.n_span > 1 or sched.span_width[0] > 1:
+            rl = sched.run_length(frac=0.5)
+            print("[train]   span corruption ON. MEASURED (masked run, visible run) at 50% mask, "
+                  "512 canvas: " + "  ".join(f"w={w}: {m}/{v}" for w, (m, v) in rl.items()),
+                  flush=True)
+            print("[train]   L_vb is now a MEAN-FIELD SURROGATE, not an ELBO -- per-position "
+                  "marginals are still exact, the joint posterior's correlation is not modelled. "
+                  "Compare vb only to other span runs. L_ce and the CE curve are unaffected.",
+                  flush=True)
         print(f"[train] objective: L = {ocfg.vb_weight} * T*E_t[KL] + {ocfg.ce_weight} * L_ce"
               f" | L_ce on corrupted positions"
               f"{'' if ocfg.ce_uncorrupted_weight == 0 else f' (+{ocfg.ce_uncorrupted_weight} on uncorrupted)'}"
@@ -362,6 +372,7 @@ def main():
     step = start_step
     tok_win, steps_win, t_win, t_eval, t_comm = 0, 0, time.perf_counter(), 0.0, 0.0
     skipped, skip_streak = 0, 0
+    span_off = sched.n_span == 1 and sched.span_width[0] <= 1
     n_micro = 0
     acc = {}
     model.train()
@@ -415,9 +426,10 @@ def main():
             _device_sync(dev)
             dt = max(time.perf_counter() - t_win, 1e-9)
             peak = _peak_mem_gb(dev)
+            run_str = "" if span_off else f"run{acc['mrun']:.0f} "
             print(f"step {step:>7} | loss {acc['loss']:.3f} "
                   f"(vb {acc['vb']:.3f}[{acc['vb_step']:.5f}/step] ce {acc['ce']:.3f}) "
-                  f"| corrupt {acc['masked']:.0%}m {acc['subst']:.0%}s "
+                  f"| corrupt {acc['masked']:.0%}m {acc['subst']:.0%}s {run_str}"
                   f"| lr {lr_sched.get_last_lr()[0]:.2e} | {tok_win / dt / 1e3:.0f}k tok/s "
                   f"| {dt / steps_win:.2f}s/step | comm {100 * t_comm / dt:.0f}%"
                   f"{f' | peak {peak:.1f}GB' if peak else ''}"

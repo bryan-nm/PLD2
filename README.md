@@ -27,7 +27,7 @@ touches only output logits and needs nothing from the architecture.
 | 1 | All layers the same width | `src/model.py` — `PBBlock`/`PBConditioning`/`PBCrossAttention` deleted; one `Block` type at `d_model` |
 | 2 | Keep the OADM ↔ substitution slider | `config.OptCfg.betas` — β is a parameter of one corruption process |
 | 3 | Train on **both** move types | `src/objective.training_step` — one ELBO covers unmasking *and* substitution |
-| 4 | ~50k steps | `config.OptCfg.total_steps = 50_000`, cosine after 2k warmup |
+| 4 | ~50k steps | `config.OptCfg.total_steps` — 50k at 55M; 18k at 1.35B, cosine after 2k warmup |
 | 5 | No cross-attention, no labelled data | no text pathway anywhere; `src/data.py` reads UniRef shards only |
 | 6 | Upweight EOS | `config.OptCfg.eos_loss_weight = 20.0`, applied in both loss branches |
 | 7 | Fixed 512 canvas | `config.DataCfg.canvas = 512`; length bucketing removed entirely |
@@ -63,6 +63,43 @@ move types in one term — unmasking an absorbed position and substituting a pla
 whole point of doing it this way. At `t=1` it reduces to `L_0 = −log p_θ(x_0|x_1)` with no special
 case. `λ` defaults to 1 (EvoDiff used 0) because at β=1 that term *is* the OADM cross-entropy, so
 the objective that demonstrably works remains a component rather than being replaced.
+
+**Span corruption: β sets *what* is corrupted, `span_width` sets *where*.** Two runs — 55M/50k and
+1.35B/18k — put generated pTM at the shuffled baseline (0.184 and 0.176 against a shuffle's 0.169,
+with naturals at 0.677), and the held-out CE curve was nearly flat below 50% corruption: going from
+40% of the sequence visible to 95% bought 0.18 nats, and 25× the parameters bought 0.08. Under
+i.i.d. per-position masking that is the *predicted* outcome — the median masked position has a
+revealed residue **directly adjacent** to it, so local context saturates almost immediately and
+long-range dependency never lands on the gradient's path. The result was a competent local infiller
+(ppl 7.6 at 5% corruption, in the range published protein MLMs report) that cannot place a fold.
+
+`span_width` draws the mask as a spatially correlated field instead of independent coin flips, so
+masked positions arrive in **runs** and filling the middle of a hole means reaching past it. Each
+entry is a target mean masked-run length in residues; measured at 50% corruption:
+
+| `span_width` | 1 | 8 | 32 | 128 |
+|---|---|---|---|---|
+| achieved mean run | 2.0 | 7.9 | 28.2 | 82.6 |
+| distance to nearest visible residue (mean) | 1.3 | 3.7 | 12.7 | 39.6 |
+| — (median) | 1.0 | 3.0 | 9.0 | 30.0 |
+
+It is a **tuple assigned per row**, like `betas`, and `1` stays in the mix deliberately: mid-decode
+the sampler's canvas is a *scattered* set of confidence-committed positions among masks, which is the
+i.i.d. regime, so a model trained only on wide spans would be off-distribution exactly where it gets
+used. The field is Gaussian-smoothed white noise under a circular rank threshold — Gaussian because a
+box filter's sinc sidelobes fragment its own level sets (at box width 128, 29% of "spans" were a
+single position), circular because zero padding under-corrupts the ends (0.257 against a 0.300
+target over the first 8 positions).
+
+**What span corruption costs, stated plainly.** The corruption *amount* and every *per-position
+marginal* are exactly unchanged — `P(x_t = MASK | x_0)` is still exactly `Qbar_t[x_0, MASK]` at every
+position — so `L_ce`, the all-MASK stationary distribution, the cold start and the CE curve stay
+directly comparable to both earlier runs, and **the sampler is untouched** (it runs the model's
+reverse process, which is factorised either way). What is lost is the exact ELBO: D3PM's
+`q(x_{t−1}|x_t,x_0)` factorises over positions only because the forward corruption does, so `L_vb`
+becomes a **mean-field surrogate** — the same computation, still a sensible denoising objective, but
+no longer a bound on `−log p(x_0)`. A `vb` figure from a span run is comparable only to other span
+runs. Set `span_width = (1,)` to restore the original process bit-for-bit.
 
 **The β-schedule is closed-form, not calibrated.** Pinning the cumulative mask fraction to the
 linear target `t/T` gives `β·c_t = 1/(T−t+1)`, hence `c_t = min(1, 1/(β(T−t+1)))`. The clamp binds

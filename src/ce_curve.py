@@ -64,6 +64,7 @@ import torch
 import torch.nn.functional as F
 
 from config import CFG, CKPT_DIR, UNIREF_SHARDS
+from .corruption import span_mask_field
 from .data import ProteinShards, make_collate
 from .dist import init_distributed
 from .model import LoopedDiffusionLM
@@ -75,6 +76,16 @@ try:
     _logging.getLogger("IPEX").setLevel(_logging.WARNING)
 except Exception:
     ipex = None
+
+
+def _corrupt_mask(shape, frac: float, width: int, dev) -> torch.Tensor:
+    """(B,L) bool corruption indicator at the given fraction. width=1 is independent coin flips;
+    beyond that the same fraction is drawn as contiguous runs (src/corruption.span_mask_field), with
+    the per-position marginal held exactly at `frac` either way."""
+    if width <= 1:
+        return torch.rand(shape, device=dev) < frac
+    p = torch.full((shape[0],), float(frac), device=dev)
+    return span_mask_field(p, shape[1], (width,))
 
 
 def masked_ce(model, tokens, mask_pos, n_aa=20):
@@ -113,6 +124,13 @@ def main():
     ap.add_argument("--batches", type=int, default=8)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
+    # SHAPE of the corruption, not its amount. 1 = i.i.d. per position, which is what the two
+    # earlier runs' curves were measured under and therefore the setting to use for a like-for-like
+    # comparison. A larger width masks in contiguous runs, which is the regime a span-trained model
+    # is supposed to have learned: measure both and the difference between them is the whole claim.
+    ap.add_argument("--span-width", type=int, default=1,
+                    help="target mean masked-run length in residues (1 = i.i.d., the comparable "
+                         "setting; 8/32/128 are the training ladder)")
     args = ap.parse_args()
 
     env = init_distributed(args.device, no_dist=True)
@@ -146,6 +164,10 @@ def main():
 
     use_amp = dev.type in ("xpu", "cuda")
     torch.manual_seed(args.seed)
+    if args.span_width > 1:
+        print(f"[ce] masking in SPANS (box width {args.span_width}); the corruption AMOUNT at each "
+              f"row of the table is identical to the i.i.d. curve, only its shape differs. Run "
+              f"once at --span-width 1 for the number comparable to earlier runs.", flush=True)
     fracs = (1.0, 0.95, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.05, 0.02)
     ce_by_frac = {}
     with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_amp):
@@ -154,7 +176,7 @@ def main():
             for t in batches:
                 # Training-shaped corruption: every canvas position is a candidate, so at frac=1.0
                 # EOS and PAD are masked too -- exactly what q_sample does at t=T.
-                mp = torch.rand(t.shape, device=dev) < frac
+                mp = _corrupt_mask(t.shape, frac, args.span_width, dev)
                 cf, ca, k = masked_ce(model, t, mp)
                 tf += cf * k
                 ta += ca * k

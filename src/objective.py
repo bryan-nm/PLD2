@@ -54,6 +54,16 @@ different beta per row is just training over a family of corruption processes. R
 round-robin (`arange(B) % n_beta`) rather than randomly: the batch order is already shuffled, so
 that is unbiased, and it makes the mix exactly balanced every step instead of only in expectation.
 
+SPAN CORRUPTION CHANGES WHAT L_vb IS, and the change is worth stating where the loss is defined
+rather than only where the corruption is. With `span_width` beyond (1,) the forward process no
+longer factorises over positions, so the sum of per-position KLs computed below is a MEAN-FIELD
+SURROGATE for the ELBO, not the ELBO: the true joint posterior carries cross-position correlation
+that neither q_post nor p_post represents. The computation is unchanged and remains a sensible
+denoising objective -- and L_ce, being a per-position cross-entropy against exact per-position
+marginals, is unaffected either way -- but a `vb` figure from a span run is not a bound on
+-log p(x_0) and should only be compared to other span runs. src/corruption.py's docstring has the
+full accounting of what survives.
+
 ----------------------------------------------------------------------------------------------
 POSITION WEIGHTS (upweight EOS).
 
@@ -85,6 +95,12 @@ def position_weights(x0: torch.Tensor, eos_id: int, pad_id: int,
     if eos_weight != 1.0:
         w = torch.where(x0 == eos_id, w.new_full((), eos_weight), w)
     return w
+
+
+def _mask_run(mk: torch.Tensor) -> torch.Tensor:
+    """Mean length of a contiguous True stretch in (B,L). Total True / number of run starts."""
+    starts = (mk[:, 1:] & ~mk[:, :-1]).sum() + mk[:, 0].sum()
+    return mk.sum() / starts.clamp_min(1)
 
 
 def _weighted_row_mean(per_pos: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -137,10 +153,11 @@ def training_step(model: LoopedDiffusionLM, batch: dict, sched: CorruptionSchedu
     B = x0.shape[0]
 
     beta_idx = torch.arange(B, device=x0.device) % sched.n_beta      # balanced, unbiased, static
+    span_idx = sched.sample_span_idx(B, x0.device)   # balanced too, and decorrelated from beta_idx
     t = sched.sample_t(B, x0.device)
     flat_idx, flat_prev = sched.flat(beta_idx, t), sched.flat(beta_idx, t - 1)
 
-    xt = sched.q_sample(x0, flat_idx)
+    xt = sched.q_sample(x0, flat_idx, span_idx)
     logits = model(xt, canvas_mask=canvas_mask)
 
     w = position_weights(x0, cfg.eos_token_id, cfg.pad_token_id, eos_loss_weight, pad_loss_weight)
@@ -151,7 +168,11 @@ def training_step(model: LoopedDiffusionLM, batch: dict, sched: CorruptionSchedu
                   # What the corruption actually did this step -- the cheapest guard against a
                   # schedule that silently stops masking or stops substituting.
                   "masked": (xt == cfg.mask_token_id).float().mean(),
-                  "subst": ((xt != x0) & (xt != cfg.mask_token_id)).float().mean()}
+                  "subst": ((xt != x0) & (xt != cfg.mask_token_id)).float().mean(),
+                  # Mean length of a contiguous masked stretch. The whole point of span corruption
+                  # is that this is >> 1; at span_width=(1,) it sits near 1/(1-mask_fraction) and a
+                  # span run that reports the same number is not doing what it claims.
+                  "mrun": _mask_run(xt == cfg.mask_token_id)}
 
 
 # --------------------------------------------------------------------------------------
@@ -183,9 +204,14 @@ if __name__ == "__main__":
                  d_model=128, n_heads=4, d_ff=384,
                  n_upstream=2, n_middle=4, n_downstream=2, n_recurrence=2)
     betas = (1.0, 0.9, 0.75, 0.5)
-    sched = CorruptionSchedule(uniform_substitution_kernel(22), 23, 22, betas=betas, T=100)
+    spans = (1, 4, 8)                      # L=24 here, so the ladder is scaled to the toy canvas
+    sched = CorruptionSchedule(uniform_substitution_kernel(22), 23, 22, betas=betas, T=100,
+                               span_width=spans)
     model = LoopedDiffusionLM(cfg)
-    print(f"demo params={count_params(model)/1e6:.2f}M | betas={betas} T={sched.T}")
+    print(f"demo params={count_params(model)/1e6:.2f}M | betas={betas} T={sched.T} "
+          f"span_width={spans}")
+    print(f"  span corruption, measured (masked run/visible run) at 50% mask on a 24 canvas: "
+          f"{sched.run_length(frac=0.5, L=24, n=2000)}")
     for bi, b in enumerate(betas):
         print(f"  beta={b:<5} P(x_T=MASK)={sched.terminal_mask_fraction(bi):.4f} "
               f"| mask fraction {sched.mask_fraction(bi, (0, 25, 50, 75, 100))} "
@@ -211,7 +237,8 @@ if __name__ == "__main__":
         if step % 300 == 0:
             print(f"step {step:4d} | loss {float(m['loss']):.3f} (vb {float(m['vb']):.3f} "
                   f"ce {float(m['ce']):.3f}) | corruption: {float(m['masked']):.0%} masked "
-                  f"{float(m['subst']):.0%} substituted | masked-NLL {_eval_oadm(model, tokens, cfg):.3f}")
+                  f"in runs of {float(m['mrun']):.1f} {float(m['subst']):.0%} substituted "
+                  f"| masked-NLL {_eval_oadm(model, tokens, cfg):.3f}")
 
     model.eval()
     with torch.no_grad():
@@ -224,6 +251,8 @@ if __name__ == "__main__":
     print(f"\npredicted boundary {pred}\n    vs true lengths {lengths}  (MAE {mae:.2f} positions)")
     print("\nWhat this shows: one loss trains BOTH move types -- the corruption line reports real "
           "masking AND real substitution every step, and the masked-NLL falls, which is the "
-          "unmasking half. It does NOT measure eos_loss_weight: 8 uniformly random sequences make "
-          "their lengths 8 arbitrary facts to memorise rather than a rule to learn. The real EOS "
-          "check is the `no-EOS` column of the [eval] line during training.")
+          "unmasking half. The `in runs of` figure is span corruption live: above 1.0 means the "
+          "mask is being shaped, and it is the cheapest check that the correlated field is wired "
+          "through to the loss at all. It does NOT measure eos_loss_weight: 8 uniformly random "
+          "sequences make their lengths 8 arbitrary facts to memorise rather than a rule to learn. "
+          "The real EOS check is the `no-EOS` column of the [eval] line during training.")

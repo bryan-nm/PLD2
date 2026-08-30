@@ -80,3 +80,63 @@ print(f"   t=1: q_post == onehot(x0)? err = {float((q1 - F.one_hot(x0, V).float(
 a = _rows(s.QT, f1, x1); ref2 = (a[..., :V-1]*pt); ref2 = ref2/ref2.sum(-1, keepdim=True)
 l0 = -ref2.gather(-1, x0.unsqueeze(-1)).squeeze(-1).log()
 print(f"   t=1: KL == -log p_theta(x0|x1)? err = {float((kl_categorical(q1,p1)-l0).abs().max()):.2e}")
+
+print("\n7. SPAN CORRUPTION: the mask is RESHAPED, the marginals are NOT")
+Lc, widths = 512, (1, 8, 32, 128)
+ss = CorruptionSchedule(B, V, MASK, betas=betas, T=T, span_width=widths)
+
+# (a) Per-position marginal. The rank threshold only gives the marginal for free if the smoothed
+#     field is STATIONARY, which is why the smoothing is circular -- zero padding would shrink the
+#     variance at the ends and mask those positions at a different rate (measured 0.257 against a
+#     0.300 target over the first 8 positions). Checked PER POSITION, because an aggregate mean is
+#     exactly what hides that failure.
+Na = 8000
+noise = 3.5 * (0.30 * 0.70 / Na) ** 0.5
+print(f"   target 0.3000 everywhere; 3.5 sd of binomial noise at {Na} rows = {noise:.4f}")
+for wi, w in enumerate(widths):
+    f = ss.span_field(torch.full((Na,), 0.30), Lc,
+                      torch.full((Na,), wi, dtype=torch.long)).float()
+    pp = f.mean(0)
+    print(f"   w={w:<4} mean {float(pp.mean()):.4f} | max dev {float((pp - 0.30).abs().max()):.4f}"
+          f" | first8 {float(pp[:8].mean()):.4f} last8 {float(pp[-8:].mean()):.4f}"
+          f" mid8 {float(pp[252:260].mean()):.4f}")
+
+# (b) What the width actually buys. span_width is a TARGET run length, not a kernel size; large
+#     widths undershoot because a 512 canvas at 50% corruption cannot hold many 128-residue runs.
+print(f"   measured (masked run, visible run) at 50% mask: {ss.run_length(frac=0.5)}")
+print(f"                                      at 20% mask: {ss.run_length(frac=0.2)}")
+
+# (c) THE LOAD-BEARING CLAIM: splitting the Qbar row into a correlated mask channel and an i.i.d.
+#     residue channel leaves every per-position marginal exactly Qbar. Empirical, against the Qbar
+#     row itself. The w=1 line is the tightest form of the check -- it runs the SPAN code path with
+#     no smoothing, so any error in the channel split alone would show up there.
+Nc = 2000
+x0 = torch.full((Nc, Lc), 7, dtype=torch.long)
+fi = ss.flat(torch.full((Nc,), 2, dtype=torch.long), torch.full((Nc,), 250, dtype=torch.long))
+ref = ss.Qbar[ss.flat(torch.tensor(2), torch.tensor(250))][7]
+for wi, w in enumerate(widths):
+    xt = ss.q_sample(x0, fi, torch.full((Nc,), wi, dtype=torch.long))
+    emp = torch.bincount(xt.reshape(-1), minlength=V).float() / (Nc * Lc)
+    mk = xt == MASK
+    starts = int((mk[:, 1:] & ~mk[:, :-1]).sum() + mk[:, 0].sum())
+    print(f"   w={w:<4} max |empirical - Qbar row| = {float((emp - ref).abs().max()):.5f}"
+          f"  | mean masked run {float(mk.sum()) / max(starts, 1):>5.1f}"
+          f"   (marginals identical, joint is not)")
+
+# (d) span_width=(1,) must be the ORIGINAL process bit-for-bit -- q_sample's early return.
+s1 = CorruptionSchedule(B, V, MASK, betas=betas, T=T, span_width=(1,))
+xb = torch.randint(0, 20, (256, 64))
+fb = s1.flat(torch.randint(0, 4, (256,)), s1.sample_t(256, xb.device))
+torch.manual_seed(1234); a1 = s1.q_sample(xb, fb)
+torch.manual_seed(1234); a2 = s.q_sample(xb, fb)
+print(f"   span_width=(1,) == the original q_sample, bit for bit: {bool((a1 == a2).all())}")
+
+# (e) Row assignment: exactly balanced, and NOT locked to beta_idx (arange % n_span would be).
+Bx = 512
+si = ss.sample_span_idx(Bx, xb.device)
+bi_ = torch.arange(Bx) % len(betas)
+cells = torch.stack([((si == a) & (bi_ == b)).sum()
+                     for a in range(ss.n_span) for b in range(len(betas))])
+print(f"   span_idx counts {torch.bincount(si, minlength=ss.n_span).tolist()} (exactly balanced)"
+      f" | joint (span,beta) cells {int(cells.min())}-{int(cells.max())} of "
+      f"{Bx // (ss.n_span * len(betas))} expected -- no sub-grid cell is starved")

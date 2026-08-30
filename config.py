@@ -126,6 +126,40 @@ class OptCfg:
     d3pm_T: int = 500                # diffusion steps; the Q/Qbar stacks are ~17MB at 4 betas
     sub_kernel: str = "blosum"       # "blosum" (biologically informed) or "uniform"
     sub_kernel_temp: float = 1.0     # BLOSUM softmax sharpness (higher -> flatter -> less informed)
+    # SPAN CORRUPTION: the SHAPE of the mask, not its amount. Two runs (55M/50k, 1.35B/18k) put pTM
+    # at the shuffled baseline -- 0.184 and 0.176 against a shuffle's 0.169, with naturals at 0.677 --
+    # and the held-out CE curve was flat below 50% corruption: going from 40% of the sequence visible
+    # to 95% bought 0.18 nats, and 25x the parameters bought 0.08 nats of mean CE. Under i.i.d.
+    # masking that is the predicted outcome, because a masked position's nearest VISIBLE neighbour is
+    # under two residues away at 40% corruption, so local context saturates early and long-range
+    # dependency is never on the gradient's path. Drawing the mask as a spatially correlated field
+    # puts the masked positions in RUNS, so filling the middle of a hole requires reaching past it.
+    # The corruption AMOUNT and every per-position marginal are unchanged (src/corruption.py).
+    #
+    # Each entry is a TARGET MEAN MASKED-RUN LENGTH in residues at 50% corruption. What it buys,
+    # measured (src/tests_corruption.py section 7 reproduces this) -- the distance a masked position
+    # must reach to find ANY revealed residue, at 50% corruption:
+    #
+    #   span_width      1      8     32    128
+    #   achieved run  2.0    7.9   28.2   82.6     (128 undershoots: a 512 canvas at 50% corruption
+    #   nearest vis.                                cannot hold many 128-residue runs)
+    #     mean        1.3    3.7   12.7   39.6
+    #     median      1.0    3.0    9.0   30.0
+    #
+    # The first column is the diagnosis as a number: under i.i.d. masking the median masked position
+    # has a revealed residue DIRECTLY ADJACENT to it, which is why local context saturates so early.
+    #
+    # A TUPLE, assigned per row like `betas`, and 1 stays in the mix for a specific reason: the
+    # sampler's mid-decode canvas is a SCATTERED set of confidence-committed positions among masks,
+    # which IS the i.i.d. regime. A model trained only on wide spans would be off-distribution
+    # exactly where it is used. The rest of the ladder is geometric -- 8 is secondary-structure
+    # scale, 32 sub-domain, 128 domain scale on a 512 canvas. The trainer logs the measured runs per
+    # width at startup and the mean masked-run length (`run`) on every log line.
+    #
+    # WHAT THIS COSTS: L_vb stops being an exact ELBO and becomes a mean-field surrogate (see
+    # src/objective.py). L_ce, the per-position marginals, the cold start and the CE curve are all
+    # unaffected. Set to (1,) to restore the original process bit-for-bit.
+    span_width: tuple = (1, 8, 32, 128)
     ce_weight: float = 1.0           # EvoDiff's lambda on the x0 cross-entropy. They used 0; at
                                      # beta=1 this term IS the OADM cross-entropy, so keeping it
                                      # means the objective that demonstrably works is still a
@@ -322,6 +356,11 @@ if __name__ == "__main__":
           f"(head_dim={m.d_model // m.n_heads}, checkpoint_chunk={m.checkpoint_chunk})")
     print(f"batch          : canvas={CFG.data.canvas} micro={CFG.batch_size}/rank x "
           f"accum {CFG.opt.grad_accum} (rows split round-robin across {len(CFG.opt.betas)} betas)")
+    print(f"corruption     : span_width={CFG.opt.span_width}"
+          + ("  (i.i.d. per position -- the original process)"
+             if tuple(CFG.opt.span_width) == (1,) else
+             "  (mask drawn as a correlated field; amount and per-position marginals unchanged, "
+             "L_vb is a mean-field surrogate not an ELBO)"))
     print(f"objective      : betas={CFG.opt.betas} T={CFG.opt.d3pm_T} "
           f"kernel={CFG.opt.sub_kernel} | L = {CFG.opt.vb_weight}*T*E[KL] + "
           f"{CFG.opt.ce_weight}*L_ce(corrupted, uncorr_w={CFG.opt.ce_uncorrupted_weight}) | "
