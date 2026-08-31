@@ -49,13 +49,28 @@ from .model import LoopedDiffusionLM
 # --------------------------------------------------------------------------------------
 @torch.no_grad()
 def _step_logits(model, canvas, guidance_fn, ban_eos: bool = False, eos_min_pos: int = 0):
-    lg = model(canvas)
-    if guidance_fn is not None:
-        lg = guidance_fn(canvas, lg)
+    """canvas (B, K, L) -> logits (B, K, L, V), K = model.cfg.n_tracks.
+
+    The repetition penalty and any caller guidance see only the AMINO-ACID track: they are written
+    against residue statistics (homopolymer runs, periodic repeats) and a 3Di run is a helix, not a
+    defect. Applying them to the structure track would penalise the most ordinary secondary
+    structure there is."""
     cfg = model.cfg
+    K = cfg.n_tracks
+    lg = model(canvas[:, 0], struct=canvas[:, 1]) if K == 2 else model(canvas[:, 0]).unsqueeze(1)
+    if guidance_fn is not None:
+        lg = torch.cat([guidance_fn(canvas[:, 0], lg[:, 0]).unsqueeze(1), lg[:, 1:]], dim=1)
     lg = lg.clone()
     lg[..., cfg.mask_token_id] = float("-inf")      # never emit MASK...
     lg[..., cfg.pad_token_id] = float("-inf")       # ...or PAD (it arrives only via EOS enforcement)
+    if K > 1:
+        # ONLY TRACK 0 DECIDES THE BOUNDARY. The tracks describe one molecule, so it has one length.
+        # Left to itself the structure track will commit its own EOS at its own position, and with
+        # eos_first=False it does: _enforce_eos then pads from the SEQUENCE track's boundary and the
+        # structure track is left holding a stray EOS to the left of it, so the two tracks disagree
+        # about where the protein ends and the decoded pair stops being position-aligned. The
+        # structure track's EOS is a MIRROR of track 0's, written by _enforce_eos, never a decision.
+        lg[:, 1:, :, cfg.eos_token_id] = float("-inf")
     if ban_eos:
         # The boundary is already committed. A second EOS to its LEFT would silently shorten the
         # sequence, since _enforce_eos honours the leftmost one.
@@ -63,7 +78,10 @@ def _step_logits(model, canvas, guidance_fn, ban_eos: bool = False, eos_min_pos:
     elif eos_min_pos > 0:
         # No EOS below the corpus floor: an EOS at position 0 yields the empty sequence, which is
         # where len=0 samples come from -- not from a short prediction.
-        lg[:, :eos_min_pos, cfg.eos_token_id] = float("-inf")
+        # Indexed on the POSITION axis explicitly. lg is (B, K, L, V) now, so the old
+        # `lg[:, :eos_min_pos, eos]` sliced the TRACK axis and then read eos_token_id as a POSITION,
+        # blanking every logit at position 20 -- a softmax of all -inf, i.e. NaN.
+        lg[:, :, :eos_min_pos, cfg.eos_token_id] = float("-inf")
     return lg
 
 
@@ -165,8 +183,8 @@ def _sample(probs, greedy):
     if greedy:
         conf, tok = probs.max(dim=-1)
         return tok, conf
-    B, L, V = probs.shape
-    tok = torch.multinomial(probs.reshape(-1, V), 1).reshape(B, L)
+    V = probs.shape[-1]
+    tok = torch.multinomial(probs.reshape(-1, V), 1).reshape(probs.shape[:-1])
     conf = probs.gather(-1, tok.unsqueeze(-1)).squeeze(-1)
     return tok, conf
 
@@ -180,12 +198,28 @@ def _first_eos(canvas, is_masked, eos_id):
 
 
 def _enforce_eos(canvas, is_masked, cfg):
-    """Everything right of the leftmost committed EOS becomes PAD and is done. In place."""
-    B, L = canvas.shape
-    first = _first_eos(canvas, is_masked, cfg.eos_token_id)
-    after = torch.arange(L, device=canvas.device).expand(B, L) > first[:, None]
-    canvas.masked_fill_(after, cfg.pad_token_id)
-    is_masked.masked_fill_(after, False)
+    """Everything right of the leftmost committed EOS becomes PAD and is done. In place.
+
+    Accepts (B,L) or the multi-track (B,K,L). The boundary is read from TRACK 0 and applied to every
+    track: the tracks describe one molecule and must agree on where it ends. unsqueeze returns a
+    view, so the in-place fills reach the caller's tensor either way."""
+    L = canvas.shape[-1]
+    cv = canvas if canvas.dim() == 3 else canvas.unsqueeze(1)
+    im = is_masked if is_masked.dim() == 3 else is_masked.unsqueeze(1)
+    first = _first_eos(cv[:, 0], im[:, 0], cfg.eos_token_id)
+    pos = torch.arange(L, device=canvas.device)
+    cv.masked_fill_(pos > first[:, None, None], cfg.pad_token_id)
+    im.masked_fill_(pos > first[:, None, None], False)
+    if cv.shape[1] > 1:
+        # The structure track pads from the boundary INCLUSIVE -- it has no EOS of its own, so the
+        # position holding the sequence track's EOS holds PAD here. That matches the training layout
+        # exactly (data.ProteinShards.get_pair) and, more to the point, leaves no second boundary
+        # token that could end up disagreeing with the first when the boundary moves. It can: a
+        # corrector may remask the EOS and redecode it away entirely, and a stale mirrored EOS then
+        # sat to the LEFT of the real boundary and silently unaligned the decoded pair.
+        at_or_after = pos >= first[:, None, None]
+        cv[:, 1:].masked_fill_(at_or_after, cfg.pad_token_id)
+        im[:, 1:].masked_fill_(at_or_after, False)
 
 
 def _topk_mask(scores, k, largest=True):
@@ -199,8 +233,20 @@ def _topk_mask(scores, k, largest=True):
     return rank < k.clamp(min=0)[:, None]
 
 
+def aa_track(canvas):
+    """(B,K,L) -> its amino-acid track (B,L); (B,L) passes through. One place to spell the
+    n_tracks branch so callers written before the structure track keep reading."""
+    return canvas[:, 0] if canvas.dim() == 3 else canvas
+
+
+def struct_track(canvas):
+    """(B,K,L) -> its 3Di track (B,L), or None if the canvas has no structure track."""
+    return canvas[:, 1] if canvas.dim() == 3 and canvas.shape[1] > 1 else None
+
+
 def lengths_of(canvas, cfg):
     """Length = position of the first EOS, else the full width (a max-length generation)."""
+    canvas = aa_track(canvas)
     no_mask = torch.zeros_like(canvas, dtype=torch.bool)
     return _first_eos(canvas, no_mask, cfg.eos_token_id).tolist()
 
@@ -217,9 +263,12 @@ def _place_eos_first(model, canvas, is_masked, guidance_fn, min_len, greedy, eos
     sample onto one length, so this samples unless the caller asked for greedy.
     """
     cfg = model.cfg
-    B, L = canvas.shape
+    B, L = canvas.shape[0], canvas.shape[-1]
     lg = _step_logits(model, canvas, guidance_fn)
-    p_eos = torch.softmax(lg.float(), dim=-1)[..., cfg.eos_token_id].clone()      # (B, L)
+    # The boundary is drawn from the SEQUENCE track and mirrored into the structure track. The two
+    # tracks describe the same molecule, so they have one length; letting each track place its own
+    # EOS would let them disagree about where the protein ends.
+    p_eos = torch.softmax(lg[:, 0].float(), dim=-1)[..., cfg.eos_token_id].clone()   # (B, L)
 
     lo = min(max(int(min_len), 0), L - 1)
     p_eos[:, :lo] = 0.0                                             # corpus floor
@@ -240,8 +289,9 @@ def _place_eos_first(model, canvas, is_masked, guidance_fn, min_len, greedy, eos
         probs = probs / probs.sum(dim=-1, keepdim=True)
 
     pos = probs.argmax(dim=-1) if greedy else torch.multinomial(probs, 1).squeeze(-1)
-    canvas.scatter_(1, pos[:, None], cfg.eos_token_id)
-    is_masked.scatter_(1, pos[:, None], False)
+    # EOS into the SEQUENCE track only; _enforce_eos then pads every other track from that index.
+    canvas[:, 0].scatter_(-1, pos[:, None], cfg.eos_token_id)
+    is_masked[:, 0].scatter_(-1, pos[:, None], False)
     _enforce_eos(canvas, is_masked, cfg)
     return pos
 
@@ -301,18 +351,27 @@ def _corrector_sweep(model, canvas, frac, guidance_fn, greedy, temperature, min_
     untrained checkpoint, correctors WITHOUT this floor drove mean length from 88 to 2.2.
     """
     cfg = model.cfg
-    lg = _step_logits(model, canvas, guidance_fn, eos_min_pos=min_len)
+    cv = aa_track(canvas)                        # a VIEW; edits write through to `canvas`
+    # WITH A STRUCTURE TRACK THE BOUNDARY IS FROZEN. This sweep remasks committed positions and
+    # redecodes them, so it can delete the EOS and let the boundary move RIGHT -- reclaiming a
+    # position the structure track was already padded at, whose 3Di token is gone and cannot be
+    # recovered. The two tracks then disagree about the length by one. Everything else the sweep
+    # does is safe (a boundary moving LEFT just pads more), so only EOS is taken off the table.
+    fixed = canvas.dim() == 3 and canvas.shape[1] > 1
+    lg = _step_logits(model, canvas, guidance_fn, ban_eos=fixed, eos_min_pos=min_len)[:, 0]
     probs = torch.softmax(lg / max(temperature, 1e-6), dim=-1)
-    conf = probs.gather(-1, canvas.unsqueeze(-1)).squeeze(-1)
-    eligible = canvas != cfg.pad_token_id                       # remask AAs / EOS, never PAD
+    conf = probs.gather(-1, cv.unsqueeze(-1)).squeeze(-1)
+    eligible = cv != cfg.pad_token_id                           # remask AAs / EOS, never PAD
+    if fixed:
+        eligible = eligible & (cv != cfg.eos_token_id)
     conf_e = conf.masked_fill(~eligible, float("inf"))          # inf -> never picked as lowest
     k = (frac * eligible.sum(dim=1).float()).long().clamp(min=1)
     pick = _topk_mask(conf_e, k, largest=False) & eligible
 
-    canvas.masked_fill_(pick, cfg.mask_token_id)
-    lg2 = _step_logits(model, canvas, guidance_fn, eos_min_pos=min_len)
+    cv.masked_fill_(pick, cfg.mask_token_id)
+    lg2 = _step_logits(model, canvas, guidance_fn, ban_eos=fixed, eos_min_pos=min_len)[:, 0]
     tok, _ = _sample(torch.softmax(lg2 / max(temperature, 1e-6), dim=-1), greedy)
-    canvas[pick] = tok[pick]
+    cv[pick] = tok[pick]
     _enforce_eos(canvas, torch.zeros_like(canvas, dtype=torch.bool), cfg)
 
 
@@ -328,16 +387,18 @@ def _substitution_corrector_sweep(model, canvas, frac, guidance_fn, greedy, temp
     the whole sequence (measured: mean length 88 -> 2.2 without the floor).
     """
     cfg = model.cfg
-    lg = _step_logits(model, canvas, guidance_fn, eos_min_pos=min_len)   # MASK/PAD out; EOS allowed
+    cv = aa_track(canvas)                        # a VIEW; edits write through to `canvas`
+    lg = _step_logits(model, canvas, guidance_fn,
+                      eos_min_pos=min_len)[:, 0]            # MASK/PAD out; EOS allowed
     probs = torch.softmax(lg / max(temperature, 1e-6), dim=-1)
-    conf = probs.gather(-1, canvas.unsqueeze(-1)).squeeze(-1)
-    eligible = ((canvas != cfg.pad_token_id) & (canvas != cfg.eos_token_id)
-                & (canvas != cfg.mask_token_id))
+    conf = probs.gather(-1, cv.unsqueeze(-1)).squeeze(-1)
+    eligible = ((cv != cfg.pad_token_id) & (cv != cfg.eos_token_id)
+                & (cv != cfg.mask_token_id))
     conf_e = conf.masked_fill(~eligible, float("inf"))
     k = (frac * eligible.sum(dim=1).float()).long().clamp(min=1)
     pick = _topk_mask(conf_e, k, largest=False) & eligible
     tok, _ = _sample(probs, greedy)
-    canvas[pick] = tok[pick]
+    cv[pick] = tok[pick]
     _enforce_eos(canvas, torch.zeros_like(canvas, dtype=torch.bool), cfg)
 
 
@@ -353,8 +414,26 @@ def generate(model: LoopedDiffusionLM, Lmax: int, batch_size: int,
              eos_first: bool = True, min_len: int = 30, eos_temp: float = 1.0,
              rep_penalty: float = 1.5, rep_periods=(1, 2, 3, 4, 5), max_run: int = 5,
              n_recurrence: Optional[int] = None,
-             subst_per_residue: float = 0.0, stats: Optional[dict] = None):
-    """Returns (canvas (B, Lmax) long, lengths list[int]). Always well-formed [AA* EOS PAD*].
+             subst_per_residue: float = 0.0, struct_first: float = 0.0,
+             stats: Optional[dict] = None):
+    """Returns (canvas, lengths). canvas is (B, Lmax) at n_tracks=1 and (B, 2, Lmax) at n_tracks=2
+    -- use sampler.aa_track() / sampler.struct_track() rather than indexing. Always well-formed
+    [AA* EOS PAD*], in every track.
+
+    ------------------------------------------------------------------------------------------
+    TWO TRACKS SHARE ONE RANKING, and that is the point of the layout. A 3Di edit and an amino-acid
+    edit at the same position are SEPARATE candidates competing on the same confidence scale, so
+    the decoder is free to lay down structure first and fill residues into it -- exactly the
+    "global plan, then sequence" behaviour a joint (aa, 3Di) token could not express, because
+    committing one such token commits both channels at once. Whether that ordering actually emerges
+    is an empirical question the decode answers on its own: 3Di is the lower-entropy track
+    (H = 2.52 nats against 2.89 for residues), so it should tend to win early slots without being
+    told to.
+
+    struct_first  forces the issue if it does not emerge. It is a decaying BIAS on structure
+                confidences over the first `struct_first * n_steps` steps, not a gate: every slot
+                stays eligible throughout, so the cosine floor and the termination proof below are
+                untouched. 0.0 leaves the ranking alone, which is the default and the honest test.
 
     A caller-supplied guidance_fn is applied AFTER the repetition penalty, so a ProteinGuide-style
     hook composes with it rather than replacing it.
@@ -417,8 +496,9 @@ def generate(model: LoopedDiffusionLM, Lmax: int, batch_size: int,
     use_subst = subst_per_residue > 0
     n_subst_done = 0
 
-    canvas = torch.full((B, Lmax), cfg.mask_token_id, dtype=torch.long, device=device)
-    is_masked = torch.ones((B, Lmax), dtype=torch.bool, device=device)
+    K = cfg.n_tracks
+    canvas = torch.full((B, K, Lmax), cfg.mask_token_id, dtype=torch.long, device=device)
+    is_masked = torch.ones((B, K, Lmax), dtype=torch.bool, device=device)
 
     if eos_first:
         _place_eos_first(model, canvas, is_masked, guide, min_len, greedy, eos_temp)
@@ -426,7 +506,10 @@ def generate(model: LoopedDiffusionLM, Lmax: int, batch_size: int,
     # Per-ROW schedule budget. A cosine schedule over Lmax would assume the whole canvas is still in
     # play; after eos_first most of it is already committed PAD, so an Lmax-based target sits above
     # the true masked count for most of the run and commits nothing until a rush at the very end.
-    n_active = is_masked.sum(dim=1).to(torch.float32)
+    # Summed over BOTH tracks: the schedule's budget is slots, and a structure slot costs a commit
+    # exactly like a residue slot does.
+    n_active = is_masked.flatten(1).sum(dim=1).to(torch.float32)
+    sf_steps = max(0.0, float(struct_first)) * n_steps
 
     # Per-step substitution allowance: constant, derived from the whole-decode budget. Held in a
     # tensor so it is per-row like every other quota here.
@@ -452,20 +535,34 @@ def generate(model: LoopedDiffusionLM, Lmax: int, batch_size: int,
             g = -torch.log(-torch.log(u).clamp_min(1e-9))
             conf = conf + gumbel_temp * g.masked_fill(~eligible, 0.0)
 
+        if K == 2 and step < sf_steps:
+            # Decaying preference for the structure track. A BIAS, not a gate: -inf entries stay
+            # -inf, every slot stays eligible, and the unmask floor below can still draw on the
+            # sequence track if it has to -- so nothing here can starve the schedule.
+            bias = torch.zeros_like(conf)
+            bias[:, 1] = 1e4 * (1.0 - step / max(sf_steps, 1e-9))
+            conf = conf + bias.masked_fill(~eligible, 0.0)
+
         # cosine schedule: how many positions should remain masked after this step (per row)
         frac = (step + 1) / n_steps
         n_mask_target = (n_active * math.cos(math.pi / 2 * frac)).round().long()
-        n_commit = (is_masked.sum(dim=1) - n_mask_target).clamp(min=0)
+        n_commit = (is_masked.flatten(1).sum(dim=1) - n_mask_target).clamp(min=0)
+
+        # Ranking is over the FLATTENED (track, position) slots, so one top-k chooses between an
+        # unmask and a substitution and between the two tracks in a single comparison.
+        shp = is_masked.shape
+        flat = lambda x: x.reshape(shp[0], -1)
 
         # FLOOR: the scheduled unmask quota, chosen among masked positions only. Guaranteed, which
         # is what keeps the termination proof intact when substitutions compete for edits.
-        commit = _topk_mask(conf.masked_fill(~is_masked, float("-inf")), n_commit) & is_masked
+        commit = _topk_mask(flat(conf.masked_fill(~is_masked, float("-inf"))),
+                            n_commit).view(shp) & is_masked
         sel = commit
         if use_subst:
             # EXTRA: the remaining budget, ranked globally across both move types. An unmask can win
             # here too, so the floor is a minimum and never a cap.
             rest = conf.masked_fill(sel, float("-inf"))
-            extra = _topk_mask(rest, n_subst_step) & eligible & ~sel
+            extra = _topk_mask(flat(rest), n_subst_step).view(shp) & eligible & ~sel
             n_subst_done += int((extra & ~is_masked).sum())
             sel = sel | extra
 
@@ -478,8 +575,8 @@ def generate(model: LoopedDiffusionLM, Lmax: int, batch_size: int,
     # ordering would re-select it.
     for _ in range(n_corrector):
         if corrector_type == "substitution":
-            _substitution_corrector_sweep(model, canvas, corrector_frac, guide, greedy, temperature,
-                                          min_len=min_len)
+            _substitution_corrector_sweep(model, canvas, corrector_frac, guide, greedy,
+                                          temperature, min_len=min_len)
         else:
             _corrector_sweep(model, canvas, corrector_frac, guide, greedy, temperature,
                              min_len=min_len)
@@ -489,7 +586,21 @@ def generate(model: LoopedDiffusionLM, Lmax: int, batch_size: int,
     if stats is not None:
         stats.update(n_steps=n_steps, n_subst=n_subst_done, subst_per_residue=subst_per_residue,
                      subst_per_seq=n_subst_done / max(B, 1))
-    return canvas, lengths_of(canvas, cfg)
+    # (B,L) at one track keeps every pre-structure caller working unchanged.
+    return (canvas if K > 1 else canvas[:, 0]), lengths_of(canvas, cfg)
+
+
+def decode_struct(canvas, cfg, min_len: int = 0, max_len: Optional[int] = None):
+    """The generated 3Di track as strings, aligned 1:1 with decode_seqs' output on the same canvas.
+
+    That alignment is what makes the self-consistency check possible: fold the amino-acid sequence,
+    3Di-encode the resulting structure, and compare it to the string this returns. The model told
+    you what fold it was building; ESMFold tells you what fold the sequence actually specifies."""
+    from .data import DI
+    st = struct_track(canvas)
+    if st is None:
+        return [], 0
+    return _decode_track(st, aa_track(canvas), cfg, DI, min_len, max_len)
 
 
 def decode_seqs(canvas, cfg, min_len: int = 0, max_len: Optional[int] = None):
@@ -500,19 +611,29 @@ def decode_seqs(canvas, cfg, min_len: int = 0, max_len: Optional[int] = None):
     was never generated is worse than reporting one fewer sample. Returns (sequences, n_skipped).
     """
     from .blosum import AA
-    seqs, skipped = [], 0
-    for row in canvas.cpu().tolist():
-        out = []
-        for t in row:
+    return _decode_track(aa_track(canvas), aa_track(canvas), cfg, AA, min_len, max_len)
+
+
+def _decode_track(track, aa, cfg, alphabet, min_len, max_len):
+    """Decode `track` up to the boundary, but judge the length filter on `aa`.
+
+    Both tracks are filtered on the SEQUENCE track's length so decode_seqs and decode_struct keep
+    and drop exactly the same rows: their outputs are index-aligned, which is what the
+    self-consistency check needs. Applied to the aa track this is the original decode_seqs,
+    character for character."""
+    out, skipped = [], 0
+    for trow, arow in zip(track.cpu().tolist(), aa.cpu().tolist()):
+        cut = len(arow)
+        for i, t in enumerate(arow):
             if t == cfg.eos_token_id or t == cfg.pad_token_id:
+                cut = i
                 break
-            if 0 <= t < len(AA):
-                out.append(AA[t])
-        if len(out) >= min_len and (max_len is None or len(out) <= max_len):
-            seqs.append("".join(out))
+        n_res = sum(1 for t in arow[:cut] if 0 <= t < 20)     # MASK survivors do not count
+        if n_res >= min_len and (max_len is None or n_res <= max_len):
+            out.append("".join(alphabet[t] for t in trow[:cut] if 0 <= t < len(alphabet)))
         else:
             skipped += 1
-    return seqs, skipped
+    return out, skipped
 
 
 def write_fasta(seqs, path, prefix="sample"):

@@ -32,6 +32,14 @@ RUNS_DIR = os.environ.get("PLD2_RUNS_DIR", "/flare/NLDesignProtein/bryan/Diffusi
 UNIREF_FASTA = os.environ.get("PLD2_UNIREF_FASTA", f"{DATASETS_DIR}/uniref90.fasta.gz")
 UNIREF_SHARDS = os.environ.get("PLD2_UNIREF_SHARDS", f"{DATASETS_DIR}/uniref90_shards")
 
+# PAIRED (amino acid, Foldseek 3Di) shards from the AlphaFold DB corpus -- src/preprocess_3di.py.
+# Same .bin/.idx layout as the UniRef shards plus a .3di sibling, so a directory of either kind
+# reads correctly and the two can be mixed. Measured on the source FASTAs: 17,070,828 records,
+# perfectly aligned (zero header or length mismatches), 15,316,921 inside the 30-500 window for
+# 2.79B residues. That is ~5.6B tokens across both tracks -- under Chinchilla for a 1.35B model, so
+# expect ~2-3 epochs on an 18k-step run rather than the single pass UniRef gave.
+AFDB_SHARDS = os.environ.get("PLD2_AFDB_SHARDS", f"{DATASETS_DIR}/afdb_3di_shards")
+
 BLOSUM_MAT = os.environ.get("PLD2_BLOSUM", f"{MODELS_DIR}/blosum62-special-MSA.mat")
 
 # --- run outputs ---
@@ -53,6 +61,11 @@ class DataCfg:
     # run, so XPU compiles it once. ProLoopDiff's length buckets are gone -- with a single width
     # there is nothing to bucket. The corpus is 30-500 aa, so 512 always holds [AA* EOS PAD*].
     canvas: int = 512
+    # 1 = amino acids only. 2 = amino acids + Foldseek 3Di at the same L positions (see
+    # model.Config.n_tracks for why two tracks rather than a joint alphabet or a 2L sequence).
+    # At 2, shards without a .3di sibling still train the sequence track; their structure track is
+    # all-MASK and excluded from the structure loss.
+    n_tracks: int = 2
     num_workers: int = 4
     prefetch_factor: int = 4         # batches prefetched per worker (only used when num_workers > 0)
     # Every Nth sequence GLOBALLY is held out for the fold/repetition baselines. Strided, not
@@ -126,6 +139,17 @@ class OptCfg:
     d3pm_T: int = 500                # diffusion steps; the Q/Qbar stacks are ~17MB at 4 betas
     sub_kernel: str = "blosum"       # "blosum" (biologically informed) or "uniform"
     sub_kernel_temp: float = 1.0     # BLOSUM softmax sharpness (higher -> flatter -> less informed)
+    # --- the 3Di structure track (n_tracks=2) ---
+    # Its own substitution kernel, because BLOSUM is a matrix over AMINO ACIDS and has no meaning
+    # over 3Di states -- the two alphabets share their 20 letters and nothing else. Uniform is the
+    # honest default: Foldseek ships a real 3Di substitution matrix (mat3di.out) and that is the
+    # right input here if you can get it, but inventing a similarity structure is worse than
+    # declaring none. beta=1 rows are unaffected either way (no substitution channel at all).
+    struct_sub_kernel: str = "uniform"
+    # Multiplier on the structure track's loss. 1.0 weights the two tracks equally per labelled row.
+    # Lower it if the structure track dominates early; the tracks' CE values are directly comparable
+    # (both are 23-state categoricals) so the log shows immediately whether they are balanced.
+    struct_weight: float = 1.0
     # SPAN CORRUPTION: the SHAPE of the mask, not its amount. Two runs (55M/50k, 1.35B/18k) put pTM
     # at the shuffled baseline -- 0.184 and 0.176 against a shuffle's 0.169, with naturals at 0.677 --
     # and the held-out CE curve was flat below 50% corruption: going from 40% of the sequence visible
@@ -248,6 +272,13 @@ class OptCfg:
     # most-confident-first is exactly the loop the sampler docstring warns about -- a repeat is
     # maximally predictable, so it wins every slot and extends itself. Order noise breaks that; the
     # logit penalty tried to and only flattened the composition.
+    # Structure-first decoding (n_tracks=2). A DECAYING BIAS toward 3Di edits over the first
+    # `sample_struct_first * eval_steps` steps -- not a gate, so every slot stays eligible and the
+    # cosine floor's termination guarantee is untouched. 0.0 leaves the unified ranking alone, which
+    # is the honest test: 3Di is the lower-entropy track (H = 2.52 nats against 2.89 for residues)
+    # so a trained model may well lead with it unprompted. Raise it only if the decode is measured
+    # to commit residues before the fold they are supposed to sit in.
+    sample_struct_first: float = 0.0
     sample_gumbel_temp: float = 0.1
     sample_corrector: int = 0        # post-decode corrector sweeps (see sampler._corrector_sweep)
     sample_corrector_type: str = "remask"   # or "substitution"
@@ -328,6 +359,7 @@ class RunCfg:
             d_model=1536, n_heads=24, d_ff=4608,
             n_upstream=4, n_middle=36, n_downstream=4, n_recurrence=1,
             checkpoint_chunk=6,
+            n_tracks=self.data.n_tracks,
         )
 
     @property
@@ -356,6 +388,13 @@ if __name__ == "__main__":
           f"(head_dim={m.d_model // m.n_heads}, checkpoint_chunk={m.checkpoint_chunk})")
     print(f"batch          : canvas={CFG.data.canvas} micro={CFG.batch_size}/rank x "
           f"accum {CFG.opt.grad_accum} (rows split round-robin across {len(CFG.opt.betas)} betas)")
+    print(f"tracks         : {m.n_tracks} "
+          + ("(amino acid + Foldseek 3Di at the same L positions; separate embeddings and heads, "
+             f"INDEPENDENT noise level per track) | 3Di kernel={CFG.opt.struct_sub_kernel} "
+             f"struct_weight={CFG.opt.struct_weight} struct_first={CFG.opt.sample_struct_first}"
+             if m.n_tracks == 2 else "(amino acids only)"))
+    print("shards         :", AFDB_SHARDS if m.n_tracks == 2 else UNIREF_SHARDS,
+          " exists:", os.path.isdir(AFDB_SHARDS if m.n_tracks == 2 else UNIREF_SHARDS))
     print(f"corruption     : span_width={CFG.opt.span_width}"
           + ("  (i.i.d. per position -- the original process)"
              if tuple(CFG.opt.span_width) == (1,) else

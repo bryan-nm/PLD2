@@ -101,6 +101,81 @@ becomes a **mean-field surrogate** — the same computation, still a sensible de
 no longer a bound on `−log p(x_0)`. A `vb` figure from a span run is comparable only to other span
 runs. Set `span_width = (1,)` to restore the original process bit-for-bit.
 
+---
+
+## The 3Di structure track (`n_tracks = 2`)
+
+Two runs put generated pTM at the shuffled baseline, and span corruption moved it only part way
+(0.190 → 0.222 against 0.677 for naturals). Sequence-only any-order diffusion learns local
+composition and secondary-structure propensity; global fold is a constraint that lives in structure
+space. A **Foldseek 3Di token encodes which residue a position sits against in 3D** — long-range
+information expressed as a per-position symbol — which is exactly the channel the sequence-only
+model has no way to represent.
+
+**Corpus** (`src/preprocess_3di.py` → `AFDB_SHARDS`): 17,070,828 paired records, verified aligned
+(zero header or length mismatches), 15,316,921 inside the 30–500 window for 2.79B residues. The
+pairing is checked per record and a mismatch aborts the run — a shifted corpus would attach the
+wrong structure to every sequence, train happily, and be invisible downstream.
+
+### Why two tracks at L, and not SaProt's joint alphabet
+
+| layout | verdict |
+|---|---|
+| **2 × L, separate embeddings + heads** | **chosen** |
+| 1 × L over a 22×22 alphabet (SaProt) | buys ~nothing, costs the corruption machinery |
+| 1 × 2L, one sequence | doubles length, quadruples attention |
+
+A joint alphabet exists to capture **within-position** correlation between the two channels. On this
+corpus that correlation is **I(aa; 3Di) = 0.044 nats — 1.8% of H(3Di)**, and H(aa | 3Di) = 2.845
+against H(aa) = 2.890. There is essentially nothing there to capture. That is not a defect: a single
+residue barely constrains its own local 3D environment, which is determined by its *neighbours* —
+which is precisely why 3Di is worth carrying as a separate channel rather than folded into the
+residue token. The tracks are complementary, not redundant, and the information the structure track
+supplies is at the whole-chain level, not the position level.
+
+Against that ~0.044 nats, the joint alphabet costs: D3PM's `Q`/`Qbar` stacks are
+`(n_beta, T+1, V, V)`, which is **4.2 MB at V=23 and 1.9 GB *each* at V=484**, against a measured
+36.7 GB peak on a 40 GB tile. And a product alphabet with a product transition kernel is
+*mathematically identical* to two independent tracks — it just pays V² for it. The 2L layout instead
+doubles the sequence (4× attention, or a 256-residue canvas that truncates most of the corpus).
+
+Two further things two tracks get for free: the aa embedding is **shared** across all structural
+contexts (a joint alphabet gives "A with structure V" and "A with structure D" no common
+parameters), and an **unlabelled** row is expressible as an all-MASK structure track with its loss
+masked off, rather than needing a wildcard sub-alphabet.
+
+The cost, stated plainly: two heads assume the tracks are conditionally independent *within one
+decoding step*. That is worth 0.044 nats by the measurement above, and the sequential decoder
+recovers even that — commit the 3Di token, re-run, and the residue head conditions on it.
+
+### The two choices that make the track do any work
+
+**Independent noise level per track.** Sharing `t` would mask the same fraction of both at once, so
+at every position sequence and structure would be revealed or hidden together and neither could ever
+inform the other — two parallel unconditional generators sharing a trunk. Drawing `t`, `beta` and
+`span_width` independently per track fills every batch with rows that are structure-revealed and
+sequence-masked (inverse folding) and rows the other way round (structure prediction). Those are the
+rows that force cross-track conditioning. `src/tests_tracks.py` asserts the two mask fractions are
+uncorrelated (measured r = −0.02; a shared `t` would pin it at +1.0).
+
+**One confidence ranking over both tracks.** A 3Di edit and a residue edit at the same position are
+*separate candidates* on one scale, so the decoder can lay down a fold and fill sequence into it —
+which a joint token cannot express at all, since committing one commits both channels at once.
+`sample_struct_first` biases the ordering if it does not emerge on its own; it is a decaying bias,
+never a gate, so the cosine floor's termination guarantee is untouched.
+
+**One molecule, one boundary.** Only the sequence track carries EOS; the structure track marks the
+same boundary by where its PAD begins. Giving it its own EOS let the tracks disagree about the
+length whenever the boundary moved, silently unaligning the decoded pair.
+
+**The eval writes both tracks** — `step_XXXXXXXX.rankNNN.fasta` and `.3di.fa` with matching record
+ids — so self-consistency is measurable: fold the sequence, 3Di-encode the result, compare it to the
+structure the model said it was building. Note the `.3di.fa` extension: `src/fold_fasta.py` globs
+`*.fasta`, and 3Di reuses the amino-acid letters, so a structure file reaching ESMFold would parse
+cleanly and produce confident nonsense rather than an error.
+
+---
+
 **The β-schedule is closed-form, not calibrated.** Pinning the cumulative mask fraction to the
 linear target `t/T` gives `β·c_t = 1/(T−t+1)`, hence `c_t = min(1, 1/(β(T−t+1)))`. The clamp binds
 only over the last ⌈1/β⌉ steps, where survival is already ~1e-3. Measured mask fraction at every β:

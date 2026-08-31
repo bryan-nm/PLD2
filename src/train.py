@@ -41,7 +41,7 @@ import time
 
 import torch
 
-from config import CFG, UNIREF_SHARDS, BLOSUM_MAT, CKPT_DIR, SAMPLES_DIR
+from config import CFG, UNIREF_SHARDS, AFDB_SHARDS, BLOSUM_MAT, CKPT_DIR, SAMPLES_DIR
 from .blosum import substitution_kernel, uniform_substitution_kernel
 from .corruption import CorruptionSchedule
 from .data import ProteinShards, ShardDataset, StepBatchSampler, make_collate
@@ -51,7 +51,7 @@ from .dist import (init_distributed, barrier, cleanup, broadcast_parameters, ave
 from .metrics import flatten_kmer, kmer_counts, kmer_line, lcr_counts, unflatten_kmer
 from .model import LoopedDiffusionLM, count_params
 from .objective import training_step
-from .sampler import decode_seqs, generate, write_fasta
+from .sampler import decode_seqs, decode_struct, generate, write_fasta
 
 try:
     import intel_extension_for_pytorch as ipex
@@ -83,6 +83,23 @@ def build_schedule(ocfg, mcfg, device):
         B = uniform_substitution_kernel(n)
     else:
         raise ValueError(f"unknown sub_kernel {ocfg.sub_kernel!r}")
+    return CorruptionSchedule(B, mcfg.vocab_size, mcfg.mask_token_id, betas=ocfg.betas,
+                              T=ocfg.d3pm_T, span_width=ocfg.span_width, device=device)
+
+
+def build_struct_schedule(ocfg, mcfg, device):
+    """The 3Di track's corruption process. Same absorbing MASK, same betas, same schedule, same
+    span widths -- only the substitution kernel differs, because BLOSUM is a matrix over amino acids
+    and carries no meaning over structural states."""
+    n = mcfg.vocab_size - 1
+    if ocfg.struct_sub_kernel == "uniform":
+        B = uniform_substitution_kernel(n)
+    elif ocfg.struct_sub_kernel == "blosum":
+        raise ValueError("struct_sub_kernel='blosum' is a category error: BLOSUM scores amino-acid "
+                         "exchangeability and the 3Di alphabet only borrows its letters. Use "
+                         "'uniform', or wire in Foldseek's mat3di.")
+    else:
+        raise ValueError(f"unknown struct_sub_kernel {ocfg.struct_sub_kernel!r}")
     return CorruptionSchedule(B, mcfg.vocab_size, mcfg.mask_token_id, betas=ocfg.betas,
                               T=ocfg.d3pm_T, span_width=ocfg.span_width, device=device)
 
@@ -168,7 +185,8 @@ def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp):
             eos_first=ocfg.sample_eos_first, min_len=ocfg.sample_min_len,
             eos_temp=ocfg.sample_eos_temp, rep_penalty=ocfg.sample_rep_penalty,
             rep_periods=ocfg.sample_rep_periods, max_run=ocfg.sample_max_run,
-            subst_per_residue=ocfg.sample_subst_per_residue, stats=gen_stats)
+            subst_per_residue=ocfg.sample_subst_per_residue,
+            struct_first=ocfg.sample_struct_first, stats=gen_stats)
 
     seqs, _ = decode_seqs(canvas, mcfg)
     if env.rank < ocfg.eval_fasta_ranks:
@@ -177,6 +195,20 @@ def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp):
         tmp = path + ".tmp"                          # tmp+rename so the folding watcher, which polls
         write_fasta(seqs, tmp, prefix=f"s{step}r{env.rank}")   # this directory, never reads a
         os.replace(tmp, path)                                  # half-written file
+        if mcfg.n_tracks == 2:
+            # The 3Di track the model generated ALONGSIDE that sequence, same record ids, so the
+            # pair can be rejoined downstream: fold the sequence, 3Di-encode the result, and compare
+            # it to this. That is the self-consistency check the structure track exists to make
+            # possible -- the model states which fold it was building and ESMFold says which fold
+            # the sequence actually specifies.
+            #
+            # ".3di.fa", NOT ".3di.fasta": src/fold_fasta.py globs SAMPLES_DIR/*.fasta, and a file
+            # of 3Di strings picked up by that glob would be folded as though it were protein --
+            # silently, since 3Di uses the amino-acid letters and every string would parse.
+            dpath = os.path.join(samples_dir, f"step_{step:08d}.rank{env.rank:03d}.3di.fa")
+            dis, _ = decode_struct(canvas, mcfg)
+            write_fasta(dis, dpath + ".tmp", prefix=f"s{step}r{env.rank}")
+            os.replace(dpath + ".tmp", dpath)
 
     lcr, lcr_tot = lcr_counts(seqs)
     n_no_eos = sum(1 for v in lengths if v >= ocfg.eval_canvas)
@@ -247,8 +279,16 @@ def main():
 
     # --- objective ---
     sched = build_schedule(ocfg, mcfg, dev)
+    two = mcfg.n_tracks == 2
+    sched_struct = build_struct_schedule(ocfg, mcfg, dev) if two else None
     batch_size = 4 if args.smoke else CFG.batch_size
     if env.is_main:
+        print(f"[train] tracks: {mcfg.n_tracks} "
+              + ("(amino acid + Foldseek 3Di at the same L positions, separate embeddings and "
+                 "heads, INDEPENDENT noise level per track -- shared t would reveal both tracks "
+                 f"together and neither could ever inform the other) | 3Di kernel="
+                 f"{ocfg.struct_sub_kernel} struct_weight={ocfg.struct_weight}"
+                 if two else "(amino acids only)"), flush=True)
         print(f"[train] corruption: kernel={ocfg.sub_kernel} T={sched.T} betas={sched.betas} "
               f"span_width={sched.span_width} "
               f"| eos_w={ocfg.eos_loss_weight} pad_w={ocfg.pad_loss_weight}", flush=True)
@@ -273,12 +313,21 @@ def main():
                   flush=True)
 
     # --- data ---
-    shards = ProteinShards(UNIREF_SHARDS, mcfg.eos_token_id,
+    # At n_tracks=2 the paired AFDB shards are the corpus; the aa-only UniRef shards have no
+    # structure to train the second track on.
+    shard_dir = AFDB_SHARDS if two else UNIREF_SHARDS
+    shards = ProteinShards(shard_dir, mcfg.eos_token_id,
                            split="train" if dcfg.holdout_stride else "all",
                            holdout_stride=max(dcfg.holdout_stride, 2))
     if len(shards) == 0:
-        raise RuntimeError(f"no shards in {UNIREF_SHARDS}. Run src.preprocess_fasta first "
-                           f"(or set PLD2_UNIREF_SHARDS).")
+        raise RuntimeError(f"no shards in {shard_dir}. Run "
+                           f"{'src.preprocess_3di' if two else 'src.preprocess_fasta'} first "
+                           f"(or set {'PLD2_AFDB_SHARDS' if two else 'PLD2_UNIREF_SHARDS'}).")
+    if two and not shards.has_struct:
+        raise RuntimeError(
+            f"n_tracks=2 but no shard in {shard_dir} has a .3di sibling, so the structure track "
+            f"would train against an all-MASK input on every row and contribute nothing. Run "
+            f"src.preprocess_3di, or set data.n_tracks=1.")
     ds = ShardDataset(shards)
     total = args.max_steps or (12 if args.smoke else ocfg.total_steps)
 
@@ -346,7 +395,7 @@ def main():
     nw = dcfg.num_workers
     loader = torch.utils.data.DataLoader(
         ds, batch_sampler=sampler, num_workers=nw,
-        collate_fn=make_collate(mcfg, dcfg.canvas),
+        collate_fn=make_collate(mcfg, dcfg.canvas, n_tracks=mcfg.n_tracks),
         **({"prefetch_factor": dcfg.prefetch_factor, "persistent_workers": True} if nw > 0 else {}))
     if env.is_main:
         epochs = batch_size * accum * env.world_size * total / max(len(shards), 1)
@@ -386,7 +435,9 @@ def main():
                                     eos_loss_weight=ocfg.eos_loss_weight,
                                     pad_loss_weight=ocfg.pad_loss_weight,
                                     ce_weight=ocfg.ce_weight, vb_weight=ocfg.vb_weight,
-                                    ce_uncorrupted_weight=ocfg.ce_uncorrupted_weight)
+                                    ce_uncorrupted_weight=ocfg.ce_uncorrupted_weight,
+                                    sched_struct=sched_struct,
+                                    struct_weight=ocfg.struct_weight)
         # Scale so the accumulated gradient equals one pass over the full effective batch, rather
         # than `accum` times it -- otherwise the effective learning rate scales with grad_accum.
         (loss / accum).backward()
@@ -427,9 +478,14 @@ def main():
             dt = max(time.perf_counter() - t_win, 1e-9)
             peak = _peak_mem_gb(dev)
             run_str = "" if span_off else f"run{acc['mrun']:.0f} "
+            # The structure track's own CE is directly comparable to the sequence track's (both are
+            # 23-state categoricals), so one glance says whether the two are balanced.
+            s_str = (f"| 3Di ce {acc['s_ce']:.3f} vb {acc['s_vb']:.3f} {acc['s_masked']:.0%}m "
+                     f"lbl {acc['s_frac']:.0%} " if two else "")
             print(f"step {step:>7} | loss {acc['loss']:.3f} "
                   f"(vb {acc['vb']:.3f}[{acc['vb_step']:.5f}/step] ce {acc['ce']:.3f}) "
                   f"| corrupt {acc['masked']:.0%}m {acc['subst']:.0%}s {run_str}"
+                  f"{s_str}"
                   f"| lr {lr_sched.get_last_lr()[0]:.2e} | {tok_win / dt / 1e3:.0f}k tok/s "
                   f"| {dt / steps_win:.2f}s/step | comm {100 * t_comm / dt:.0f}%"
                   f"{f' | peak {peak:.1f}GB' if peak else ''}"

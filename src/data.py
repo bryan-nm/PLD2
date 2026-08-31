@@ -33,6 +33,16 @@ from torch.utils.data import Dataset
 
 from .blosum import AA                                  # canonical 20-AA alphabet, id == index
 
+# The Foldseek 3Di structural alphabet. It is WRITTEN with the same 20 letters as the amino acids
+# and means something entirely different -- a 3Di state describes the local tertiary environment of
+# a residue, i.e. which residue it sits against in 3D. It is kept as its own name with its own
+# encode table, and the model embeds it with its own table, because one vector cannot mean both
+# "leucine" and "3Di state L". Measured on the paired AFDB corpus: the two tracks carry only
+# 0.044 nats of mutual information at a position, so they are near-independent per position and
+# genuinely complementary -- which is the entire reason for adding the track.
+DI = "ACDEFGHIKLMNPQRSTVWY"
+_DI_ID = {c: i for i, c in enumerate(DI)}
+
 # Map rare/ambiguous residues onto standard AAs; any other character rejects the sequence.
 _RARE = {"B": "D", "Z": "E", "J": "L", "U": "C", "O": "K", "X": "A"}
 _AA_ID = {c: i for i, c in enumerate(AA)}
@@ -45,6 +55,13 @@ for _c, _i in _AA_ID.items():
     _ENCODE_TABLE[ord(_c)] = _i
 for _r, _std in _RARE.items():
     _ENCODE_TABLE[ord(_r)] = _AA_ID[_std]
+
+# Separate table for the structure track. No _RARE folding: Foldseek emits 'X' for positions it
+# cannot type, and mapping that onto a real state would invent structure that was never observed.
+# An unmappable character rejects the record in preprocess_3di.
+_DI_ENCODE = np.full(256, _INVALID, dtype=np.uint8)
+for _c, _i in _DI_ID.items():
+    _DI_ENCODE[ord(_c)] = _i
 
 
 class ProteinTokenizer:
@@ -111,7 +128,7 @@ class ProteinShards:
             if shard_dir and os.path.isdir(shard_dir) else []
         self.n_shards_total = len(bins)
 
-        self.offsets, self.data = [], []
+        self.offsets, self.data, self.struct = [], [], []
         for b in bins:
             off = np.fromfile(b[:-4] + ".idx", dtype="int64")
             if verify:
@@ -127,6 +144,21 @@ class ProteinShards:
                         f"refused rather than trained on. Re-run src.preprocess_fasta.")
             self.offsets.append(off)
             self.data.append(np.memmap(b, dtype="uint8", mode="r"))
+            # Optional structure track. Decided PER SHARD, so an aa-only corpus (the UniRef shards)
+            # and a paired one can sit in the same directory and both read correctly. The .idx was
+            # already checked against the .bin above and the pairing guarantees equal lengths, so
+            # checking the .3di against the same offsets validates it for free.
+            d3 = b[:-4] + ".3di"
+            if os.path.exists(d3):
+                if verify and os.path.getsize(d3) != int(off[-1]):
+                    raise RuntimeError(
+                        f"{d3}: {os.path.getsize(d3)} bytes against an .idx of {int(off[-1])}. The "
+                        f"structure track does not line up with the sequence track, which would "
+                        f"attach the wrong structure to every record past the mismatch. Re-run "
+                        f"src.preprocess_3di.")
+                self.struct.append(np.memmap(d3, dtype="uint8", mode="r"))
+            else:
+                self.struct.append(None)
         counts = [len(off) - 1 for off in self.offsets]
         self.cum = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64) if counts \
             else np.array([0], np.int64)
@@ -158,9 +190,30 @@ class ProteinShards:
         return s, i - int(self.cum[s])
 
     def get(self, j) -> List[int]:
+        """Amino-acid ids + EOS. Unchanged, so aa-only callers (ce_curve, make_baselines) still
+        work exactly as before whether or not the shards carry a structure track."""
         s, k = self._locate(self.global_index(int(j)))
         a, b = int(self.offsets[s][k]), int(self.offsets[s][k + 1])
         return self.data[s][a:b].tolist() + [self.eos_id]
+
+    def get_pair(self, j):
+        """(aa ids + EOS, 3Di ids + EOS or None). None means this record has no structure label --
+        the loss is masked off for it rather than being trained against invented structure."""
+        s, k = self._locate(self.global_index(int(j)))
+        a, b = int(self.offsets[s][k]), int(self.offsets[s][k + 1])
+        aa = self.data[s][a:b].tolist() + [self.eos_id]
+        st = self.struct[s]
+        # NO EOS on the structure track. The two tracks describe one molecule, so it has ONE
+        # boundary and the sequence track owns it; the structure track marks the same boundary by
+        # where its PAD begins, which carries identical information without a second token that
+        # could disagree. Giving it its own EOS made the sampler's tracks fall out of alignment
+        # whenever the boundary moved (see src/sampler._enforce_eos).
+        return aa, (None if st is None else st[a:b].tolist())
+
+    @property
+    def has_struct(self) -> bool:
+        """True if ANY shard carries a structure track."""
+        return any(s is not None for s in self.struct)
 
     def all_lengths(self) -> np.ndarray:
         """Every sequence's residue count, over ALL shards, straight from the offset arrays.
@@ -180,7 +233,7 @@ class ShardDataset(Dataset):
         return len(self.shards)
 
     def __getitem__(self, i):
-        return self.shards.get(int(i))
+        return self.shards.get_pair(int(i))
 
 
 class StepBatchSampler(torch.utils.data.Sampler):
@@ -215,40 +268,63 @@ class StepBatchSampler(torch.utils.data.Sampler):
         return max(0, self.total_steps - self.start_step)
 
 
-def make_collate(cfg, canvas: int = 512):
-    """samples (lists of token ids) -> {"tokens": (B, canvas) long}, right-padded with PAD.
+def make_collate(cfg, canvas: int = 512, n_tracks: int = 1):
+    """samples -> {"tokens": (B, canvas) long} and, at n_tracks=2, also "struct" and "has_struct".
+
+    A sample is either a bare list of amino-acid ids (aa-only callers: ce_curve, make_baselines) or
+    the (aa, 3Di-or-None) pair ShardDataset yields. Both are accepted, so nothing that predates the
+    structure track needs to change.
 
     A sequence longer than the canvas is truncated to canvas-1 residues plus EOS, so every row is
     well-formed [AA* EOS PAD*]. The corpus is size-filtered to <= 500 aa upstream, so this should
     never fire; it exists so a mis-built shard produces a valid batch rather than a silent
     off-by-one at the canvas edge.
+
+    THE TWO TRACKS ARE MIRRORED: the sequence track is [AA* EOS PAD*] and the structure track is
+    [3Di* PAD*] with its PAD starting exactly at the sequence track's EOS, because the pairing
+    guarantees equal lengths. Only the sequence track carries EOS -- one molecule, one boundary. A row with no structure label gets an all-PAD
+    structure track and has_struct=False, and objective.training_step zeroes its structure loss. It
+    is filled with PAD rather than MASK because x0 must never contain MASK -- the Q/Qbar stacks are
+    indexed BY x0 and cover only the non-MASK states, so a MASK there is an out-of-bounds gather,
+    unchecked on XPU and surfacing as an opaque GPU fault rather than an exception.
     """
     pad, eos, vocab, mask = cfg.pad_token_id, cfg.eos_token_id, cfg.vocab_size, cfg.mask_token_id
 
-    def collate(samples):
-        B = len(samples)
-        tokens = torch.full((B, canvas), pad, dtype=torch.long)
-        for i, ids in enumerate(samples):
-            if len(ids) > canvas:
-                ids = list(ids[:canvas - 1]) + [eos]
-            tokens[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
+    def _fill(row, ids):
+        if len(ids) > canvas:
+            ids = list(ids[:canvas - 1]) + [eos]
+        row[:len(ids)] = torch.tensor(ids, dtype=torch.long)
+
+    def _check(t, name):
         # Bounds check on the HOST, where it costs ~10us and raises something readable. nn.Embedding
         # and cross_entropy do NOT bounds-check on XPU: an id outside [0, vocab) there is an
         # unchecked out-of-range read that surfaces as an opaque "Segmentation fault from GPU ...
         # NotPresent" abort with no line number. A corrupt/truncated shard is how you get one.
-        lo, hi = int(tokens.min()), int(tokens.max())
+        lo, hi = int(t.min()), int(t.max())
         if lo < 0 or hi >= vocab:
-            bad = [(i, int(tokens[i].min()), int(tokens[i].max())) for i in range(B)
-                   if int(tokens[i].min()) < 0 or int(tokens[i].max()) >= vocab]
-            raise ValueError(f"token id out of range [0,{vocab}): batch min={lo} max={hi}; "
-                             f"offending rows (idx, min, max)={bad[:8]}. Check the shard .bin/.idx.")
-        # x0 must never contain MASK. The OADM branch puts MASK in on purpose; the D3PM branch
-        # indexes its Q/Qbar stacks with x0 and those cover only the 22 non-MASK states, so a MASK
-        # here would be an out-of-bounds gather -- unchecked on XPU, and an opaque GPU fault rather
-        # than an exception. One host-side comparison per batch buys a readable error instead.
-        if bool((tokens == mask).any()):
-            raise ValueError(f"MASK (id {mask}) appears in the training targets. x0 must hold only "
-                             f"amino acids, EOS and PAD; check the shard .bin for a stray byte.")
-        return {"tokens": tokens}
+            bad = [(i, int(t[i].min()), int(t[i].max())) for i in range(t.shape[0])
+                   if int(t[i].min()) < 0 or int(t[i].max()) >= vocab]
+            raise ValueError(f"{name}: token id out of range [0,{vocab}): min={lo} max={hi}; "
+                             f"offending rows (idx, min, max)={bad[:8]}. Check the shard files.")
+        if bool((t == mask).any()):
+            raise ValueError(f"{name}: MASK (id {mask}) appears in the training targets. x0 must "
+                             f"hold only real states, EOS and PAD; check the shard for a stray byte.")
+
+    def collate(samples):
+        B = len(samples)
+        tokens = torch.full((B, canvas), pad, dtype=torch.long)
+        struct = torch.full((B, canvas), pad, dtype=torch.long)
+        has = torch.zeros(B, dtype=torch.bool)
+        for i, smp in enumerate(samples):
+            aa, di = smp if isinstance(smp, tuple) else (smp, None)
+            _fill(tokens[i], aa)
+            if di is not None:
+                _fill(struct[i], di)
+                has[i] = True
+        _check(tokens, "tokens")
+        if n_tracks == 1:
+            return {"tokens": tokens}
+        _check(struct, "struct")
+        return {"tokens": tokens, "struct": struct, "has_struct": has}
 
     return collate

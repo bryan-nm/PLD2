@@ -75,6 +75,22 @@ class Config:
     dropout: float = 0.0
     tie_embeddings: bool = True
 
+    # TRACKS. 1 = amino acids only (everything before the 3Di work; a 1-track checkpoint keeps its
+    # exact state-dict keys, so ckpt_00017999.pt still loads). 2 = amino acids + Foldseek 3Di
+    # structure states at the SAME L positions, embedded with SEPARATE tables and summed into one
+    # residual stream, with a separate output head per track.
+    #
+    # Two tracks at L rather than one joint token per position (SaProt's 20x20 vocabulary) or one
+    # sequence of length 2L. The joint alphabet exists to capture within-position correlation
+    # between the two channels, and on the paired AFDB corpus that correlation is
+    # I(aa; 3Di) = 0.044 nats -- 1.8% of H(3Di). It buys almost nothing, and it costs: D3PM's Q/Qbar
+    # stacks are (n_beta, T+1, V, V), which is 4.2MB at V=23 and 1.9GB EACH at V=484, against a
+    # 36.7GB peak on a 40GB tile. The 2L layout instead doubles the sequence and quadruples
+    # attention. Two tracks also let the decoder commit a structure token and a residue token at the
+    # same position as SEPARATE edits, which is what allows a fold to be laid down before the
+    # sequence is filled into it -- see src/sampler.py.
+    n_tracks: int = 1
+
     def assert_vocab(self):
         """MASK must be the last id and EOS/PAD must precede it -- see the vocab note above."""
         assert self.mask_token_id == self.vocab_size - 1, \
@@ -252,6 +268,13 @@ class LoopedDiffusionLM(nn.Module):
         self.final_norm = RMSNorm(cfg.d_model)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
 
+        # The structure track. Deliberately NOT folded into `embed`/`lm_head` as a widened
+        # vocabulary: keeping those two names and shapes untouched is what lets a 1-track checkpoint
+        # load into a 1-track model with identical keys after this change landed.
+        if cfg.n_tracks == 2:
+            self.struct_embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
+            self.struct_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+
         # INITIALISATION -- a fix, not a design change (see README "deviations"). PyTorch's default
         # nn.Embedding init is N(0, 1), unscaled, and with tied embeddings the output logits are
         # <h, e_i> with ||h|| ~ sqrt(d_model): measured, that put the cross-entropy at step 0 near
@@ -270,8 +293,10 @@ class LoopedDiffusionLM(nn.Module):
 
         if cfg.tie_embeddings:
             self.lm_head.weight = self.embed.weight
+            if cfg.n_tracks == 2:
+                self.struct_head.weight = self.struct_embed.weight
 
-    def forward(self, tokens, canvas_mask=None, n_recurrence=None):
+    def forward(self, tokens, canvas_mask=None, n_recurrence=None, struct=None):
         """
         tokens:      (B, L) long. MASK where absorbed (OADM), or a substituted token (D3PM).
                      EOS marks the length; PAD after EOS is modelled and attended.
@@ -279,13 +304,30 @@ class LoopedDiffusionLM(nn.Module):
                      bidirectional attention, which is the case for PLD2's fixed 512 canvas (every
                      position is AA, EOS or PAD -- there is no beyond-canvas filler).
         n_recurrence: override the number of loop passes (adaptive compute at inference).
-        returns:     logits (B, L, vocab_size)
+        struct:      (B, L) long, the 3Di track, required when cfg.n_tracks == 2. Same corruption
+                     alphabet as `tokens` and mirrored EOS/PAD, but drawn at its OWN noise level.
+        returns:     logits (B, L, V) at n_tracks=1, or (B, 2, L, V) at n_tracks=2, ordered
+                     [amino acid, structure].
+
+        THE RETURN SHAPE IS CONDITIONAL ON n_tracks, which is a real wart and a deliberate one: the
+        alternative is always returning (B, n_tracks, L, V), which would have forced a rename of
+        `embed`/`lm_head` or a shim in every existing caller, and ckpt_00017999.pt has CE curves
+        still owed against it. Callers branch on cfg.n_tracks.
         """
         cfg = self.cfg
         N = n_recurrence or cfg.n_recurrence
         keep_mask = canvas_mask
 
         x = self.embed(tokens)
+        if cfg.n_tracks == 2:
+            if struct is None:
+                raise ValueError("n_tracks=2 needs the `struct` track; got None. An absent "
+                                 "structure LABEL is expressed as an all-PAD track plus "
+                                 "has_struct=False (see data.make_collate), not as a missing arg.")
+            # SUMMED, not concatenated. Concatenation would halve the width available to each track
+            # or double d_model; summing is how a multi-track transformer normally composes inputs
+            # and it keeps the trunk, the checkpointing and the memory profile exactly as measured.
+            x = x + self.struct_embed(struct)
         for l in self.up_layers:
             x = l(x, keep_mask)
         h_up = x                                                # upstream output for re-injection
@@ -304,7 +346,10 @@ class LoopedDiffusionLM(nn.Module):
         for l in self.down_layers:
             x = l(x, keep_mask)
 
-        return self.lm_head(self.final_norm(x))
+        h = self.final_norm(x)
+        if cfg.n_tracks == 2:
+            return torch.stack((self.lm_head(h), self.struct_head(h)), dim=1)
+        return self.lm_head(h)
 
 
 def count_params(m: nn.Module) -> int:

@@ -103,10 +103,20 @@ def _mask_run(mk: torch.Tensor) -> torch.Tensor:
     return mk.sum() / starts.clamp_min(1)
 
 
-def _weighted_row_mean(per_pos: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """Weighted mean over positions for each row, then mean over rows. -> scalar."""
+def _weighted_row_mean(per_pos: torch.Tensor, w: torch.Tensor,
+                       row_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Weighted mean over positions for each row, then mean over the rows row_mask selects.
+
+    row_mask is NOT the same as zeroing those rows' position weights. Zeroed weights give
+    per_seq = 0/eps = 0 for the excluded rows and .mean() then averages those zeros in, so the
+    structure loss would silently scale with the FRACTION of the batch that happens to carry a
+    structure label -- an effective learning rate that moves with the data mix. Excluding the rows
+    from the denominator keeps the per-labelled-row loss on a fixed scale."""
     per_seq = (per_pos * w).sum(dim=1) / w.sum(dim=1).clamp_min(1e-6)
-    return per_seq.mean()
+    if row_mask is None:
+        return per_seq.mean()
+    m = row_mask.to(per_seq.dtype)
+    return (per_seq * m).sum() / m.sum().clamp_min(1.0)
 
 
 # --------------------------------------------------------------------------------------
@@ -114,7 +124,8 @@ def _weighted_row_mean(per_pos: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 # --------------------------------------------------------------------------------------
 def diffusion_loss(logits, x0, xt, flat_idx, flat_prev, sched: CorruptionSchedule,
                    weights, ce_weight: float = 1.0, vb_weight: float = 1.0,
-                   ce_uncorrupted_weight: float = 0.0):
+                   ce_uncorrupted_weight: float = 0.0,
+                   row_mask: Optional[torch.Tensor] = None):
     """vb_weight * T * E_t[KL] + ce_weight * L_ce over the unified process. See the module docstring
     for why the T and the corrupted-only restriction both matter.
 
@@ -128,51 +139,104 @@ def diffusion_loss(logits, x0, xt, flat_idx, flat_prev, sched: CorruptionSchedul
         p_tilde = x0_probs(logits, sched.n)                     # (B,L,n) over non-MASK states
         q_post, p_post = sched.posteriors(x0, xt, flat_idx, flat_prev, p_tilde)
         # Per-step KL, then scaled to the SUM over t that the ELBO actually is.
-        vb_step = _weighted_row_mean(kl_categorical(q_post, p_post), weights)
+        vb_step = _weighted_row_mean(kl_categorical(q_post, p_post), weights, row_mask)
         vb = sched.T * vb_step
         # Corrupted == the model cannot copy the answer out of its own input.
         corrupted = (xt != x0).float()
         ce_w = weights * (corrupted + ce_uncorrupted_weight * (1.0 - corrupted))
         ce = _weighted_row_mean(
-            -p_tilde.gather(-1, x0.unsqueeze(-1)).squeeze(-1).clamp_min(1e-12).log(), ce_w)
+            -p_tilde.gather(-1, x0.unsqueeze(-1)).squeeze(-1).clamp_min(1e-12).log(), ce_w, row_mask)
     return (vb_weight * vb + ce_weight * ce, vb.detach(), vb_step.detach(), ce.detach())
 
 
 def training_step(model: LoopedDiffusionLM, batch: dict, sched: CorruptionSchedule,
                   eos_loss_weight: float = 1.0, pad_loss_weight: float = 1.0,
                   ce_weight: float = 1.0, vb_weight: float = 1.0,
-                  ce_uncorrupted_weight: float = 0.0):
-    """batch: {"tokens": (B, L) long}. Returns (loss, metrics).
+                  ce_uncorrupted_weight: float = 0.0,
+                  sched_struct: Optional[CorruptionSchedule] = None,
+                  struct_weight: float = 1.0):
+    """batch: {"tokens": (B,L)} and, at n_tracks=2, also "struct" (B,L) and "has_struct" (B,).
+    Returns (loss, metrics).
 
     Metrics are on-device 0-d tensors: converting them here would force a device->host sync every
     step for numbers the trainer only prints every log_every steps.
+
+    THE TWO TRACKS ARE CORRUPTED AT INDEPENDENT NOISE LEVELS, and this is the single most important
+    choice in the two-track design. Sharing t across tracks would mask the same fraction of both at
+    once, so at every position the sequence and the structure would be revealed or hidden together
+    and NEITHER track would ever be able to inform the other -- the model would learn two parallel
+    unconditional generators sharing a trunk, which is precisely the thing we already have. Drawing
+    t, beta and span independently per track means the batch constantly contains rows with the
+    structure largely revealed and the sequence largely masked (inverse folding) and rows the other
+    way round (structure prediction), and those are the rows that force cross-track conditioning.
+
+    A ROW WITH NO STRUCTURE LABEL gets an all-MASK structure input and is excluded from the
+    structure loss. All-MASK is not a placeholder here -- it is the honest statement "structure
+    unknown", it is exactly the canvas the sampler cold-starts the structure track from, and it
+    keeps mixed labelled/unlabelled corpora in distribution with generation.
     """
     cfg = model.cfg
     x0 = batch["tokens"]
     canvas_mask = batch.get("canvas_mask")            # None -> the whole 512 canvas is modelled
-    B = x0.shape[0]
+    dev, B = x0.device, x0.shape[0]
+    two = cfg.n_tracks == 2
 
-    beta_idx = torch.arange(B, device=x0.device) % sched.n_beta      # balanced, unbiased, static
-    span_idx = sched.sample_span_idx(B, x0.device)   # balanced too, and decorrelated from beta_idx
-    t = sched.sample_t(B, x0.device)
+    beta_idx = torch.arange(B, device=dev) % sched.n_beta           # balanced, unbiased, static
+    span_idx = sched.sample_span_idx(B, dev)         # balanced too, and decorrelated from beta_idx
+    t = sched.sample_t(B, dev)
     flat_idx, flat_prev = sched.flat(beta_idx, t), sched.flat(beta_idx, t - 1)
-
     xt = sched.q_sample(x0, flat_idx, span_idx)
-    logits = model(xt, canvas_mask=canvas_mask)
+
+    if not two:
+        logits = model(xt, canvas_mask=canvas_mask)
+        aa_logits = logits
+    else:
+        if sched_struct is None:
+            raise ValueError("n_tracks=2 needs sched_struct (the 3Di corruption process). The "
+                             "structure track has its own substitution kernel -- BLOSUM is defined "
+                             "over amino acids and means nothing over 3Di states.")
+        s0 = batch["struct"]
+        has = batch["has_struct"].to(dev)
+        # Independent draws. beta is permuted rather than arange'd so it does not lock to the aa
+        # track's arange assignment, which would collapse the (beta_aa, beta_struct) grid onto its
+        # diagonal and never sample the off-diagonal combinations.
+        beta_s = torch.argsort(torch.rand(B, device=dev)) % sched_struct.n_beta
+        span_s = sched_struct.sample_span_idx(B, dev)
+        t_s = sched_struct.sample_t(B, dev)
+        flat_s, flat_s_prev = sched_struct.flat(beta_s, t_s), sched_struct.flat(beta_s, t_s - 1)
+        st = sched_struct.q_sample(s0, flat_s, span_s)
+        st = torch.where(has[:, None], st, torch.full_like(st, cfg.mask_token_id))
+        logits = model(xt, canvas_mask=canvas_mask, struct=st)
+        aa_logits, st_logits = logits[:, 0], logits[:, 1]
 
     w = position_weights(x0, cfg.eos_token_id, cfg.pad_token_id, eos_loss_weight, pad_loss_weight)
-    loss, vb, vb_step, ce = diffusion_loss(logits, x0, xt, flat_idx, flat_prev, sched, w,
+    loss, vb, vb_step, ce = diffusion_loss(aa_logits, x0, xt, flat_idx, flat_prev, sched, w,
                                            ce_weight, vb_weight, ce_uncorrupted_weight)
 
-    return loss, {"loss": loss.detach(), "vb": vb, "vb_step": vb_step, "ce": ce,
-                  # What the corruption actually did this step -- the cheapest guard against a
-                  # schedule that silently stops masking or stops substituting.
-                  "masked": (xt == cfg.mask_token_id).float().mean(),
-                  "subst": ((xt != x0) & (xt != cfg.mask_token_id)).float().mean(),
-                  # Mean length of a contiguous masked stretch. The whole point of span corruption
-                  # is that this is >> 1; at span_width=(1,) it sits near 1/(1-mask_fraction) and a
-                  # span run that reports the same number is not doing what it claims.
-                  "mrun": _mask_run(xt == cfg.mask_token_id)}
+    m = {"vb": vb, "vb_step": vb_step, "ce": ce,
+         # What the corruption actually did this step -- the cheapest guard against a schedule that
+         # silently stops masking or stops substituting.
+         "masked": (xt == cfg.mask_token_id).float().mean(),
+         "subst": ((xt != x0) & (xt != cfg.mask_token_id)).float().mean(),
+         # Mean length of a contiguous masked stretch. The whole point of span corruption is that
+         # this is >> 1; at span_width=(1,) it sits near 1/(1-mask_fraction) and a span run that
+         # reports the same number is not doing what it claims.
+         "mrun": _mask_run(xt == cfg.mask_token_id)}
+
+    if two:
+        ws = position_weights(s0, cfg.eos_token_id, cfg.pad_token_id,
+                              eos_loss_weight, pad_loss_weight)
+        s_loss, s_vb, s_vb_step, s_ce = diffusion_loss(
+            st_logits, s0, st, flat_s, flat_s_prev, sched_struct, ws,
+            ce_weight, vb_weight, ce_uncorrupted_weight, row_mask=has)
+        loss = loss + struct_weight * s_loss
+        m.update({"s_vb": s_vb, "s_ce": s_ce,
+                  "s_masked": (st == cfg.mask_token_id).float().mean(),
+                  # Fraction of the batch carrying a real structure label. If this drifts from the
+                  # corpus mix, the sampler or the shard directory is not what you think it is.
+                  "s_frac": has.float().mean()})
+    m["loss"] = loss.detach()
+    return loss, m
 
 
 # --------------------------------------------------------------------------------------

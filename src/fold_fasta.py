@@ -336,9 +336,14 @@ def main():
     lo = ocfg.fold_min_len if args.min_len is None else args.min_len
     hi = ocfg.fold_max_len if args.max_len is None else args.max_len
     patterns = args.fasta or [os.path.join(args.dir, "*.fasta")]
+    # Never fold a structure track. The 3Di alphabet reuses the amino-acid letters, so a .3di file
+    # that reached ESMFold would parse cleanly and produce confident-looking nonsense rather than an
+    # error. The trainer already names them ".3di.fa" to miss the glob above; this is the backstop
+    # for an explicit argument or a widened pattern.
+    _is_struct = lambda q: ".3di." in os.path.basename(q)
 
     def current_paths():
-        return [p for pat in patterns for p in sorted(glob_.glob(pat))]
+        return [p for pat in patterns for p in sorted(glob_.glob(pat)) if not _is_struct(p)]
 
     # Topology WITHOUT a process group: this reads the MPI rank/size and pins this rank's tile, but
     # never calls init_process_group, so oneCCL is never initialised in this process. That is the
