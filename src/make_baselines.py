@@ -43,13 +43,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=ocfg.n_baseline, help="sequences per baseline")
     ap.add_argument("--out-dir", default=SAMPLES_DIR)
-    # FOLLOWS n_tracks, like train.py. The natural/shuffled rows are the ceiling and floor every
-    # checkpoint is read against, so they have to be drawn from the corpus the model was actually
-    # trained on. Pinning them to UniRef while training on AFDB would compare generations against a
-    # different length distribution (AFDB median 170 vs UniRef ~250) and a set selected for having
-    # AlphaFold models -- a mismatch that shifts both baselines and is invisible in the table.
+    # FOLLOWS THE TRAINING MIX. The natural/shuffled rows are the ceiling and floor every checkpoint
+    # is read against, so they must come from the distribution the model is actually being trained
+    # toward. Drawing them from the wrong corpus is invisible in the table and shifts both rows:
+    # measured, AFDB gives natural 73.0 pLDDT / 0.568 pTM at length 165 where UniRef gives
+    # 81.8 / 0.677 at 250 -- a ceiling ~9 pLDDT lower and a usable range ~25% narrower.
+    #
+    # So: UniRef whenever UniRef is in the mix (struct_frac < 1), which is both the broader target
+    # distribution and what keeps this run's fold table comparable to the three that came before.
+    # Only a pure-AFDB run (struct_frac = 1.0) reads against AFDB.
     ap.add_argument("--shards",
-                    default=AFDB_SHARDS if CFG.data.n_tracks == 2 else UNIREF_SHARDS)
+                    default=AFDB_SHARDS if (CFG.data.n_tracks == 2
+                                            and CFG.data.struct_frac >= 1.0) else UNIREF_SHARDS)
     ap.add_argument("--max-len", type=int, default=None,
                     help="drop sequences longer than this (default: the eval canvas, so the "
                          "baseline covers the same length regime the model can generate)")

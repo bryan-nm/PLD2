@@ -223,6 +223,88 @@ class ProteinShards:
         return np.concatenate([np.diff(off).astype(np.int32) for off in self.offsets])
 
 
+class MixedShards:
+    """Two (or more) corpora sampled at a FIXED ratio, exposing the ProteinShards interface.
+
+    The point is the amino-acid track. AFDB gives 15.3M paired sequences (2.79B residues); UniRef90
+    gives several times that with no structure. Training on AFDB alone gets structure on every row
+    but a narrower, shorter sequence distribution -- and it moves the fold table's natural ceiling
+    (measured: 73.0 pLDDT / 0.568 pTM at length 165, against UniRef's 81.8 / 0.677 at 250), so the
+    run stops being comparable to every previous one. Simply concatenating instead pins the ratio at
+    whatever the corpus sizes happen to be, which is ~14% structure -- too thin to train the second
+    track on. So the ratio is a knob.
+
+    ROUTING IS CLOSED-FORM, like the strided holdout, so no per-sequence index is materialised: a
+    virtual index j takes slot j % K, the slot decides which corpus, and j // K indexes into it
+    (mod its length). K slots split by weight give exactly the requested proportions, and because
+    StepBatchSampler draws j uniformly with replacement, every rank sees the intended mix every step
+    without any coordination. The `lbl` column of the training log reports the achieved fraction,
+    which is the check that this is doing what it claims.
+    """
+
+    _K = 16                                     # slot granularity; ratios are multiples of 1/16
+
+    def __init__(self, parts, weights):
+        parts = [p for p in parts if len(p) > 0]
+        assert parts, "MixedShards needs at least one non-empty corpus"
+        w = [max(0.0, float(x)) for x in weights][:len(parts)]
+        tot = sum(w) or 1.0
+        # Slots per part, rounded to the grid, with every non-zero-weight part guaranteed >= 1.
+        counts = [max(1, int(round(self._K * x / tot))) if x > 0 else 0 for x in w]
+        while sum(counts) > self._K:            # rounding can overshoot; trim the largest
+            counts[counts.index(max(counts))] -= 1
+        while sum(counts) < self._K:
+            counts[counts.index(max(counts))] += 1
+        self.parts = parts
+        self.counts = counts
+        self.route = [i for i, c in enumerate(counts) for _ in range(c)]
+        self.eos_id = parts[0].eos_id
+        self._n = self._K * max(len(p) for p in parts)
+
+    def __len__(self):
+        return self._n
+
+    @property
+    def has_struct(self) -> bool:
+        return any(p.has_struct for p in self.parts)
+
+    @property
+    def n_total(self) -> int:
+        """Real sequences across all parts. NOT len(self), which is the virtual index space the
+        closed-form routing draws from and is deliberately larger."""
+        return sum(p.n_total for p in self.parts)
+
+    @property
+    def n_shards_total(self) -> int:
+        return sum(p.n_shards_total for p in self.parts)
+
+    @property
+    def n_train(self) -> int:
+        """Trainable rows across all parts, i.e. what len() would mean for a single corpus."""
+        return sum(len(p) for p in self.parts)
+
+    @property
+    def struct_fraction(self) -> float:
+        """Fraction of DRAWS that land on a corpus carrying a structure track."""
+        return sum(c for c, p in zip(self.counts, self.parts) if p.has_struct) / float(self._K)
+
+    def _route(self, j):
+        j = int(j)
+        p = self.parts[self.route[j % self._K]]
+        return p, (j // self._K) % len(p)
+
+    def get(self, j):
+        p, k = self._route(j)
+        return p.get(k)
+
+    def get_pair(self, j):
+        p, k = self._route(j)
+        return p.get_pair(k)
+
+    def all_lengths(self):
+        return np.concatenate([p.all_lengths() for p in self.parts])
+
+
 class ShardDataset(Dataset):
     """Thin Dataset over ProteinShards; __getitem__ returns the token id list."""
 

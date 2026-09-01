@@ -66,6 +66,23 @@ class DataCfg:
     # At 2, shards without a .3di sibling still train the sequence track; their structure track is
     # all-MASK and excluded from the structure loss.
     n_tracks: int = 2
+    # Fraction of training rows drawn from the PAIRED (structure-carrying) corpus, the rest from
+    # aa-only UniRef. Only meaningful at n_tracks=2.
+    #
+    #   1.0  AFDB only. Structure on every row, but 2.79B residues (~2-3 epochs at 18k steps), a
+    #        narrower and shorter sequence distribution, and -- measured -- a fold ceiling that
+    #        moves: natural 73.0 pLDDT / 0.568 pTM at length 165, against UniRef's 81.8 / 0.677 at
+    #        250. That last one is the expensive part: the run stops being comparable to every
+    #        earlier one.
+    #   0.0  UniRef only, i.e. no structure signal at all. Pointless at n_tracks=2.
+    #   ~0.14 what simple concatenation would give, since UniRef is several times larger. Too thin
+    #        to train a second track on.
+    #
+    # 0.5 keeps structure on half the rows while the sequence track still sees UniRef's diversity,
+    # and it keeps the fold table readable against the same baselines as the previous three runs.
+    # Rounded to sixteenths (data.MixedShards._K); the training log's `lbl` column reports the
+    # fraction actually achieved, which is the check that this knob does what it says.
+    struct_frac: float = 0.5
     num_workers: int = 4
     prefetch_factor: int = 4         # batches prefetched per worker (only used when num_workers > 0)
     # Every Nth sequence GLOBALLY is held out for the fold/repetition baselines. Strided, not
@@ -388,6 +405,10 @@ if __name__ == "__main__":
           f"(head_dim={m.d_model // m.n_heads}, checkpoint_chunk={m.checkpoint_chunk})")
     print(f"batch          : canvas={CFG.data.canvas} micro={CFG.batch_size}/rank x "
           f"accum {CFG.opt.grad_accum} (rows split round-robin across {len(CFG.opt.betas)} betas)")
+    print(f"corpora        : "
+          + (f"{CFG.data.struct_frac:.0%} paired AFDB + {1 - CFG.data.struct_frac:.0%} aa-only "
+             f"UniRef (rows without a structure label get an all-MASK structure track and are "
+             f"excluded from the structure loss)" if m.n_tracks == 2 else "UniRef only"))
     print(f"tracks         : {m.n_tracks} "
           + ("(amino acid + Foldseek 3Di at the same L positions; separate embeddings and heads, "
              f"INDEPENDENT noise level per track) | 3Di kernel={CFG.opt.struct_sub_kernel} "

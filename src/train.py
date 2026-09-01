@@ -44,7 +44,7 @@ import torch
 from config import CFG, UNIREF_SHARDS, AFDB_SHARDS, BLOSUM_MAT, CKPT_DIR, SAMPLES_DIR
 from .blosum import substitution_kernel, uniform_substitution_kernel
 from .corruption import CorruptionSchedule
-from .data import ProteinShards, ShardDataset, StepBatchSampler, make_collate
+from .data import MixedShards, ProteinShards, ShardDataset, StepBatchSampler, make_collate
 from .dist import (init_distributed, barrier, cleanup, broadcast_parameters, average_gradients,
                    broadcast_checkpoint_bytes, preallocate_grad_buffer, preallocate_stats_buffer,
                    allreduce_stats)
@@ -358,21 +358,47 @@ def main():
                   flush=True)
 
     # --- data ---
-    # At n_tracks=2 the paired AFDB shards are the corpus; the aa-only UniRef shards have no
-    # structure to train the second track on.
-    shard_dir = AFDB_SHARDS if two else UNIREF_SHARDS
-    shards = ProteinShards(shard_dir, mcfg.eos_token_id,
-                           split="train" if dcfg.holdout_stride else "all",
-                           holdout_stride=max(dcfg.holdout_stride, 2))
+    # At n_tracks=2 this is a MIXTURE: paired AFDB rows carry a structure label, aa-only UniRef rows
+    # get an all-MASK structure track and are excluded from the structure loss (objective.row_mask).
+    # data.struct_frac sets the ratio -- see config for why neither extreme is right.
+    split = "train" if dcfg.holdout_stride else "all"
+    hs = max(dcfg.holdout_stride, 2)
+    open_dir = lambda d: ProteinShards(d, mcfg.eos_token_id, split=split, holdout_stride=hs)
+    if not two:
+        shard_dir, shards = UNIREF_SHARDS, open_dir(UNIREF_SHARDS)
+    else:
+        frac = float(dcfg.struct_frac)
+        afdb = open_dir(AFDB_SHARDS)
+        if len(afdb) == 0:
+            raise RuntimeError(f"n_tracks=2 but no shards in {AFDB_SHARDS}. Run "
+                               f"src.preprocess_3di (or set PLD2_AFDB_SHARDS).")
+        if not afdb.has_struct:
+            raise RuntimeError(
+                f"no shard in {AFDB_SHARDS} has a .3di sibling, so the structure track would train "
+                f"against an all-MASK input on every row and contribute nothing. Re-run "
+                f"src.preprocess_3di, or set data.n_tracks=1.")
+        if frac >= 1.0:
+            shard_dir, shards = AFDB_SHARDS, afdb
+        else:
+            uni = open_dir(UNIREF_SHARDS)
+            if len(uni) == 0:
+                raise RuntimeError(
+                    f"struct_frac={frac} asks for aa-only rows but {UNIREF_SHARDS} is empty. Set "
+                    f"PLD2_UNIREF_SHARDS, or set data.struct_frac=1.0 to train on AFDB alone.")
+            shard_dir = f"{AFDB_SHARDS} + {UNIREF_SHARDS}"
+            shards = MixedShards([afdb, uni], [frac, 1.0 - frac])
     if len(shards) == 0:
         raise RuntimeError(f"no shards in {shard_dir}. Run "
                            f"{'src.preprocess_3di' if two else 'src.preprocess_fasta'} first "
                            f"(or set {'PLD2_AFDB_SHARDS' if two else 'PLD2_UNIREF_SHARDS'}).")
-    if two and not shards.has_struct:
-        raise RuntimeError(
-            f"n_tracks=2 but no shard in {shard_dir} has a .3di sibling, so the structure track "
-            f"would train against an all-MASK input on every row and contribute nothing. Run "
-            f"src.preprocess_3di, or set data.n_tracks=1.")
+    if env.is_main:
+        sf = shards.struct_fraction if isinstance(shards, MixedShards) else (1.0 if two else 0.0)
+        print(f"[train] corpora: {shard_dir}", flush=True)
+        if two:
+            print(f"[train]   {sf:.0%} paired AFDB + {1 - sf:.0%} aa-only UniRef. Unlabelled rows "
+                  f"get an all-MASK structure track and are excluded from the structure loss, so "
+                  f"they still train the SEQUENCE track; the eval line's `lbl` column reports the "
+                  f"fraction actually achieved.", flush=True)
     ds = ShardDataset(shards)
 
     # The natural 3Di reference. Computed ONCE from this corpus's own holdout, because the
@@ -382,7 +408,9 @@ def main():
     natural_3di = None
     if two and env.is_main:
         from .data import DI
-        ref = ProteinShards(shard_dir, mcfg.eos_token_id, split="holdout",
+        # AFDB_SHARDS explicitly, not shard_dir: when mixing, shard_dir is a display string naming
+        # both corpora, and only the paired one has 3Di to build a reference from.
+        ref = ProteinShards(AFDB_SHARDS, mcfg.eos_token_id, split="holdout",
                             holdout_stride=max(dcfg.holdout_stride, 2))
         nat = []
         for j in range(min(len(ref), 600 if not args.smoke else 60)):
@@ -469,7 +497,8 @@ def main():
               f"{batch_size * accum * env.world_size:,} sequences "
               f"({batch_size * accum * env.world_size * dcfg.canvas / 1e6:.1f}M tokens) per "
               f"optimizer step", flush=True)
-        print(f"[train] corpus={len(shards):,} of {shards.n_total:,} sequences in "
+        n_train = shards.n_train if isinstance(shards, MixedShards) else len(shards)
+        print(f"[train] corpus={n_train:,} of {shards.n_total:,} sequences in "
               f"{shards.n_shards_total} shards "
               f"(holdout=every {dcfg.holdout_stride}th)" if dcfg.holdout_stride else "(no holdout)")
         print(f"[train] "
