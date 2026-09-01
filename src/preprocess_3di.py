@@ -33,6 +33,7 @@ import os
 
 import numpy as np
 
+from config import AFDB_SHARDS
 from .data import DI, _DI_ENCODE, _ENCODE_TABLE, _INVALID
 
 
@@ -89,7 +90,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("aa_fasta")
     ap.add_argument("di_fasta")
-    ap.add_argument("out_dir")
+    # OPTIONAL, defaulting to the configured location. config.py owns every path in this repo, and
+    # its os.environ.get("PLD2_AFDB_SHARDS", default) resolves that default INSIDE PYTHON ONLY -- it
+    # exports nothing back to the shell. A job script written as
+    #     python -m src.preprocess_3di aa.fasta 3di.fasta $PLD2_AFDB_SHARDS
+    # therefore expands the unset variable to nothing, the word disappears, and argparse reports a
+    # missing positional for an argument the author believed was set. Defaulting here means the
+    # config is the single source of truth for the shell too.
+    ap.add_argument("out_dir", nargs="?", default=AFDB_SHARDS)
     ap.add_argument("--min", type=int, default=30)
     ap.add_argument("--max", type=int, default=500)
     ap.add_argument("--shard-size", type=int, default=1_000_000)
@@ -97,6 +105,14 @@ def main():
                     help="abort if more than this many header/length mismatches are seen; the "
                          "default of 0 refuses any misalignment at all")
     a = ap.parse_args()
+    if not (a.out_dir or "").strip():
+        raise SystemExit(
+            "out_dir is empty. This is what a QUOTED unset variable looks like -- "
+            '"$PLD2_AFDB_SHARDS" with nothing set expands to an empty argument rather than '
+            "vanishing. Either export PLD2_AFDB_SHARDS, or omit the argument entirely and let it "
+            f"default to config.AFDB_SHARDS ({AFDB_SHARDS}).")
+    print(f"[preprocess] {a.aa_fasta}\n             + {a.di_fasta}\n             -> {a.out_dir}"
+          f"  (length window {a.min}-{a.max}, {a.shard_size:,} sequences/shard)", flush=True)
 
     w = PairedShardWriter(a.out_dir, a.shard_size)
     n = kept = bad_pair = bad_len = bad_char = 0
