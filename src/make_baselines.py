@@ -23,7 +23,7 @@ import argparse
 import os
 import random
 
-from config import CFG, SAMPLES_DIR, UNIREF_SHARDS
+from config import CFG, SAMPLES_DIR, UNIREF_SHARDS, AFDB_SHARDS
 from .blosum import AA
 from .data import ProteinShards
 from .metrics import kmer_counts, kmer_line, lcr_counts, length_stats
@@ -43,7 +43,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=ocfg.n_baseline, help="sequences per baseline")
     ap.add_argument("--out-dir", default=SAMPLES_DIR)
-    ap.add_argument("--shards", default=UNIREF_SHARDS)
+    # FOLLOWS n_tracks, like train.py. The natural/shuffled rows are the ceiling and floor every
+    # checkpoint is read against, so they have to be drawn from the corpus the model was actually
+    # trained on. Pinning them to UniRef while training on AFDB would compare generations against a
+    # different length distribution (AFDB median 170 vs UniRef ~250) and a set selected for having
+    # AlphaFold models -- a mismatch that shifts both baselines and is invisible in the table.
+    ap.add_argument("--shards",
+                    default=AFDB_SHARDS if CFG.data.n_tracks == 2 else UNIREF_SHARDS)
     ap.add_argument("--max-len", type=int, default=None,
                     help="drop sequences longer than this (default: the eval canvas, so the "
                          "baseline covers the same length regime the model can generate)")
