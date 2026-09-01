@@ -36,7 +36,7 @@ show, and far above the shuffle".
 """
 from __future__ import annotations
 import math
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence
 
 from .blosum import AA
 
@@ -205,3 +205,179 @@ if __name__ == "__main__":
         print(f"{name:<22} len={len(s)} LCR={lcr/max(tot,1):6.1%}  {kmer_line(kmer_counts([s]))}")
     print("\nExpect: the homopolymer lights up LCR; the hidden 20-mer repeat leaves LCR at the "
           "random level and shows up only in k13/k20 rep_frac. That gap is the whole point.")
+
+
+# ---------------------------------------------------------------------------
+# Structure-track (3Di) statistics
+# ---------------------------------------------------------------------------
+# THE AMINO-ACID THRESHOLDS DO NOT TRANSFER, and using them here would be actively misleading.
+# Measured over 107,404 natural AlphaFold-DB 3Di strings:
+#
+#                        3Di (natural)      amino acid (natural)
+#   k13 repeat coverage      9.52%                  0.5%
+#   k20                      6.34%                  0.3%
+#   k30                      4.05%                  0.2%
+#   longest run per seq   mean 16, p90 34, max 350       --
+#
+# 3Di is ~20x more repetitive than protein sequence at k13, and a 34-residue run of one state sits
+# at the 90th percentile of NORMAL -- a helix is exactly that. The fold table's DEGENERATE rule
+# (k13 > 2.3%) would flag essentially every real structure string. So nothing here is a threshold:
+# every statistic is reported against a reference computed from the corpus's own holdout, and the
+# question is always "does this look like the natural distribution", never "is this above a line".
+#
+# The run-length SHAPE is what discriminates. Natural 3Di is mostly short runs with occasional long
+# ones (mean 1.48, median 1) while still reaching a per-sequence max of 16 on average. A collapsed
+# head has a large mean AND a large median; a head that learned the marginal but no grammar has the
+# right composition and the wrong conditional entropy. Reporting mean, median and p90 separately
+# separates those cases, which any single summary number would blur together.
+def struct_bigram(seqs: Sequence[str], alphabet: str = None):
+    """(20,20) adjacent-pair counts for a 3Di track. Summable across ranks, for the same reason
+    cross_track_table is: composition and especially H(x_i | x_(i-1)) are taken over 400 cells, and
+    the plug-in conditional entropy is biased DOWNWARD at small N -- so a rank-local estimate on
+    ~1,000 positions would make a grammar-free track look like it had grammar. Pool first."""
+    import numpy as np
+    from .data import DI
+    ab = alphabet or DI
+    idx = {c: i for i, c in enumerate(ab)}
+    T = np.zeros((len(ab), len(ab)), dtype=np.float64)
+    for s in seqs:
+        a = [idx[c] for c in s if c in idx]
+        for i in range(1, len(a)):
+            T[a[i - 1], a[i]] += 1.0
+    return T
+
+
+def struct_entropies(T):
+    """(H(x), H(x_i | x_(i-1))) in nats from a pooled bigram table."""
+    import numpy as np
+    T = np.asarray(T, dtype=np.float64)
+    n = T.sum()
+    if n <= 0:
+        return 0.0, 0.0
+    J = T / n
+    H = lambda p: float(-(p[p > 0] * np.log(p[p > 0])).sum())
+    return H(J.sum(1)), H(J) - H(J.sum(1))
+
+
+def struct_stats(seqs: Sequence[str], ks: Sequence[int] = KMER_KS, alphabet: str = None,
+                 bigram=None) -> Dict:
+    """Distributional description of a 3Di track: composition, run shape, repetition, grammar.
+
+    `bigram` overrides the local adjacency table with a pooled one (see struct_bigram). Run-length
+    quantiles stay local -- a few hundred sequences give tens of thousands of runs, so they are
+    already well estimated where the entropies are not.
+    """
+    from .data import DI
+    ab = alphabet or DI
+    idx = {c: i for i, c in enumerate(ab)}
+    seqs = [s for s in seqs if len(s) >= 2]
+    if not seqs:
+        return {}
+    runs, maxruns = [], []
+    for s in seqs:
+        a = [idx.get(c, -1) for c in s]
+        here, cur = [], 1
+        for i in range(1, len(a)):
+            if a[i] == a[i - 1]:
+                cur += 1
+            else:
+                here.append(cur)
+                cur = 1
+        here.append(cur)
+        runs.extend(here)
+        maxruns.append(max(here))          # THIS sequence's runs, not a tail of the global list
+    T = struct_bigram(seqs, ab) if bigram is None else bigram
+    ent, cond = struct_entropies(T)
+    import numpy as np
+    uni = np.asarray(T, dtype=np.float64).sum(1)
+    runs.sort()
+    ms = sorted(maxruns)
+    q = lambda v, p: v[min(len(v) - 1, int(p * len(v)))]
+    km = kmer_counts(seqs, ks)
+    return {"n": len(seqs), "entropy": ent, "cond_entropy": cond,
+            "run_mean": sum(runs) / len(runs), "run_p50": q(runs, 0.5), "run_p90": q(runs, 0.9),
+            "maxrun_mean": sum(maxruns) / len(maxruns), "maxrun_p90": q(ms, 0.9),
+            "top": "".join(ab[i] for i in sorted(range(len(ab)), key=lambda j: -uni[j])[:4]),
+            "kmer": {k: km[k]["rep_pos"] / max(km[k]["n_pos"], 1) for k in ks}}
+
+
+def cross_track_table(aa_seqs: Sequence[str], di_seqs: Sequence[str]):
+    """(20,20) float count table of paired (amino acid, 3Di) positions. Summable across ranks --
+    which is the point: at eval_n=4 per rank a single rank has ~1,000 paired positions, and the MI
+    estimator's variance at 400 cells is far too large to read at that size. All-reducing the table
+    pools every rank's samples before any entropy is taken."""
+    import numpy as np
+    from .blosum import AA
+    from .data import DI
+    ai = {c: i for i, c in enumerate(AA)}
+    di = {c: i for i, c in enumerate(DI)}
+    T = np.zeros((20, 20), dtype=np.float64)
+    for a, d in zip(aa_seqs, di_seqs):
+        for ca, cd in zip(a, d):                      # zip stops at the shorter; they should match
+            if ca in ai and cd in di:
+                T[ai[ca], di[cd]] += 1.0
+    return T
+
+
+def mi_from_table(T, seed: int = 0, n_null: int = 3):
+    """(observed MI, null, excess, n_paired) in nats from a pooled contingency table.
+
+    n_paired is returned so a caller can tell "the tracks are uncoupled" from "there were not enough
+    paired positions to say" -- both look like an excess of ~0 and they mean opposite things.
+
+    THE MOST INFORMATIVE THING MEASURABLE WITHOUT FOLDING ANYTHING, because it asks whether the two
+    tracks are coupled AT ALL in the generations. The model can emit a perfectly natural-looking
+    sequence and a perfectly natural-looking structure string that have nothing to do with each
+    other; every other statistic here would pass and the structure track would be decoration.
+
+    Reported against a NULL rather than against zero. The plug-in MI estimator is biased upward by
+    roughly (r-1)(c-1)/2N -- at 20x20 over 12,000 paired positions that is ~0.015 nats, a third of
+    the natural signal of 0.044. The null resamples the SAME number of points from the product of
+    the observed marginals, so it carries the same bias at the same N and the difference is clean.
+    Natural corpus excess: +0.044 nats. An excess near 0 means the tracks were generated
+    independently, whatever each looks like on its own.
+    """
+    import numpy as np
+    T = np.asarray(T, dtype=np.float64)
+    N = T.sum()
+    if N < 400:
+        return 0.0, 0.0, 0.0, int(N)
+    H = lambda p: float(-(p[p > 0] * np.log(p[p > 0])).sum())
+    mi = lambda J: H(J.sum(1)) + H(J.sum(0)) - H(J)
+    J = T / N
+    obs = mi(J)
+    px, py = J.sum(1), J.sum(0)
+    rng = np.random.default_rng(seed)
+    nulls = [mi(rng.multinomial(int(N), np.outer(px, py).ravel()).reshape(20, 20) / N)
+             for _ in range(n_null)]
+    null = float(np.mean(nulls))
+    return obs, null, obs - null, int(N)
+
+
+def cross_track_mi(aa_seqs: Sequence[str], di_seqs: Sequence[str], seed: int = 0):
+    """Single-process convenience wrapper over cross_track_table + mi_from_table."""
+    return mi_from_table(cross_track_table(aa_seqs, di_seqs), seed)
+
+
+def struct_line(gen: Dict, ref: Optional[Dict] = None, mi=None) -> str:
+    """One line: the generated structure track against the natural reference, never a threshold."""
+    if not gen:
+        return "[3di] no structure track decoded"
+    ks = sorted(gen["kmer"])
+    f = lambda d: (f"H {d['entropy']:.2f} H(x|x-1) {d['cond_entropy']:.2f} | run mean "
+                   f"{d['run_mean']:.2f} med {d['run_p50']} p90 {d['run_p90']} | longest/seq mean "
+                   f"{d['maxrun_mean']:.0f} p90 {d['maxrun_p90']} | "
+                   + " ".join(f"k{k} {d['kmer'][k]:.1%}" for k in ks) + f" | top {d['top']}")
+    out = f"[3di] gen  n={gen['n']:<4} {f(gen)}"
+    if ref:
+        out += f"\n[3di] nat  n={ref['n']:<4} {f(ref)}"
+    if mi is not None:
+        obs, null, exc, npos = mi
+        if npos < 400:
+            out += (f"\n[3di] aa<->3Di coupling: only {npos:,} paired positions -- too few to "
+                    f"estimate (needs >=400; a real eval pools ~11k across ranks)")
+        else:
+            out += (f"\n[3di] aa<->3Di coupling: MI {obs:.4f} - null {null:.4f} = {exc:+.4f} nats "
+                    f"over {npos:,} positions  (natural corpus +0.044; ~0 means the two tracks "
+                    f"were generated independently of each other)")
+    return out

@@ -48,7 +48,9 @@ from .data import ProteinShards, ShardDataset, StepBatchSampler, make_collate
 from .dist import (init_distributed, barrier, cleanup, broadcast_parameters, average_gradients,
                    broadcast_checkpoint_bytes, preallocate_grad_buffer, preallocate_stats_buffer,
                    allreduce_stats)
-from .metrics import flatten_kmer, kmer_counts, kmer_line, lcr_counts, unflatten_kmer
+from .metrics import (cross_track_table, flat_len, flatten_kmer, kmer_counts, kmer_line,
+                      lcr_counts, mi_from_table, struct_bigram, struct_line, struct_stats,
+                      unflatten_kmer)
 from .model import LoopedDiffusionLM, count_params
 from .objective import training_step
 from .sampler import decode_seqs, decode_struct, generate, write_fasta
@@ -189,6 +191,10 @@ def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp):
             struct_first=ocfg.sample_struct_first, stats=gen_stats)
 
     seqs, _ = decode_seqs(canvas, mcfg)
+    # Decoded on EVERY rank, not only the FASTA-writing ones: the structure statistics are pooled
+    # across ranks below, and at eval_n=4 a single rank's ~1,000 positions are far too few to read
+    # a 400-cell entropy or mutual information from.
+    dis, _ = decode_struct(canvas, mcfg) if mcfg.n_tracks == 2 else ([], 0)
     if env.rank < ocfg.eval_fasta_ranks:
         os.makedirs(samples_dir, exist_ok=True)
         path = os.path.join(samples_dir, f"step_{step:08d}.rank{env.rank:03d}.fasta")
@@ -206,7 +212,6 @@ def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp):
             # of 3Di strings picked up by that glob would be folded as though it were protein --
             # silently, since 3Di uses the amino-acid letters and every string would parse.
             dpath = os.path.join(samples_dir, f"step_{step:08d}.rank{env.rank:03d}.3di.fa")
-            dis, _ = decode_struct(canvas, mcfg)
             write_fasta(dis, dpath + ".tmp", prefix=f"s{step}r{env.rank}")
             os.replace(dpath + ".tmp", dpath)
 
@@ -214,7 +219,22 @@ def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp):
     n_no_eos = sum(1 for v in lengths if v >= ocfg.eval_canvas)
     head = [float(len(lengths)), float(sum(lengths)), float(sum(v * v for v in lengths)),
             float(n_no_eos), float(lcr), float(lcr_tot), float(gen_stats.get("n_subst", 0))]
-    flat = allreduce_stats(head + flatten_kmer(kmer_counts(seqs, ocfg.kmer_ks), ocfg.kmer_ks), dev)
+    tail = []
+    if mcfg.n_tracks == 2:
+        # 400 + 400 floats: the 3Di adjacency table and the (aa, 3Di) contingency table. Summed
+        # across ranks BEFORE any entropy is taken -- both quantities are plug-in estimates over
+        # 400 cells and are badly biased at one rank's sample size.
+        tail = (list(struct_bigram(dis).ravel()) + list(cross_track_table(seqs, dis).ravel()))
+    flat = allreduce_stats(head + flatten_kmer(kmer_counts(seqs, ocfg.kmer_ks), ocfg.kmer_ks)
+                           + tail, dev)
+    nk = flat_len(ocfg.kmer_ks)
+    struct = {}
+    if mcfg.n_tracks == 2:
+        import numpy as np
+        bg = np.array(flat[7 + nk:7 + nk + 400]).reshape(20, 20)
+        ct = np.array(flat[7 + nk + 400:7 + nk + 800]).reshape(20, 20)
+        struct = {"stats": struct_stats(dis, ocfg.kmer_ks, bigram=bg),
+                  "mi": mi_from_table(ct)}
 
     n, s1, s2, no_eos, lcr, lcr_tot, n_subst = flat[:7]
     torch.set_rng_state(rng_state)
@@ -223,7 +243,8 @@ def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp):
     var = s2 / n - mean * mean
     return {"n": n, "mean": mean, "sd": var ** 0.5 if var > 0 else 0.0,
             "no_eos": int(no_eos), "lcr": lcr / max(lcr_tot, 1), "subst": n_subst / n,
-            "kmer": unflatten_kmer(flat[7:], ocfg.kmer_ks),
+            "kmer": unflatten_kmer(flat[7:7 + nk], ocfg.kmer_ks),
+            "struct": struct,
             "seconds": time.perf_counter() - t0}
 
 
@@ -329,6 +350,27 @@ def main():
             f"would train against an all-MASK input on every row and contribute nothing. Run "
             f"src.preprocess_3di, or set data.n_tracks=1.")
     ds = ShardDataset(shards)
+
+    # The natural 3Di reference. Computed ONCE from this corpus's own holdout, because the
+    # amino-acid thresholds do not transfer at all: natural 3Di has 9.5% k13 repeat coverage against
+    # 0.5% for protein sequence, and a 34-residue run of one state is the 90th percentile of normal
+    # (a helix). Every structure statistic is read against this row, never against a fixed line.
+    natural_3di = None
+    if two and env.is_main:
+        from .data import DI
+        ref = ProteinShards(shard_dir, mcfg.eos_token_id, split="holdout",
+                            holdout_stride=max(dcfg.holdout_stride, 2))
+        nat = []
+        for j in range(min(len(ref), 600 if not args.smoke else 60)):
+            _, d = ref.get_pair(j)
+            if d:
+                nat.append("".join(DI[t] for t in d if t < len(DI)))
+        natural_3di = struct_stats(nat, ocfg.kmer_ks) if nat else None
+        if natural_3di:
+            print("[3di] natural reference (holdout). Generated structure is read against THIS "
+                  "row, never a threshold:", flush=True)
+            print(struct_line(natural_3di).replace("[3di] gen ", "[3di] nat "), flush=True)
+
     total = args.max_steps or (12 if args.smoke else ocfg.total_steps)
 
     # --- resume (rank 0 reads latest.txt and broadcasts the BYTES; see dist.py) ---
@@ -501,6 +543,9 @@ def main():
             t_eval += time.perf_counter() - te
             if env.is_main:
                 print(_eval_line(step, stats, ocfg), flush=True)
+                if stats.get("struct"):
+                    print(struct_line(stats["struct"]["stats"], natural_3di,
+                                      stats["struct"]["mi"]), flush=True)
 
         if step > 0 and step % ocfg.ckpt_every == 0:
             save_checkpoint(model, opt, lr_sched, step, CKPT_DIR, env)
