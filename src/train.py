@@ -162,6 +162,19 @@ def _peak_mem_gb(dev):
 # Training-time generative eval
 # --------------------------------------------------------------------------------------
 @torch.no_grad()
+# The number of floats generative_eval hands to allreduce_stats. It has to be known at STARTUP,
+# because dist.allreduce_stats reduces one fixed-size buffer for the life of the run -- one shape
+# for CCL, forever -- and that buffer is preallocated before the allocator is otherwise touched.
+# Deriving it here rather than hard-coding a constant is what keeps the two in step: the structure
+# track added two 400-cell tables and, with the size left at its default of 64, the run trained for
+# 500 steps and then died at the FIRST eval. Anything added to the eval payload must be added here.
+def eval_payload_len(ocfg, mcfg) -> int:
+    n = 7 + flat_len(ocfg.kmer_ks)                 # length/EOS/LCR head + the k-mer counters
+    if mcfg.n_tracks == 2:
+        n += 800                                   # 3Di adjacency (400) + aa x 3Di contingency (400)
+    return n
+
+
 def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp):
     """Decode eval_n sequences per rank at temperature 0.5, write FASTA, aggregate the metrics.
 
@@ -225,8 +238,14 @@ def generative_eval(model, dev, mcfg, ocfg, step, env, samples_dir, use_amp):
         # across ranks BEFORE any entropy is taken -- both quantities are plug-in estimates over
         # 400 cells and are badly biased at one rank's sample size.
         tail = (list(struct_bigram(dis).ravel()) + list(cross_track_table(seqs, dis).ravel()))
-    flat = allreduce_stats(head + flatten_kmer(kmer_counts(seqs, ocfg.kmer_ks), ocfg.kmer_ks)
-                           + tail, dev)
+    payload = head + flatten_kmer(kmer_counts(seqs, ocfg.kmer_ks), ocfg.kmer_ks) + tail
+    if len(payload) != eval_payload_len(ocfg, mcfg):
+        raise RuntimeError(
+            f"eval payload is {len(payload)} floats but eval_payload_len says "
+            f"{eval_payload_len(ocfg, mcfg)}. The stats buffer is sized ONCE at startup from that "
+            f"function and reduced at a fixed shape for the whole run, so the two must agree -- "
+            f"update eval_payload_len alongside whatever was just added here.")
+    flat = allreduce_stats(payload, dev)
     nk = flat_len(ocfg.kmer_ks)
     struct = {}
     if mcfg.n_tracks == 2:
@@ -288,8 +307,13 @@ def main():
         ocfg.grad_accum = 2
 
     # Before anything else touches the allocator, so oneCCL's cached registration for the one buffer
-    # it reduces every eval is taken from a clean heap and held for the life of the run.
-    preallocate_stats_buffer(dev)
+    # it reduces every eval is taken from a clean heap and held for the life of the run. Sized from
+    # the config rather than left at the default: the first eval is 500 steps in, and a buffer too
+    # small to hold the payload turns that into a lost run.
+    n_stats = preallocate_stats_buffer(dev, eval_payload_len(ocfg, mcfg))
+    if env.is_main:
+        print(f"[train] eval stats buffer: {n_stats} floats "
+              f"(payload {eval_payload_len(ocfg, mcfg)})", flush=True)
 
     # --- model ---
     model = LoopedDiffusionLM(mcfg).to(dev)
