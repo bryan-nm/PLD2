@@ -16,7 +16,7 @@ job_banner "PLD2 Foldseek consistency check"
 
 # shellcheck disable=SC2086  # FOLD_ARGS is deliberately word-split into separate flags
 python -m src.self_consistency --emit-reference 200
-python -m src.fold_fasta --pdb-dir $SAMPLES_DIR/pdb
+python -m src.fold_fasta --pdb-dir /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/pdb
 python -m src.self_consistency
 
 rc=$?; echo "[job] exit $rc"; exit $rc     # exit $rc so the EXIT trap reports the true code
