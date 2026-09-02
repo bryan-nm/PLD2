@@ -1,0 +1,75 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N pld2_fsc
+#PBS -l walltime=03:00:00
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q debug
+#PBS -j oe
+
+# 3Di self-consistency: fold every generated sequence, re-tokenise the structure with foldseek, and
+# compare it to the 3Di the model emitted alongside that sequence.
+#
+# THE FOLD STEP IS RELAUNCHED IN A LOOP, because ESMFold on Aurora aborts with
+#   "Segmentation fault from GPU at 0x... type: 0 (NotPresent) ... aborting"
+# at an unpredictable rate that survived four hypotheses (see src/fold_fasta.py). Everything in that
+# module is built to make the crash cost almost nothing rather than to prevent it: results are
+# fsynced per sequence, the PDB index is appended per structure, and a rerun skips whatever is
+# already done. This loop is the last piece -- without it a fault 25 sequences into 146 ends the job.
+#
+# The loop stops on success, on a pass that made NO progress (a crash on the first sequence every
+# time is structural, not transient, and retrying cannot fix it), or when the remaining walltime is
+# too short to be worth another pass.
+#
+#   qsub scripts/self_consistency.pbs
+#   qsub -v SC_REFERENCE=0 scripts/self_consistency.pbs        # skip re-emitting the ceiling row
+#   qsub -v RANKS_PER_NODE=1 scripts/self_consistency.pbs      # the single-tile fallback
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./scripts/pbs_common.sh
+
+PDB_DIR=${PDB_DIR:-$(python -c 'from config import SAMPLES_DIR;print(SAMPLES_DIR+"/pdb")')}
+SC_REFERENCE=${SC_REFERENCE:-200}      # natural pairs for the ceiling row; 0 to reuse existing
+MAX_TRIES=${MAX_TRIES:-12}
+FOLD_BUDGET=${FOLD_BUDGET:-8400}       # seconds to spend folding before giving up on retries
+
+job_banner "PLD2 foldseek self-consistency" PDB_DIR SC_REFERENCE MAX_TRIES
+
+if [ "${SC_REFERENCE}" -gt 0 ]; then
+    python -m src.self_consistency --emit-reference "${SC_REFERENCE}" || {
+        rc=$?; echo "[job] emit-reference failed ($rc)"; exit $rc; }
+fi
+
+n_pdb() { find "${PDB_DIR}" -maxdepth 1 -name '*.pdb' 2>/dev/null | wc -l | tr -d ' '; }
+
+t_start=$SECONDS
+before_all=$(n_pdb)
+fold_rc=1
+for attempt in $(seq 1 "${MAX_TRIES}"); do
+    before=$(n_pdb)
+    elapsed=$(( SECONDS - t_start ))
+    if [ "${elapsed}" -ge "${FOLD_BUDGET}" ]; then
+        echo "[job] fold budget exhausted after ${elapsed}s and ${attempt} attempt(s); "\
+             "continuing with the ${before} structures already written"
+        break
+    fi
+    echo "[job] === fold attempt ${attempt}/${MAX_TRIES} (${before} PDBs so far, ${elapsed}s spent) ==="
+    "${MPI_LAUNCH[@]}" python -m src.fold_fasta --device xpu --pdb-dir "${PDB_DIR}" ${FOLD_ARGS:-}
+    fold_rc=$?
+    after=$(n_pdb)
+    if [ "${fold_rc}" -eq 0 ]; then
+        echo "[job] fold pass completed cleanly on attempt ${attempt} (${after} PDBs)"
+        break
+    fi
+    echo "[job] fold exited ${fold_rc} -- ${before} -> ${after} PDBs this attempt"
+    if [ "${after}" -le "${before}" ]; then
+        # A crash that folds nothing is not the transient GPU fault; relaunching just burns
+        # walltime. Stop and let the summary report on whatever did get written.
+        echo "[job] no progress on this attempt; not retrying -- this is not the transient fault"
+        break
+    fi
+done
+echo "[job] folding done: $(n_pdb) structures (started from ${before_all})"
+
+python -m src.self_consistency --pdb-dir "${PDB_DIR}" --out "${PDB_DIR}/identity.jsonl"
+rc=$?; echo "[job] exit $rc"; exit $rc     # exit $rc so the EXIT trap reports the true code

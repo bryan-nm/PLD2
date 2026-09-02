@@ -265,23 +265,28 @@ def collect(paths, out_path, lo, hi, limit=0, pdb_dir=None):
     `todo` is in a deterministic order (sorted paths, then file order), but ranks partition it by
     `owns()` rather than by position -- see there.
 
-    WITH --pdb-dir, "already scored" ALSO requires the structure file to exist. pLDDT and pTM are
-    the only things the JSONL records, so every sequence folded before --pdb-dir existed counts as
-    done and would be skipped -- leaving the self-consistency check with structures for nothing but
-    whatever happened to be new. Observed exactly that: "1520 already scored | 200 to do", and the
-    200 were the reference pairs written moments earlier.
+    WITH --pdb-dir, "already scored" ALSO requires an INDEXED structure. pLDDT and pTM are the only
+    things the JSONL records, so every sequence folded before --pdb-dir existed counts as done and
+    would be skipped -- leaving the self-consistency check with structures for nothing but whatever
+    happened to be new. Observed exactly that: "1520 already scored | 200 to do", and the 200 were
+    the reference pairs written moments earlier.
+
+    The test is INDEXED, not "the .pdb file exists", and the difference is not academic. A GPU abort
+    leaves structures on disk that the index never recorded -- the first crashed run left ~200 of
+    them. Keyed on file existence those are skipped forever while being unusable, since nothing can
+    say which record each belongs to. Keyed on the index they are simply re-folded.
     """
     todo, skipped, superseded = [], 0, 0
     already = done_pairs(out_path)
     done_id_only = {i for i, _ in already}
+    indexed = set(load_pdb_index(pdb_dir).values()) if pdb_dir else set()
     need_pdb = 0
     for p in paths:
         for sid, seq in read_fasta(p):
             if (sid, seq) in already:
-                if not pdb_dir or os.path.exists(
-                        os.path.join(pdb_dir, _safe_name(sid) + ".pdb")):
+                if not pdb_dir or sid in indexed:
                     continue
-                need_pdb += 1                    # scored, but has no structure yet
+                need_pdb += 1                    # scored, but has no indexed structure yet
             if len(seq) < lo or len(seq) > hi:
                 skipped += 1
                 continue
@@ -291,8 +296,8 @@ def collect(paths, out_path, lo, hi, limit=0, pdb_dir=None):
     if limit:
         todo = todo[:limit]
     if need_pdb:
-        print(f"[fold] {need_pdb} sequence(s) already scored but missing a PDB -- re-folding them "
-              f"so src.self_consistency has structures to read", flush=True)
+        print(f"[fold] {need_pdb} sequence(s) already scored but with no INDEXED structure -- "
+              f"re-folding them so src.self_consistency has something it can join", flush=True)
     return todo, len(already), skipped, superseded
 
 
@@ -426,10 +431,41 @@ def _safe_name(sid: str) -> str:
     return "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(sid))[:180]
 
 
-def fold_all(todo, scorer, out_path, ocfg, t0, tag="", pdb_dir=None):
-    n_ok, n_pdb, pdb_index = 0, 0, {}
+def pdb_index_path(pdb_dir, rank):
+    return os.path.join(pdb_dir, f"index.rank{rank:03d}.jsonl")
+
+
+def load_pdb_index(pdb_dir):
+    """{pdb basename: record id}, merged across every rank's append-only index."""
+    idx = {}
+    legacy = os.path.join(pdb_dir, "index.json")
+    if os.path.exists(legacy):                       # written by the pre-crash-safe version
+        try:
+            idx.update(json.load(open(legacy)))
+        except Exception:
+            pass
+    for p in sorted(glob_.glob(os.path.join(pdb_dir, "index.rank*.jsonl"))):
+        with open(p) as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue                         # a truncated final line after an abort
+                idx[r["file"]] = r["id"]
+    return idx
+
+
+def fold_all(todo, scorer, out_path, ocfg, t0, tag="", pdb_dir=None, rank=0):
+    n_ok, n_pdb = 0, 0
+    idx_fh = None
     if pdb_dir:
         os.makedirs(pdb_dir, exist_ok=True)
+        # APPEND-ONLY AND FSYNCED PER RECORD, exactly like the results JSONL and for exactly the
+        # same reason: a GPU fault aborts the process outright, with no atexit and no buffer drain.
+        # An index written once at the end is lost every time, which is how a crashed run left 200
+        # structures on disk and nothing able to say which record each one belonged to. Per-rank
+        # files because twelve ranks read-modify-writing one JSON would race and lose entries.
+        idx_fh = open(pdb_index_path(pdb_dir, rank), "a")
     with open(out_path, "a") as fh:
         for i, (sid, seq) in enumerate(todo):
             if pdb_dir:
@@ -441,7 +477,9 @@ def fold_all(todo, scorer, out_path, ocfg, t0, tag="", pdb_dir=None):
                 if rows:
                     base = _safe_name(sid)
                     if write_pdb(os.path.join(pdb_dir, base + ".pdb"), seq, rows):
-                        pdb_index[base] = sid
+                        idx_fh.write(json.dumps({"file": base, "id": sid}) + "\n")
+                        idx_fh.flush()
+                        os.fsync(idx_fh.fileno())
                         n_pdb += 1
                 if i == 0:
                     # Report the layout on the FIRST sequence whether extraction worked or not. The
@@ -479,21 +517,8 @@ def fold_all(todo, scorer, out_path, ocfg, t0, tag="", pdb_dir=None):
                 print(f"[fold]{tag} {i + 1}/{len(todo)} ({time.perf_counter() - t0:.0f}s)",
                       flush=True)
 
-    if pdb_dir and pdb_index:
-        # Sidecar map so the join never has to reverse-engineer a record id out of a filename.
-        # Merged rather than overwritten: ranks and repeated passes both append into one directory.
-        ipath = os.path.join(pdb_dir, "index.json")
-        old = {}
-        if os.path.exists(ipath):
-            try:
-                old = json.load(open(ipath))
-            except Exception:
-                old = {}
-        old.update(pdb_index)
-        tmp = ipath + f".{os.getpid()}.tmp"
-        with open(tmp, "w") as fh:
-            json.dump(old, fh)
-        os.replace(tmp, ipath)
+    if idx_fh is not None:
+        idx_fh.close()
         print(f"[fold]{tag} wrote {n_pdb} PDBs to {pdb_dir}", flush=True)
     return n_ok
 
@@ -590,7 +615,8 @@ def main():
     last_progress = time.perf_counter()
     while True:
         if todo:
-            total += fold_all(todo, scorer, my_out, ocfg, t0, tag, pdb_dir=args.pdb_dir)
+            total += fold_all(todo, scorer, my_out, ocfg, t0, tag, pdb_dir=args.pdb_dir,
+                              rank=env.rank)
             last_progress = time.perf_counter()
             # Only rank 0 prints the table; every rank's records are in it, because summarize()
             # globs all the per-rank files. Twelve copies of the same table would bury the log.

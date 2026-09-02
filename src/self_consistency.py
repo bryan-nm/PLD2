@@ -248,11 +248,17 @@ def main():
     if not gen:
         raise SystemExit(f"no *.3di.fa in {a.samples_dir}. Those are written by the training eval "
                          f"at n_tracks=2; a one-track run has no structure track to check.")
-    ipath = os.path.join(a.pdb_dir, "index.json")
-    if not os.path.exists(ipath):
-        raise SystemExit(f"no {ipath}. It is written by src/fold_fasta.py --pdb-dir alongside the "
-                         f"PDBs, and maps each structure file back to its record id.")
-    index = json.load(open(ipath))
+    from .fold_fasta import load_pdb_index
+    index = load_pdb_index(a.pdb_dir)
+    if not index:
+        raise SystemExit(
+            f"no PDB index in {a.pdb_dir}. src/fold_fasta.py --pdb-dir appends one line per "
+            f"structure to index.rankNNN.jsonl as it writes it; an empty directory means the fold "
+            f"pass never got that far.")
+    n_pdb = len(glob_.glob(os.path.join(a.pdb_dir, "*.pdb")))
+    if n_pdb > len(index):
+        print(f"[sc] {n_pdb:,} PDBs but only {len(index):,} indexed -- the unindexed ones predate "
+              f"the crash-safe index and are skipped.", flush=True)
 
     tsv = a.tsv or os.path.join(a.pdb_dir, "descriptor.tsv")
     if not a.tsv:
