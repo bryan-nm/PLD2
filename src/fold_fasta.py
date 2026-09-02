@@ -259,19 +259,29 @@ def owns(sid: str, rank: int, world: int) -> bool:
     return world <= 1 or zlib.crc32(sid.encode()) % world == rank
 
 
-def collect(paths, out_path, lo, hi, limit=0):
+def collect(paths, out_path, lo, hi, limit=0, pdb_dir=None):
     """-> (todo, n_already, n_out_of_range, n_superseded) for the given FASTA paths.
 
     `todo` is in a deterministic order (sorted paths, then file order), but ranks partition it by
     `owns()` rather than by position -- see there.
+
+    WITH --pdb-dir, "already scored" ALSO requires the structure file to exist. pLDDT and pTM are
+    the only things the JSONL records, so every sequence folded before --pdb-dir existed counts as
+    done and would be skipped -- leaving the self-consistency check with structures for nothing but
+    whatever happened to be new. Observed exactly that: "1520 already scored | 200 to do", and the
+    200 were the reference pairs written moments earlier.
     """
     todo, skipped, superseded = [], 0, 0
     already = done_pairs(out_path)
     done_id_only = {i for i, _ in already}
+    need_pdb = 0
     for p in paths:
         for sid, seq in read_fasta(p):
             if (sid, seq) in already:
-                continue
+                if not pdb_dir or os.path.exists(
+                        os.path.join(pdb_dir, _safe_name(sid) + ".pdb")):
+                    continue
+                need_pdb += 1                    # scored, but has no structure yet
             if len(seq) < lo or len(seq) > hi:
                 skipped += 1
                 continue
@@ -280,6 +290,9 @@ def collect(paths, out_path, lo, hi, limit=0):
             todo.append((sid, seq))
     if limit:
         todo = todo[:limit]
+    if need_pdb:
+        print(f"[fold] {need_pdb} sequence(s) already scored but missing a PDB -- re-folding them "
+              f"so src.self_consistency has structures to read", flush=True)
     return todo, len(already), skipped, superseded
 
 
@@ -293,52 +306,115 @@ _AA3 = {"A": "ALA", "C": "CYS", "D": "ASP", "E": "GLU", "F": "PHE", "G": "GLY", 
         "R": "ARG", "S": "SER", "T": "THR", "V": "VAL", "W": "TRP", "Y": "TYR"}
 
 
-def _coords_from(output):
-    """(L, >=5, 3) backbone coordinates out of an ESMFold output dict, or None.
+def _np(v):
+    import numpy as np
+    if v is None:
+        return None
+    return v.detach().float().cpu().numpy() if hasattr(v, "detach") else np.asarray(v)
 
-    The model's exact output keys are a property of the build, so this probes the usual names and
-    reports what it DID find rather than guessing -- a silent None here would look like 'foldseek
-    found no structures' three steps later."""
+
+def _squeeze_lead(v, keep_ndim):
+    """Drop leading batch / diffusion-sample axes until `keep_ndim` remain, taking index 0."""
+    while v is not None and v.ndim > keep_ndim:
+        v = v[0]
+    return v
+
+
+def _to_atoms(v, n_atoms):
+    """Align an array's FIRST axis to the atom axis by dropping leading batch/sample axes.
+
+    Anchoring on the known atom count rather than on the number of dimensions is what makes this
+    robust: `atom_to_token` arrives as either (B, n_atoms) integer indices or (B, n_atoms, n_tokens)
+    one-hot, and a rule based on ndim alone reads the first of those as one-hot and argmaxes over
+    the atom axis -- silently collapsing every atom into one.
+    """
+    if v is None:
+        return None
+    while v.ndim > 1 and v.shape[0] != n_atoms:
+        v = v[0]
+    return v if v.shape[0] == n_atoms else None
+
+
+def _atom_names(output, n_atoms):
+    """Decode ref_atom_name_chars -> ['N', 'CA', ...], or None.
+
+    Boltz/AF3-style models carry each atom name as 4 characters stored as ord(c) - 32, either as
+    integer codes (n_atoms, 4) or one-hot over a 64-symbol alphabet (n_atoms, 4, 64)."""
+    v = _to_atoms(_np(output.get("ref_atom_name_chars")), n_atoms)
+    if v is None or v.ndim < 2:
+        return None
+    if v.ndim == 3:                      # one-hot over the symbol alphabet
+        v = v.argmax(-1)
+    out = []
+    for row in v:
+        nm = "".join(chr(int(c) + 32) for c in row).strip()
+        out.append("".join(ch for ch in nm if ch.isalnum() or ch == "'") or "X")
+    return out
+
+
+def structure_from(output, seq):
+    """ESMFold output -> [(residue_index, atom_name, x, y, z)], or None.
+
+    THE MODEL IS ALL-ATOM AND FLAT, not the (L, 37, 3) of classic ESMFold. Its output carries
+    `sample_atom_coords` over a packed atom list, `atom_to_token` mapping each atom to its residue,
+    `atom_pad_mask` marking the real ones, and `ref_atom_name_chars` naming them. Residue identity
+    comes from the INPUT SEQUENCE indexed by token rather than from `res_type`, which avoids having
+    to know the model's residue alphabet ordering.
+    """
     import numpy as np
     if not hasattr(output, "keys"):
         return None
-    for k in ("positions", "final_atom_positions", "atom37_positions", "atom_positions",
-              "coords", "all_atom_positions"):
-        if k not in output:
+    xyz = _np(output.get("sample_atom_coords"))
+    if xyz is None:                              # older/classic layouts, kept as a fallback
+        for k in ("positions", "final_atom_positions", "atom37_positions", "coords"):
+            if k in output:
+                v = _squeeze_lead(_np(output[k]), 3)
+                if v is not None and v.ndim == 3 and v.shape[-1] == 3 and v.shape[1] >= 5:
+                    return [(i, nm, *v[i, j]) for i in range(min(len(seq), v.shape[0]))
+                            for j, nm, _ in _ATOM37 if j < v.shape[1]
+                            and np.all(np.isfinite(v[i, j])) and not (nm == "CB" and seq[i] == "G")]
+        return None
+    xyz = _squeeze_lead(xyz, 2)                  # -> (n_atoms, 3)
+    if xyz.ndim != 2 or xyz.shape[-1] != 3:
+        return None
+    n_atoms = xyz.shape[0]
+    tok = _to_atoms(_np(output.get("atom_to_token")), n_atoms)
+    if tok is not None:
+        if tok.ndim == 2:                        # one-hot over tokens
+            tok = tok.argmax(-1)
+        tok = tok.reshape(-1).astype(int)
+    pad = _to_atoms(_np(output.get("atom_pad_mask")), n_atoms)
+    if pad is not None:
+        pad = pad.reshape(-1)
+    names = _atom_names(output, n_atoms)
+    rows = []
+    for a in range(n_atoms):
+        if pad is not None and not pad[a]:
             continue
-        v = output[k]
-        v = v.detach().float().cpu().numpy() if hasattr(v, "detach") else np.asarray(v)
-        while v.ndim > 3:                       # strip leading recycle/batch/sample axes
-            v = v[-1] if v.shape[0] > 1 and v.ndim == 4 else v[0]
-        if v.ndim == 3 and v.shape[-1] == 3 and v.shape[1] >= 5:
-            return v
-    return None
+        if not np.all(np.isfinite(xyz[a])):
+            continue
+        r = int(tok[a]) if tok is not None else a // 5
+        if r >= len(seq):
+            continue
+        nm = names[a] if names else "CA"
+        rows.append((r, nm, float(xyz[a, 0]), float(xyz[a, 1]), float(xyz[a, 2])))
+    return rows or None
 
 
-def write_pdb(path, seq, xyz):
-    """Minimal backbone PDB. Only atoms with finite coordinates are emitted, so a model that leaves
-    CB undefined for glycine (or anything else) simply omits it rather than writing NaN."""
-    import numpy as np
-    n = min(len(seq), xyz.shape[0])
+def write_pdb(path, seq, rows):
+    """rows: [(residue_index, atom_name, x, y, z)] -> a PDB file. Returns the atom count."""
     lines, serial = [], 1
-    for i in range(n):
-        res = _AA3.get(seq[i], "GLY")
-        for j, name, elem in _ATOM37:
-            if j >= xyz.shape[1]:
-                continue
-            x, y, z = (float(c) for c in xyz[i, j])
-            if not all(np.isfinite(v) for v in (x, y, z)):
-                continue
-            if name == "CB" and seq[i] == "G":
-                continue
-            # Column-exact PDB. The fixed-width layout is: 1-6 record, 7-11 serial, 13-16 atom
-            # name, 17 altLoc, 18-20 resName, 22 chain, 23-26 resSeq, 31-38/39-46/47-54 x/y/z.
-            # Gemmi (which foldseek parses with) reads by column, so a single missing space shifts
-            # resName into altLoc and every residue silently becomes unknown.
-            an = f" {name}" if len(name) < 4 else name        # 1-2 char elements are space-padded
-            lines.append(f"ATOM  {serial:>5} {an:<4} {res:>3} A{i + 1:>4}    "
-                         f"{x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          {elem:>2}")
-            serial += 1
+    for i, name, x, y, z in rows:
+        res = _AA3.get(seq[i], "GLY") if i < len(seq) else "GLY"
+        elem = next((c for c in name if c.isalpha()), "C")
+        # Column-exact PDB. The fixed-width layout is: 1-6 record, 7-11 serial, 13-16 atom name,
+        # 17 altLoc, 18-20 resName, 22 chain, 23-26 resSeq, 31-38/39-46/47-54 x/y/z. Gemmi (which
+        # foldseek parses with) reads by column, so a single missing space shifts resName into
+        # altLoc and every residue silently becomes unknown.
+        an = f" {name}" if len(name) < 4 else name        # 1-2 char elements are space-padded
+        lines.append(f"ATOM  {serial:>5} {an:<4} {res:>3} A{i + 1:>4}    "
+                     f"{x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          {elem:>2}")
+        serial += 1
     lines.append("END")
     with open(path, "w") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -361,17 +437,30 @@ def fold_all(todo, scorer, out_path, ocfg, t0, tag="", pdb_dir=None):
                 # uses and keep them. Falls back to score() if this build's output has no usable
                 # coordinate array, so the pLDDT/pTM table never depends on the PDB path working.
                 out = scorer._infer(seq, loops=ocfg.fold_loops, steps=ocfg.fold_steps)
-                xyz = _coords_from(out)
-                if xyz is not None:
+                rows = structure_from(out, seq)
+                if rows:
                     base = _safe_name(sid)
-                    if write_pdb(os.path.join(pdb_dir, base + ".pdb"), seq, xyz):
+                    if write_pdb(os.path.join(pdb_dir, base + ".pdb"), seq, rows):
                         pdb_index[base] = sid
                         n_pdb += 1
-                elif i == 0:
-                    keys = sorted(out.keys()) if hasattr(out, "keys") else type(out).__name__
-                    print(f"[fold]{tag} WARNING: --pdb-dir given but no coordinate array found in "
-                          f"the model output; keys were {keys}. Folding continues WITHOUT PDBs, so "
-                          f"the self-consistency check will have nothing to read.", flush=True)
+                if i == 0:
+                    # Report the layout on the FIRST sequence whether extraction worked or not. The
+                    # coordinate keys are a property of the model build, and a failed job that only
+                    # says "no coordinates" costs another full round trip to diagnose.
+                    shp = {k: tuple(getattr(v, "shape", ())) for k, v in out.items()
+                           if k in ("sample_atom_coords", "atom_to_token", "atom_pad_mask",
+                                    "ref_atom_name_chars", "res_type")} if hasattr(out, "keys") \
+                        else {}
+                    if rows:
+                        nres = len({r[0] for r in rows})
+                        nm = sorted({r[1] for r in rows})[:8]
+                        print(f"[fold]{tag} PDB layout OK: {len(rows)} atoms over {nres} residues "
+                              f"(sequence is {len(seq)}), atom names {nm} | shapes {shp}", flush=True)
+                    else:
+                        keys = sorted(out.keys()) if hasattr(out, "keys") else type(out).__name__
+                        print(f"[fold]{tag} WARNING: --pdb-dir given but no usable coordinates. "
+                              f"shapes {shp} | all keys {keys}. Folding continues WITHOUT PDBs.",
+                              flush=True)
                 r = type("R", (), {"per_sequence_plddt": [float(out["plddt"].mean())],
                                    "per_sequence_ptm": [float(out["ptm"].mean())]})()
                 del out
@@ -467,7 +556,8 @@ def main():
     my_out = rank_path(args.out, rank) if world > 1 else args.out
 
     paths = current_paths()
-    todo_all, n_done, n_skip, n_super = collect(paths, args.out, lo, hi, args.limit)
+    todo_all, n_done, n_skip, n_super = collect(paths, args.out, lo, hi, args.limit,
+                                                pdb_dir=args.pdb_dir)
     todo = [x for x in todo_all if owns(x[0], rank, world)]      # no coordination needed
     if rank == 0:
         print(f"[fold] {len(paths)} file(s) | {n_done} already scored | {len(todo_all)} to do "
@@ -512,7 +602,8 @@ def main():
             print(f"[fold]{tag} idle for {args.max_idle}s; exiting.", flush=True)
             break
         time.sleep(args.poll)
-        todo = [x for x in collect(current_paths(), args.out, lo, hi, args.limit)[0]
+        todo = [x for x in collect(current_paths(), args.out, lo, hi, args.limit,
+                                   pdb_dir=args.pdb_dir)[0]
                 if owns(x[0], rank, world)]
 
     print(f"[fold]{tag} scored {total} sequence(s) this process", flush=True)
