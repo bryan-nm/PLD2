@@ -56,7 +56,7 @@ def read_fasta(path):
             if line.startswith(">"):
                 if name is not None:
                     out[name] = "".join(buf)
-                name, buf = line[1:].strip().split()[0], []
+                name, buf = record_key(line[1:].strip().split()[0]), []
             else:
                 buf.append(line.strip())
     if name is not None:
@@ -70,6 +70,18 @@ def load_generated(samples_dir):
     for p in sorted(glob_.glob(os.path.join(samples_dir, "*.3di.fa"))):
         gen.update(read_fasta(p))
     return gen
+
+
+def record_key(sid: str) -> str:
+    """Normalise a record id to the bare FASTA header name.
+
+    The two sides of this join spell ids differently. src/fold_fasta.py prefixes every id with its
+    group so several FASTAs can share one results JSONL -- "step_00017500|s17500r0_3" -- while the
+    .3di.fa written by the trainer's eval carries the bare header, "s17500r0_3". Joining them
+    without normalising produced 1,720 refolded structures, 1,320 generated tracks, and exactly 0
+    matches. The bare name already encodes step, rank and index, so it is unique on its own.
+    """
+    return str(sid).split("|")[-1]
 
 
 def group_of(sid: str) -> str:
@@ -129,7 +141,7 @@ def parse_descriptor(tsv_path, index):
             # foldseek's header is the structure name, optionally with a _<chain> suffix appended.
             for key in (head, head.rsplit("_", 1)[0], os.path.splitext(head)[0]):
                 if key in index:
-                    out[index[key]] = parts[2]
+                    out[record_key(index[key])] = parts[2]
                     break
             else:
                 unmatched += 1
@@ -269,8 +281,15 @@ def main():
           f"{len(rows):,} joined"
           + (f" | {unmatched} descriptor rows matched no index entry" if unmatched else ""))
     if not rows:
-        raise SystemExit("nothing joined. The PDB index and the .3di.fa record ids disagree -- "
-                         "check that both came from the same run.")
+        g = sorted(gen)[:4]
+        r = sorted(refold)[:4]
+        raise SystemExit(
+            f"nothing joined: no record id appears on both sides.\n"
+            f"  generated (.3di.fa): {g}\n"
+            f"  refolded  (foldseek via the PDB index): {r}\n"
+            f"If those look like the same records spelled differently, it is an id-normalisation "
+            f"bug in record_key(); if they look like different records, the samples and the "
+            f"structures came from different runs.")
     stats = summarise(rows)
     print_table(stats)
     if a.out:

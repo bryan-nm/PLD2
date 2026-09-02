@@ -1,0 +1,1123 @@
+Lmod Warning: ONEAPI_DEVICE_SELECTOR has been set to
+"opencl:gpu;level_zero:gpu"
+to enable Triton-XPU, vLLM, Ray, and dpctl functionality.
+
+If you encounter issues, you can revert to:
+  export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
+
+If you do need to revert, please email support@alcf.anl.gov
+so we can track and address compatibility issues.
+
+While processing the following module(s):
+    Module fullname      Module Filename
+    ---------------      ---------------
+    frameworks/2025.3.1  /opt/aurora/26.26.0/modulefiles/frameworks/2025.3.1.lua
+
+Lmod Warning: ONEAPI_DEVICE_SELECTOR has been set to
+"opencl:gpu;level_zero:gpu"
+to enable Triton-XPU, vLLM, Ray, and dpctl functionality.
+
+If you encounter issues, you can revert to:
+  export ONEAPI_DEVICE_SELECTOR="level_zero:gpu"
+
+If you do need to revert, please email support@alcf.anl.gov
+so we can track and address compatibility issues.
+
+While processing the following module(s):
+    Module fullname      Module Filename
+    ---------------      ---------------
+    frameworks/2025.3.1  /opt/aurora/26.26.0/modulefiles/frameworks/2025.3.1.lua
+
+================================================================
+  PLD2 foldseek self-consistency
+  job        : 8798484.aurora-pbs-0001.hostmgmt.cm.aurora.alcf.anl.gov  started 2026-09-02T22:36:18+0000
+  repo       : /flare/NLDesignProtein/bryan/Diffusion-dev-space/PLD2   commit 060e4a8
+  topology   : 1 nodes x 12 ranks/node = 12 ranks
+    ONEAPI_DEVICE_SELECTOR   = level_zero:gpu
+    CCL_PROCESS_LAUNCHER     = pmix
+    CCL_KVS_MODE             = mpi
+    FI_PROVIDER              = cxi
+    OMP_NUM_THREADS          = 208
+  config.py resolves to:
+    REPO_ROOT      : /lus/flare/projects/NLDesignProtein/bryan/Diffusion-dev-space/PLD2
+    UNIREF_SHARDS  : /flare/NLDesignProtein/bryan/Diffusion-dev-space/datasets/uniref90_shards  exists: True
+    UNIREF_FASTA   : /flare/NLDesignProtein/bryan/Diffusion-dev-space/datasets/uniref90.fasta.gz  exists: True
+    BLOSUM_MAT     : /flare/NLDesignProtein/bryan/Diffusion-dev-space/models/blosum62-special-MSA.mat  exists: True
+    ESMFOLD_WEIGHTS: /flare/NLDesignProtein/bryan/models/ESMFold2-Fast  exists: True
+    CKPT_DIR       : /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/checkpoints
+    SAMPLES_DIR    : /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples
+    FOLDS_JSONL    : /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/folds.jsonl
+    model          : d_model=1536 d_ff=4608 heads=24 layers=4+36(x1)+4 vocab=23 (eos=20 pad=21 mask=22)
+    params         : ~1350M in 44 distinct layers, 44 applied/token (head_dim=64, checkpoint_chunk=6)
+    batch          : canvas=512 micro=8/rank x accum 4 (rows split round-robin across 4 betas)
+    corpora        : 50% paired AFDB + 50% aa-only UniRef (rows without a structure label get an all-MASK structure track and are excluded from the structure loss)
+    tracks         : 2 (amino acid + Foldseek 3Di at the same L positions; separate embeddings and heads, INDEPENDENT noise level per track) | 3Di kernel=uniform struct_weight=1.0 struct_first=0.0
+    shards         : /flare/NLDesignProtein/bryan/Diffusion-dev-space/datasets/afdb_3di_shards  exists: True
+    corruption     : span_width=(1, 8, 32, 128)  (mask drawn as a correlated field; amount and per-position marginals unchanged, L_vb is a mean-field surrogate not an ELBO)
+    objective      : betas=(1.0, 0.9, 0.75, 0.5) T=500 kernel=blosum | L = 1.0*T*E[KL] + 1.0*L_ce(corrupted, uncorr_w=0.0) | eos_w=20.0 pad_w=0.1
+    sampling       : T=1.0 steps=512 eos_first=True subst/residue=1.0 (unified edit decode)
+    schedule       : 18000 steps, warmup 2000, lr 0.0002, eval every 500, ckpt every 1000
+    PDB_DIR                  = /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/pdb
+    SC_REFERENCE             = 200
+    MAX_TRIES                = 12
+================================================================
+[sc] wrote 200 reference pairs to /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/sc_natural.fasta and /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/sc_natural.3di.fa
+     Fold them with the same job that folds the samples:
+       python -m src.fold_fasta /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/sc_natural.fasta --pdb-dir <PDB_DIR>
+     They then appear as the 'natural (ceiling)' row -- ESMFold-vs-AlphaFold agreement on real
+     sequences, which is the highest score any generated row could reach.
+[job] === fold attempt 1/12 (0 PDBs so far, 0s spent) ===
+[dist] no_dist: 12 rank(s), NO process group (oneCCL not initialised); rank0 device=xpu:0
+[fold] 1720 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1720 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1720 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1720 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1720 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1720 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1720 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1720 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1720 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1720 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1720 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 283 file(s) | 1720 already scored | 1720 to do | 0 outside [10,512] | watch=False | 12 rank(s)
+[fold] 1720 entr(y/ies) have a stale record under the same id with a DIFFERENT sequence -- a regenerated FASTA. Re-folding them; the summary keeps the newest record per id.
+[fold] 1720 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+2026-09-02 22:38:48,386 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:38:48,387 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:38:48,386 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:38:48,387 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:38:48,386 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:38:48,387 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:38:48,386 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:38:48,387 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:38:48,386 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:38:48,387 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:38:48,386 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:38:48,387 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:38:48,386 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:38:48,387 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:38:48,386 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:38:48,387 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:38:48,386 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:38:48,387 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:38:48,386 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:38:48,387 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:38:48,386 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:38:48,387 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:38:48,387 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:38:48,387 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:38:48,694 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:38:48,694 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:38:48,695 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:38:48,694 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:38:48,694 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:38:48,695 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:38:48,694 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:38:48,695 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:38:48,694 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:38:48,695 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:38:48,695 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:38:48,695 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:38:48,695 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:38:48,695 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:38:48,695 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:38:48,695 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:38:48,695 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:38:48,695 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:38:48,694 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:38:48,694 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:38:48,695 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:38:48,695 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:38:48,695 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:38:48,695 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:38:55,895 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:38:55,895 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:38:55,895 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:38:55,895 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:38:55,895 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:38:55,895 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:38:55,895 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:38:55,895 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:38:55,895 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:38:55,895 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:38:55,895 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:38:55,896 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+2026-09-02 22:39:41,851 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+[fold] r11 ESMFold loaded in 53s on xpu:11 | 138 of 1720 sequences
+2026-09-02 22:39:41,851 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:39:41,851 - esmfold_scorer.scorer - INFO - Model loaded in 53.5 s
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r11 PDB layout OK: 2504 atoms over 318 residues (sequence is 318), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 2528, 3), 'atom_pad_mask': (1, 2528), 'res_type': (1, 318), 'atom_to_token': (1, 2528), 'ref_atom_name_chars': (1, 2528, 4)}
+[fold] r11 25/138 (100s)
+2026-09-02 22:40:35,222 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+[fold] r10 ESMFold loaded in 107s on xpu:10 | 144 of 1720 sequences
+2026-09-02 22:40:35,222 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:40:35,222 - esmfold_scorer.scorer - INFO - Model loaded in 106.8 s
+2026-09-02 22:40:35,295 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:40:35,296 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[xpu-linalg] CPU round-trip installed for 18 linalg op(s): det, slogdet, inv, pinv, solve, lstsq, eigh, eigvalsh, eig, eigvals, qr, cholesky, cholesky_ex, matrix_exp, matrix_power, matrix_rank, norm, cross
+[fold] r0 ESMFold loaded in 107s on xpu:0 | 146 of 1720 sequences
+2026-09-02 22:40:35,296 - esmfold_scorer.scorer - INFO - Model loaded in 106.9 s
+2026-09-02 22:40:35,333 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:40:35,333 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:40:35,334 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:40:35,334 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r4 ESMFold loaded in 107s on xpu:4 | 134 of 1720 sequences
+2026-09-02 22:40:35,333 - esmfold_scorer.scorer - INFO - Model loaded in 106.9 s
+[fold] r1 ESMFold loaded in 107s on xpu:1 | 151 of 1720 sequences
+2026-09-02 22:40:35,334 - esmfold_scorer.scorer - INFO - Model loaded in 106.9 s
+2026-09-02 22:40:35,335 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:40:35,335 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:40:35,335 - esmfold_scorer.scorer - INFO - Model loaded in 106.9 s
+[fold] r2 ESMFold loaded in 107s on xpu:2 | 145 of 1720 sequences
+2026-09-02 22:40:35,339 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:40:35,339 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:40:35,339 - esmfold_scorer.scorer - INFO - Model loaded in 107.0 s
+[fold] r7 ESMFold loaded in 107s on xpu:7 | 158 of 1720 sequences
+2026-09-02 22:40:35,342 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:40:35,342 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:40:35,342 - esmfold_scorer.scorer - INFO - Model loaded in 107.0 s
+[fold] r8 ESMFold loaded in 107s on xpu:8 | 152 of 1720 sequences
+2026-09-02 22:40:35,354 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:40:35,354 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:40:35,354 - esmfold_scorer.scorer - INFO - Model loaded in 107.0 s
+[fold] r9 ESMFold loaded in 107s on xpu:9 | 125 of 1720 sequences
+2026-09-02 22:40:35,366 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+[fold] r3 ESMFold loaded in 107s on xpu:3 | 132 of 1720 sequences
+2026-09-02 22:40:35,366 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:40:35,366 - esmfold_scorer.scorer - INFO - Model loaded in 107.0 s
+2026-09-02 22:40:35,367 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:40:35,367 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:40:35,367 - esmfold_scorer.scorer - INFO - Model loaded in 107.0 s
+[fold] r5 ESMFold loaded in 107s on xpu:5 | 152 of 1720 sequences
+2026-09-02 22:40:35,405 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:40:35,405 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r6 ESMFold loaded in 107s on xpu:6 | 143 of 1720 sequences
+2026-09-02 22:40:35,405 - esmfold_scorer.scorer - INFO - Model loaded in 107.0 s
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r3 PDB layout OK: 1166 atoms over 149 residues (sequence is 149), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 1184, 3), 'atom_pad_mask': (1, 1184), 'res_type': (1, 149), 'atom_to_token': (1, 1184), 'ref_atom_name_chars': (1, 1184, 4)}
+[fold] r9 PDB layout OK: 1569 atoms over 201 residues (sequence is 201), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 1600, 3), 'atom_pad_mask': (1, 1600), 'res_type': (1, 201), 'atom_to_token': (1, 1600), 'ref_atom_name_chars': (1, 1600, 4)}
+[fold] r5 PDB layout OK: 1012 atoms over 125 residues (sequence is 125), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 1024, 3), 'atom_pad_mask': (1, 1024), 'res_type': (1, 125), 'atom_to_token': (1, 1024), 'ref_atom_name_chars': (1, 1024, 4)}
+[fold] r4 PDB layout OK: 1373 atoms over 183 residues (sequence is 183), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 1376, 3), 'atom_pad_mask': (1, 1376), 'res_type': (1, 183), 'atom_to_token': (1, 1376), 'ref_atom_name_chars': (1, 1376, 4)}
+[fold] r6 PDB layout OK: 1282 atoms over 163 residues (sequence is 163), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 1312, 3), 'atom_pad_mask': (1, 1312), 'res_type': (1, 163), 'atom_to_token': (1, 1312), 'ref_atom_name_chars': (1, 1312, 4)}
+[fold] r8 PDB layout OK: 995 atoms over 125 residues (sequence is 125), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 1024, 3), 'atom_pad_mask': (1, 1024), 'res_type': (1, 125), 'atom_to_token': (1, 1024), 'ref_atom_name_chars': (1, 1024, 4)}
+[fold] r7 PDB layout OK: 2197 atoms over 289 residues (sequence is 289), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 2208, 3), 'atom_pad_mask': (1, 2208), 'res_type': (1, 289), 'atom_to_token': (1, 2208), 'ref_atom_name_chars': (1, 2208, 4)}
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r1 PDB layout OK: 2648 atoms over 332 residues (sequence is 332), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 2656, 3), 'atom_pad_mask': (1, 2656), 'res_type': (1, 332), 'atom_to_token': (1, 2656), 'ref_atom_name_chars': (1, 2656, 4)}
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r0 PDB layout OK: 3286 atoms over 412 residues (sequence is 412), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 3296, 3), 'atom_pad_mask': (1, 3296), 'res_type': (1, 412), 'atom_to_token': (1, 3296), 'ref_atom_name_chars': (1, 3296, 4)}
+[fold] r10 PDB layout OK: 3293 atoms over 428 residues (sequence is 428), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 3296, 3), 'atom_pad_mask': (1, 3296), 'res_type': (1, 428), 'atom_to_token': (1, 3296), 'ref_atom_name_chars': (1, 3296, 4)}
+[fold] r2 PDB layout OK: 3338 atoms over 418 residues (sequence is 418), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 3360, 3), 'atom_pad_mask': (1, 3360), 'res_type': (1, 418), 'atom_to_token': (1, 3360), 'ref_atom_name_chars': (1, 3360, 4)}
+Segmentation fault from GPU at 0xff290683f95be000, ctx_id: 1 (CCS) type: 0 (NotPresent), level: 4 (PML5), access: 0 (Read), banned: 1, aborting.
+Abort was called at 288 line in file:
+/home/ubit/rpmbuild/BUILD/intel-compute-runtime-25.18.33578.42/shared/source/os_interface/linux/drm_neo.cpp
+Segmentation fault from GPU at 0xff290683f95be000, ctx_id: 1 (CCS) type: 0 (NotPresent), level: 4 (PML5), access: 0 (Read), banned: 1, aborting.
+x4311c3s0b0n0.hsn.cm.aurora.alcf.anl.gov: rank 8 died from signal 6
+x4311c3s0b0n0.hsn.cm.aurora.alcf.anl.gov: rank 10 died from signal 15
+[job] fold exited 143 -- 0 -> 180 PDBs this attempt
+[job] === fold attempt 2/12 (180 PDBs so far, 281s spent) ===
+[dist] no_dist: 12 rank(s), NO process group (oneCCL not initialised); rank0 device=xpu:0
+[fold] 1540 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1540 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1540 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1540 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1540 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1540 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 283 file(s) | 1720 already scored | 1540 to do | 0 outside [10,512] | watch=False | 12 rank(s)
+[fold] 1540 entr(y/ies) have a stale record under the same id with a DIFFERENT sequence -- a regenerated FASTA. Re-folding them; the summary keeps the newest record per id.
+[fold] 1540 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1540 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1540 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1540 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1540 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1540 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+2026-09-02 22:41:28,910 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:41:28,910 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:41:28,911 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:41:28,911 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:41:28,911 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:41:28,911 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:41:28,911 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:41:28,911 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:41:28,911 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:41:28,911 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:41:28,912 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:41:28,912 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:41:28,912 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:41:28,912 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:41:28,912 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:41:28,912 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:41:28,912 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:41:28,912 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:41:28,912 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:41:28,912 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:41:28,912 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:41:28,912 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:41:28,913 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:41:28,913 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:41:28,939 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:41:28,939 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:41:28,940 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:41:28,940 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:41:28,941 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:41:28,941 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:41:28,941 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:41:28,941 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:41:28,941 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:41:28,941 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:41:28,941 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:41:28,941 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:41:28,941 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:41:28,941 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:41:28,941 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:41:28,941 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:41:28,941 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:41:28,941 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:41:28,941 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:41:28,941 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:41:28,942 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:41:28,942 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:41:28,942 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:41:28,942 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:41:29,739 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:41:29,740 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:41:29,740 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:41:29,741 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:41:29,741 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:41:29,741 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:41:29,741 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:41:29,741 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:41:29,742 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:41:29,742 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:41:29,742 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:41:29,742 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+2026-09-02 22:42:03,176 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:42:03,176 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[xpu-linalg] CPU round-trip installed for 18 linalg op(s): det, slogdet, inv, pinv, solve, lstsq, eigh, eigvalsh, eig, eigvals, qr, cholesky, cholesky_ex, matrix_exp, matrix_power, matrix_rank, norm, cross
+[fold] r0 ESMFold loaded in 34s on xpu:0 | 137 of 1540 sequences
+2026-09-02 22:42:03,176 - esmfold_scorer.scorer - INFO - Model loaded in 34.3 s
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r0 PDB layout OK: 1304 atoms over 164 residues (sequence is 164), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 1312, 3), 'atom_pad_mask': (1, 1312), 'res_type': (1, 164), 'atom_to_token': (1, 1312), 'ref_atom_name_chars': (1, 1312, 4)}
+2026-09-02 22:42:16,438 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:42:16,438 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r4 ESMFold loaded in 48s on xpu:4 | 123 of 1540 sequences
+2026-09-02 22:42:16,438 - esmfold_scorer.scorer - INFO - Model loaded in 47.5 s
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+2026-09-02 22:42:20,222 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:42:20,222 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r2 ESMFold loaded in 51s on xpu:2 | 132 of 1540 sequences
+2026-09-02 22:42:20,222 - esmfold_scorer.scorer - INFO - Model loaded in 51.3 s
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r4 PDB layout OK: 2394 atoms over 300 residues (sequence is 300), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 2400, 3), 'atom_pad_mask': (1, 2400), 'res_type': (1, 300), 'atom_to_token': (1, 2400), 'ref_atom_name_chars': (1, 2400, 4)}
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r2 PDB layout OK: 3353 atoms over 426 residues (sequence is 426), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 3360, 3), 'atom_pad_mask': (1, 3360), 'res_type': (1, 426), 'atom_to_token': (1, 3360), 'ref_atom_name_chars': (1, 3360, 4)}
+2026-09-02 22:42:27,161 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:42:27,161 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r3 ESMFold loaded in 58s on xpu:3 | 121 of 1540 sequences
+2026-09-02 22:42:27,161 - esmfold_scorer.scorer - INFO - Model loaded in 58.2 s
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r3 PDB layout OK: 2376 atoms over 296 residues (sequence is 296), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 2400, 3), 'atom_pad_mask': (1, 2400), 'res_type': (1, 296), 'atom_to_token': (1, 2400), 'ref_atom_name_chars': (1, 2400, 4)}
+2026-09-02 22:42:38,068 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:42:38,068 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r9 ESMFold loaded in 69s on xpu:9 | 114 of 1540 sequences
+2026-09-02 22:42:38,068 - esmfold_scorer.scorer - INFO - Model loaded in 69.2 s
+2026-09-02 22:42:38,792 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:42:38,792 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r8 ESMFold loaded in 70s on xpu:8 | 135 of 1540 sequences
+2026-09-02 22:42:38,792 - esmfold_scorer.scorer - INFO - Model loaded in 69.9 s
+2026-09-02 22:42:39,393 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:42:39,394 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r10 ESMFold loaded in 70s on xpu:10 | 132 of 1540 sequences
+2026-09-02 22:42:39,394 - esmfold_scorer.scorer - INFO - Model loaded in 70.5 s
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+2026-09-02 22:42:40,573 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:42:40,573 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r7 ESMFold loaded in 72s on xpu:7 | 141 of 1540 sequences
+2026-09-02 22:42:40,573 - esmfold_scorer.scorer - INFO - Model loaded in 71.7 s
+2026-09-02 22:42:40,932 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+[fold] r5 ESMFold loaded in 72s on xpu:5 | 136 of 1540 sequences
+2026-09-02 22:42:40,933 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:42:40,933 - esmfold_scorer.scorer - INFO - Model loaded in 72.0 s
+2026-09-02 22:42:40,986 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:42:40,986 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:42:40,986 - esmfold_scorer.scorer - INFO - Model loaded in 72.1 s
+[fold] r1 ESMFold loaded in 72s on xpu:1 | 145 of 1540 sequences
+2026-09-02 22:42:40,990 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:42:40,990 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:42:40,990 - esmfold_scorer.scorer - INFO - Model loaded in 72.1 s
+[fold] r11 ESMFold loaded in 72s on xpu:11 | 92 of 1540 sequences
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+2026-09-02 22:42:41,091 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:42:41,091 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r6 ESMFold loaded in 72s on xpu:6 | 132 of 1540 sequences
+2026-09-02 22:42:41,091 - esmfold_scorer.scorer - INFO - Model loaded in 72.2 s
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r9 PDB layout OK: 2056 atoms over 264 residues (sequence is 264), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 2080, 3), 'atom_pad_mask': (1, 2080), 'res_type': (1, 264), 'atom_to_token': (1, 2080), 'ref_atom_name_chars': (1, 2080, 4)}
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r10 PDB layout OK: 2103 atoms over 269 residues (sequence is 269), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 2112, 3), 'atom_pad_mask': (1, 2112), 'res_type': (1, 269), 'atom_to_token': (1, 2112), 'ref_atom_name_chars': (1, 2112, 4)}
+[fold] r8 PDB layout OK: 2637 atoms over 320 residues (sequence is 320), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 2656, 3), 'atom_pad_mask': (1, 2656), 'res_type': (1, 320), 'atom_to_token': (1, 2656), 'ref_atom_name_chars': (1, 2656, 4)}
+[fold] r7 PDB layout OK: 1798 atoms over 217 residues (sequence is 217), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 1824, 3), 'atom_pad_mask': (1, 1824), 'res_type': (1, 217), 'atom_to_token': (1, 1824), 'ref_atom_name_chars': (1, 1824, 4)}
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r1 PDB layout OK: 2815 atoms over 351 residues (sequence is 351), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 2816, 3), 'atom_pad_mask': (1, 2816), 'res_type': (1, 351), 'atom_to_token': (1, 2816), 'ref_atom_name_chars': (1, 2816, 4)}
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r6 PDB layout OK: 2687 atoms over 349 residues (sequence is 349), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 2688, 3), 'atom_pad_mask': (1, 2688), 'res_type': (1, 349), 'atom_to_token': (1, 2688), 'ref_atom_name_chars': (1, 2688, 4)}
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r5 PDB layout OK: 3098 atoms over 394 residues (sequence is 394), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 3104, 3), 'atom_pad_mask': (1, 3104), 'res_type': (1, 394), 'atom_to_token': (1, 3104), 'ref_atom_name_chars': (1, 3104, 4)}
+[fold] r11 PDB layout OK: 3397 atoms over 439 residues (sequence is 439), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 3424, 3), 'atom_pad_mask': (1, 3424), 'res_type': (1, 439), 'atom_to_token': (1, 3424), 'ref_atom_name_chars': (1, 3424, 4)}
+[fold] r8 25/135 (101s)
+[fold] r0 25/137 (101s)
+[fold] r4 25/123 (103s)
+[fold] r3 25/121 (106s)
+[fold] r9 25/114 (109s)
+[fold] r6 25/132 (111s)
+[fold] r7 25/141 (112s)
+[fold] r2 25/132 (112s)
+[fold] r1 25/145 (114s)
+[fold] r10 25/132 (122s)
+Segmentation fault from GPU at 0xffb1ff9bf8e78000, ctx_id: 1 (CCS) type: 0 (NotPresent), level: 4 (PML5), access: 0 (Read), banned: 1, aborting.
+Abort was called at 288 line in file:
+/home/ubit/rpmbuild/BUILD/intel-compute-runtime-25.18.33578.42/shared/source/os_interface/linux/drm_neo.cpp
+Segmentation fault from GPU at 0xffb1ff9bf8e78000, ctx_id: 1 (CCS) type: 0 (NotPresent), level: 4 (PML5), access: 0 (Read), banned: 1, aborting.
+x4311c3s0b0n0.hsn.cm.aurora.alcf.anl.gov: rank 10 died from signal 6
+x4311c3s0b0n0.hsn.cm.aurora.alcf.anl.gov: rank 1 died from signal 15
+[job] fold exited 143 -- 180 -> 580 PDBs this attempt
+[job] === fold attempt 3/12 (580 PDBs so far, 433s spent) ===
+[dist] no_dist: 12 rank(s), NO process group (oneCCL not initialised); rank0 device=xpu:0
+[fold] 1140 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1140 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 283 file(s) | 1720 already scored | 1140 to do | 0 outside [10,512] | watch=False | 12 rank(s)
+[fold] 1140 entr(y/ies) have a stale record under the same id with a DIFFERENT sequence -- a regenerated FASTA. Re-folding them; the summary keeps the newest record per id.
+[fold] 1140 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1140 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1140 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1140 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1140 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1140 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1140 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1140 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1140 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1140 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+2026-09-02 22:43:59,163 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:43:59,163 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:43:59,164 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:43:59,164 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:43:59,164 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:43:59,164 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:43:59,164 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:43:59,164 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:43:59,164 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:43:59,164 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:43:59,165 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:43:59,165 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:43:59,165 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:43:59,165 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:43:59,167 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:43:59,167 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:43:59,167 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:43:59,167 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:43:59,167 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:43:59,167 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:43:59,168 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:43:59,168 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:43:59,168 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:43:59,168 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:43:59,179 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:43:59,179 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:43:59,189 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:43:59,189 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:43:59,190 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:43:59,190 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:43:59,190 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:43:59,190 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:43:59,191 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:43:59,192 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:43:59,192 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:43:59,192 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:43:59,192 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:43:59,192 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:43:59,193 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:43:59,193 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:43:59,195 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:43:59,195 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:43:59,196 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:43:59,196 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:43:59,196 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:43:59,196 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:43:59,197 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:43:59,197 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:43:59,674 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:43:59,675 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:43:59,676 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:43:59,677 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:43:59,677 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:43:59,678 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:43:59,696 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:43:59,701 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:43:59,702 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:43:59,704 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:43:59,704 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:43:59,707 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+2026-09-02 22:44:34,730 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+[xpu-linalg] CPU round-trip installed for 18 linalg op(s): det, slogdet, inv, pinv, solve, lstsq, eigh, eigvalsh, eig, eigvals, qr, cholesky, cholesky_ex, matrix_exp, matrix_power, matrix_rank, norm, cross
+[fold] r0 ESMFold loaded in 36s on xpu:0 | 100 of 1140 sequences
+2026-09-02 22:44:34,730 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:44:34,730 - esmfold_scorer.scorer - INFO - Model loaded in 35.6 s
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r0 PDB layout OK: 3452 atoms over 446 residues (sequence is 446), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 3456, 3), 'atom_pad_mask': (1, 3456), 'res_type': (1, 446), 'atom_to_token': (1, 3456), 'ref_atom_name_chars': (1, 3456, 4)}
+2026-09-02 22:44:48,014 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+[fold] r4 ESMFold loaded in 49s on xpu:4 | 89 of 1140 sequences
+2026-09-02 22:44:48,014 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:44:48,014 - esmfold_scorer.scorer - INFO - Model loaded in 48.9 s
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+2026-09-02 22:44:54,519 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+[fold] r1 ESMFold loaded in 55s on xpu:1 | 108 of 1140 sequences
+2026-09-02 22:44:54,519 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:44:54,519 - esmfold_scorer.scorer - INFO - Model loaded in 55.4 s
+[fold] r4 PDB layout OK: 2974 atoms over 387 residues (sequence is 387), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 2976, 3), 'atom_pad_mask': (1, 2976), 'res_type': (1, 387), 'atom_to_token': (1, 2976), 'ref_atom_name_chars': (1, 2976, 4)}
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+2026-09-02 22:44:59,266 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+[fold] r2 ESMFold loaded in 60s on xpu:2 | 99 of 1140 sequences
+2026-09-02 22:44:59,266 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:44:59,266 - esmfold_scorer.scorer - INFO - Model loaded in 60.1 s
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r1 PDB layout OK: 3146 atoms over 379 residues (sequence is 379), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 3168, 3), 'atom_pad_mask': (1, 3168), 'res_type': (1, 379), 'atom_to_token': (1, 3168), 'ref_atom_name_chars': (1, 3168, 4)}
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r2 PDB layout OK: 3341 atoms over 413 residues (sequence is 413), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 3360, 3), 'atom_pad_mask': (1, 3360), 'res_type': (1, 413), 'atom_to_token': (1, 3360), 'ref_atom_name_chars': (1, 3360, 4)}
+Segmentation fault from GPU at 0xff7f53240e174000, ctx_id: 1 (CCS) type: 0 (NotPresent), level: 4 (PML5), access: 0 (Read), banned: 1, aborting.
+Segmentation fault from GPU at 0xff7f53240e174000, ctx_id: 1 (CCS) type: 0 (NotPresent), level: 4 (PML5), access: 0 (Read), banned: 1, aborting.
+Abort was called at 288 line in file:
+/home/ubit/rpmbuild/BUILD/intel-compute-runtime-25.18.33578.42/shared/source/os_interface/linux/drm_neo.cpp
+x4311c3s0b0n0.hsn.cm.aurora.alcf.anl.gov: rank 2 died from signal 6
+x4311c3s0b0n0.hsn.cm.aurora.alcf.anl.gov: rank 0 died from signal 15
+[job] fold exited 143 -- 580 -> 597 PDBs this attempt
+[job] === fold attempt 4/12 (597 PDBs so far, 523s spent) ===
+[dist] no_dist: 12 rank(s), NO process group (oneCCL not initialised); rank0 device=xpu:0
+[fold] 1123 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1123 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1123 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 283 file(s) | 1720 already scored | 1123 to do | 0 outside [10,512] | watch=False | 12 rank(s)
+[fold] 1123 entr(y/ies) have a stale record under the same id with a DIFFERENT sequence -- a regenerated FASTA. Re-folding them; the summary keeps the newest record per id.
+2026-09-02 22:45:29,310 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:45:29,310 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+[fold] 1123 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+2026-09-02 22:45:29,312 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:45:29,312 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:45:29,312 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:45:29,312 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+[fold] 1123 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1123 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1123 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+2026-09-02 22:45:29,315 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:45:29,315 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+[fold] 1123 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+2026-09-02 22:45:29,316 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:45:29,316 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+[fold] 1123 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1123 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1123 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+[fold] 1123 sequence(s) already scored but with no INDEXED structure -- re-folding them so src.self_consistency has something it can join
+2026-09-02 22:45:29,318 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:45:29,318 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:45:29,318 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:45:29,319 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:45:29,320 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:45:29,320 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:45:29,320 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:45:29,320 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:45:29,321 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:45:29,321 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:45:29,321 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:45:29,321 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:45:29,321 - esmfold_scorer.device - INFO - Using XPU device
+2026-09-02 22:45:29,321 - esmfold_scorer.scorer - INFO - Loading ESMFold2-Fast from /flare/NLDesignProtein/bryan/models/ESMFold2-Fast (device=xpu, dtype=torch.bfloat16)
+2026-09-02 22:45:29,327 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:45:29,327 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:45:29,329 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:45:29,329 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:45:29,329 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:45:29,329 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:45:29,332 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:45:29,332 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:45:29,332 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:45:29,333 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:45:29,335 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:45:29,335 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:45:29,336 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:45:29,336 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:45:29,337 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:45:29,337 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:45:29,339 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:45:29,339 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:45:29,340 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:45:29,340 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:45:29,340 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:45:29,341 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:45:29,341 - esm.models.esmc.kernels - WARNING - ESMC: Transformer Engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically - measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+2026-09-02 22:45:29,341 - esm.models.esmc.kernels - WARNING - ESMC: neither xformers nor flash-attn is installed; falling back to PyTorch ``F.scaled_dot_product_attention``. The attention reduction order in bf16 differs from a fused kernel by ~1 bf16 ULP per attention block; compounded across the 80-block stack this reaches ~O(100) max-diff on the unnormalized residual stream. Install xformers (preferred) with `pip install xformers` for a fused attention kernel.
+2026-09-02 22:45:30,087 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:45:30,152 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:45:30,153 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:45:30,154 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+2026-09-02 22:45:30,154 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:45:30,156 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:45:30,171 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:45:30,175 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:45:30,178 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:45:30,189 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:45:30,190 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+2026-09-02 22:45:30,191 - esmfold_scorer.scorer - INFO - Using EsmFold2Model from esm package
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/config.py:480: FutureWarning: config.json uses 31 pre-alignment ESMFold2 field path(s), e.g. ['confidence_head.folding_trunk.dropout', 'confidence_head.folding_trunk.n_heads', 'confidence_head.folding_trunk.n_layers']; see EsmFold2Config for the current names.
+  return cls(**raw)
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmc/config.py:206: FutureWarning: config.json uses pre-alignment ESMC field names ['d_model', 'n_heads', 'n_layers']; the current names are ['hidden_size', 'num_attention_heads', 'num_hidden_layers'].
+  return cls.from_dict(json.load(f))
+2026-09-02 22:45:53,253 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+[xpu-linalg] CPU round-trip installed for 18 linalg op(s): det, slogdet, inv, pinv, solve, lstsq, eigh, eigvalsh, eig, eigvals, qr, cholesky, cholesky_ex, matrix_exp, matrix_power, matrix_rank, norm, cross
+[fold] r0 ESMFold loaded in 24s on xpu:0 | 91 of 1123 sequences
+2026-09-02 22:45:53,253 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:45:53,253 - esmfold_scorer.scorer - INFO - Model loaded in 23.9 s
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r0 PDB layout OK: 1804 atoms over 232 residues (sequence is 232), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 1824, 3), 'atom_pad_mask': (1, 1824), 'res_type': (1, 232), 'atom_to_token': (1, 1824), 'ref_atom_name_chars': (1, 1824, 4)}
+2026-09-02 22:46:17,406 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+[fold] r2 ESMFold loaded in 48s on xpu:2 | 98 of 1123 sequences
+2026-09-02 22:46:17,406 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:46:17,406 - esmfold_scorer.scorer - INFO - Model loaded in 48.1 s
+2026-09-02 22:46:18,461 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+[fold] r3 ESMFold loaded in 49s on xpu:3 | 80 of 1123 sequences
+2026-09-02 22:46:18,461 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:46:18,461 - esmfold_scorer.scorer - INFO - Model loaded in 49.1 s
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r2 PDB layout OK: 1313 atoms over 167 residues (sequence is 167), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 1344, 3), 'atom_pad_mask': (1, 1344), 'res_type': (1, 167), 'atom_to_token': (1, 1344), 'ref_atom_name_chars': (1, 1344, 4)}
+[fold] r3 PDB layout OK: 1420 atoms over 181 residues (sequence is 181), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 1440, 3), 'atom_pad_mask': (1, 1440), 'res_type': (1, 181), 'atom_to_token': (1, 1440), 'ref_atom_name_chars': (1, 1440, 4)}
+2026-09-02 22:46:29,257 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:46:29,257 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r9 ESMFold loaded in 60s on xpu:9 | 78 of 1123 sequences
+2026-09-02 22:46:29,257 - esmfold_scorer.scorer - INFO - Model loaded in 59.9 s
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r9 PDB layout OK: 2166 atoms over 279 residues (sequence is 279), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 2176, 3), 'atom_pad_mask': (1, 2176), 'res_type': (1, 279), 'atom_to_token': (1, 2176), 'ref_atom_name_chars': (1, 2176, 4)}
+2026-09-02 22:46:38,777 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:46:38,777 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r8 ESMFold loaded in 69s on xpu:8 | 93 of 1123 sequences
+2026-09-02 22:46:38,777 - esmfold_scorer.scorer - INFO - Model loaded in 69.5 s
+2026-09-02 22:46:39,229 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+[fold] r5 ESMFold loaded in 70s on xpu:5 | 112 of 1123 sequences
+2026-09-02 22:46:39,229 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+2026-09-02 22:46:39,229 - esmfold_scorer.scorer - INFO - Model loaded in 69.9 s
+2026-09-02 22:46:39,554 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:46:39,554 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r10 ESMFold loaded in 70s on xpu:10 | 104 of 1123 sequences
+2026-09-02 22:46:39,554 - esmfold_scorer.scorer - INFO - Model loaded in 70.2 s
+2026-09-02 22:46:40,588 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:46:40,588 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r4 ESMFold loaded in 71s on xpu:4 | 85 of 1123 sequences
+2026-09-02 22:46:40,588 - esmfold_scorer.scorer - INFO - Model loaded in 71.3 s
+2026-09-02 22:46:40,733 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:46:40,733 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r11 ESMFold loaded in 71s on xpu:11 | 75 of 1123 sequences
+2026-09-02 22:46:40,733 - esmfold_scorer.scorer - INFO - Model loaded in 71.4 s
+2026-09-02 22:46:40,776 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:46:40,776 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r1 ESMFold loaded in 71s on xpu:1 | 105 of 1123 sequences
+2026-09-02 22:46:40,776 - esmfold_scorer.scorer - INFO - Model loaded in 71.5 s
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+2026-09-02 22:46:40,860 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:46:40,860 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r7 ESMFold loaded in 72s on xpu:7 | 105 of 1123 sequences
+2026-09-02 22:46:40,860 - esmfold_scorer.scorer - INFO - Model loaded in 71.5 s
+2026-09-02 22:46:41,047 - esmfold_scorer.scorer - INFO - Patched torch.linalg.svd/det for XPU (explicit CPU round-trip)
+2026-09-02 22:46:41,047 - esmfold_scorer.scorer - INFO - Patched F.linear and F.layer_norm for XPU bf16 dtype matching
+[fold] r6 ESMFold loaded in 72s on xpu:6 | 97 of 1123 sequences
+2026-09-02 22:46:41,047 - esmfold_scorer.scorer - INFO - Model loaded in 71.7 s
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r8 PDB layout OK: 1812 atoms over 237 residues (sequence is 237), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 1824, 3), 'atom_pad_mask': (1, 1824), 'res_type': (1, 237), 'atom_to_token': (1, 1824), 'ref_atom_name_chars': (1, 1824, 4)}
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/model.py:484: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r10 PDB layout OK: 1315 atoms over 175 residues (sequence is 175), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 1344, 3), 'atom_pad_mask': (1, 1344), 'res_type': (1, 175), 'atom_to_token': (1, 1344), 'ref_atom_name_chars': (1, 1344, 4)}
+[fold] r1 PDB layout OK: 1044 atoms over 129 residues (sequence is 129), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 1056, 3), 'atom_pad_mask': (1, 1056), 'res_type': (1, 129), 'atom_to_token': (1, 1056), 'ref_atom_name_chars': (1, 1056, 4)}
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r5 PDB layout OK: 3284 atoms over 419 residues (sequence is 419), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 3296, 3), 'atom_pad_mask': (1, 3296), 'res_type': (1, 419), 'atom_to_token': (1, 3296), 'ref_atom_name_chars': (1, 3296, 4)}
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r6 PDB layout OK: 3050 atoms over 379 residues (sequence is 379), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 3072, 3), 'atom_pad_mask': (1, 3072), 'res_type': (1, 379), 'atom_to_token': (1, 3072), 'ref_atom_name_chars': (1, 3072, 4)}
+/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/lib/python3.12/site-packages/esm/models/esmfold2/layers.py:1405: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+[fold] r11 PDB layout OK: 3518 atoms over 437 residues (sequence is 437), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 3520, 3), 'atom_pad_mask': (1, 3520), 'res_type': (1, 437), 'atom_to_token': (1, 3520), 'ref_atom_name_chars': (1, 3520, 4)}
+[fold] r7 PDB layout OK: 3279 atoms over 433 residues (sequence is 433), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 3296, 3), 'atom_pad_mask': (1, 3296), 'res_type': (1, 433), 'atom_to_token': (1, 3296), 'ref_atom_name_chars': (1, 3296, 4)}
+[fold] r4 PDB layout OK: 3768 atoms over 485 residues (sequence is 485), atom names ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1'] | shapes {'sample_atom_coords': (1, 3776, 3), 'atom_pad_mask': (1, 3776), 'res_type': (1, 485), 'atom_to_token': (1, 3776), 'ref_atom_name_chars': (1, 3776, 4)}
+[fold] r0 25/91 (96s)
+[fold] r2 25/98 (104s)
+[fold] r3 25/80 (125s)
+[fold] r10 25/104 (125s)
+[fold] r9 25/78 (127s)
+[fold] r1 25/105 (130s)
+[fold] r4 25/85 (130s)
+[fold] r8 25/93 (131s)
+[fold] r7 25/105 (131s)
+[fold] r5 25/112 (132s)
+[fold] r11 25/75 (135s)
+[fold] r6 25/97 (141s)
+[fold] r0 50/91 (155s)
+[fold] r4 50/85 (171s)
+[fold] r2 50/98 (175s)
+[fold] r10 50/104 (177s)
+[fold] r5 50/112 (180s)
+[fold] r3 50/80 (182s)
+[fold] r6 50/97 (188s)
+[fold] r9 50/78 (190s)
+[fold] r8 50/93 (197s)
+[fold] r1 50/105 (200s)
+[fold] r7 50/105 (200s)
+[fold] r0 75/91 (209s)
+[fold] r11 50/75 (209s)
+[fold] r3 75/80 (226s)
+[fold] r4 75/85 (234s)
+[fold] r2 75/98 (235s)
+[fold] r3 wrote 80 PDBs to /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/pdb
+[fold] r3 scored 80 sequence(s) this process
+[fold] r5 75/112 (240s)
+[fold] r10 75/104 (243s)
+[fold] r0 wrote 91 PDBs to /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/pdb
+
+[fold] PARTIAL -- other ranks are still folding; the final table follows when they finish.
+
+source                         n   pLDDT    >70     pTM    >.5    LCR    len     k13     k20     k30   <- kmer rep_frac
+----------------------------------------------------------------------------------------------------
+natural                      200    81.9   80%   0.678   74%  7.9%  249.7    0.5%    0.3%    0.2% 
+sc_natural                   200    75.7   62%   0.607   64%  5.8%  189.7    0.7%    0.2%    0.2% 
+shuffled                     200    39.1    2%   0.168    0%  4.7%  249.7    0.0%    0.0%    0.0% 
+step_00000500                 32    38.9    0%   0.192    0%  6.5%  299.6    0.0%    0.0%    0.0% 
+step_00001000                 32    36.8    0%   0.181    0%  6.5%  286.8    0.0%    0.0%    0.0% 
+step_00001500                 32    40.5    0%   0.193    0%  7.5%  228.5    0.0%    0.0%    0.0% 
+step_00002000                 32    47.8    0%   0.226    0%  7.1%  285.2    0.0%    0.0%    0.0% 
+step_00002500                 32    44.8    3%   0.217    0%  4.8%  257.7    0.0%    0.0%    0.0% 
+step_00003000                 32    41.5    6%   0.201    3%  6.7%  307.5    0.0%    0.0%    0.0% 
+step_00003500                 32    41.6    0%   0.210    0%  9.2%  288.8    0.0%    0.0%    0.0% 
+step_00004000                 32    43.4    6%   0.211    0%  8.9%  242.7    0.9%    0.0%    0.0% 
+step_00004500                 32    42.6    6%   0.203    0%  9.3%  274.0    0.0%    0.0%    0.0% 
+step_00005000                 32    45.9    9%   0.222    0% 12.3%  268.8    0.0%    0.0%    0.0% 
+step_00005500                 32    49.5    6%   0.234    3% 11.0%  290.8    0.0%    0.0%    0.0% 
+step_00006000                 32    39.6    3%   0.188    0%  7.5%  278.2    0.0%    0.0%    0.0% 
+step_00006500                 32    43.8    0%   0.216    0%  9.1%  290.3    0.0%    0.0%    0.0% 
+step_00007000                 32    43.1    6%   0.211    3%  5.4%  251.9    0.0%    0.0%    0.0% 
+step_00007500                 32    44.8    3%   0.225    0%  9.0%  261.5    0.0%    0.0%    0.0% 
+step_00008000                 32    47.0    6%   0.222    0%  7.9%  286.7    0.0%    0.0%    0.0% 
+step_00008500                 32    43.3    3%   0.219    0%  7.7%  257.1    0.0%    0.0%    0.0% 
+step_00009000                 32    41.5    0%   0.209    0%  4.5%  251.0    0.0%    0.0%    0.0% 
+step_00009500                 32    42.9    0%   0.217    0%  7.7%  281.9    0.0%    0.0%    0.0% 
+step_00010000                 32    47.2    3%   0.229    0%  9.5%  270.6    0.0%    0.0%    0.0% 
+step_00010500                 32    44.9    0%   0.218    3%  6.7%  336.7    0.0%    0.0%    0.0% 
+step_00011000                 32    41.6    3%   0.199    0%  4.8%  262.2    0.0%    0.0%    0.0% 
+step_00011500                 32    46.1    3%   0.224    0%  4.7%  245.5    0.0%    0.0%    0.0% 
+step_00012000                 32    45.1    0%   0.227    3%  6.0%  222.9    0.0%    0.0%    0.0% 
+step_00012500                 32    41.8    3%   0.216    3%  7.4%  291.3    0.0%    0.0%    0.0% 
+step_00013000                 32    44.9    0%   0.233    0%  4.5%  232.4    0.0%    0.0%    0.0% 
+step_00013500                 32    41.9    0%   0.211    0%  3.6%  267.5    0.0%    0.0%    0.0% 
+step_00014000                 32    45.6    6%   0.228    3%  7.5%  230.3    0.0%    0.0%    0.0% 
+step_00014500                 32    44.7    6%   0.237    3%  4.6%  254.8    0.0%    0.0%    0.0% 
+step_00015000                 32    46.7    3%   0.242    3%  5.1%  251.9    0.0%    0.0%    0.0% 
+step_00015500                 32    44.1    3%   0.221    0%  5.1%  254.7    0.0%    0.0%    0.0% 
+step_00016000                 32    42.5    0%   0.212    0%  2.4%  296.5    0.0%    0.0%    0.0% 
+step_00016500                 32    46.0    6%   0.253    0%  5.2%  246.6    0.0%    0.0%    0.0% 
+step_00017000                 32    46.5    6%   0.245    0%  4.6%  260.0    0.0%    0.0%    0.0% 
+step_00017500                 32    43.5    3%   0.224    0%  8.8%  277.4    0.0%    0.0%    0.0% 
+----------------------------------------------------------------------------------------------------
+Read every step row against the 'natural' and 'shuffled' rows (src.make_baselines): natural is the ceiling, shuffled the composition-matched floor. A step whose pLDDT sits at or below shuffled has learned composition and not structure.
+DEGENERATE marks k13 repeat coverage above 2.3% (5x the natural row): repetitive sequences fold CONFIDENTLY, so a high pLDDT there is the metric being gamed, not a better model. Also compare the len column before believing a pLDDT gain -- short chains score higher.
+[fold] r0 scored 91 sequence(s) this process
+[fold] waiting for 12 rank(s) to finish before the final table...
+[fold] r4 wrote 85 PDBs to /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/pdb
+[fold] r4 scored 85 sequence(s) this process
+[fold] r7 75/105 (253s)
+[fold] r6 75/97 (253s)
+[fold] r1 75/105 (260s)
+[fold] r8 75/93 (262s)
+[fold] r11 75/75 (276s)
+[fold] r11 wrote 75 PDBs to /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/pdb
+[fold] r11 scored 75 sequence(s) this process
+[fold] r2 wrote 98 PDBs to /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/pdb
+[fold] r2 scored 98 sequence(s) this process
+[fold] r5 100/112 (295s)
+[fold] r8 wrote 93 PDBs to /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/pdb
+[fold] r8 scored 93 sequence(s) this process
+[fold] r10 100/104 (300s)
+[fold] r6 wrote 97 PDBs to /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/pdb
+[fold] r6 scored 97 sequence(s) this process
+[fold] r10 wrote 104 PDBs to /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/pdb
+[fold] r10 scored 104 sequence(s) this process
+[fold] r1 100/105 (308s)
+[fold] r7 100/105 (314s)
+[fold] r1 wrote 105 PDBs to /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/pdb
+[fold] r1 scored 105 sequence(s) this process
+[fold] r7 wrote 105 PDBs to /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/pdb
+[fold] r7 scored 105 sequence(s) this process
+[fold] r5 wrote 112 PDBs to /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/pdb
+[fold] r5 scored 112 sequence(s) this process
+[fold] r9 75/78 (333s)
+[fold] r9 wrote 78 PDBs to /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/pdb
+[fold] r9 scored 78 sequence(s) this process
+
+source                         n   pLDDT    >70     pTM    >.5    LCR    len     k13     k20     k30   <- kmer rep_frac
+----------------------------------------------------------------------------------------------------
+natural                      200    81.9   80%   0.678   74%  7.9%  249.7    0.5%    0.3%    0.2% 
+sc_natural                   200    75.7   62%   0.607   64%  5.8%  189.7    0.7%    0.2%    0.2% 
+shuffled                     200    39.1    2%   0.168    0%  4.7%  249.7    0.0%    0.0%    0.0% 
+step_00000500                 32    38.9    0%   0.192    0%  6.5%  299.6    0.0%    0.0%    0.0% 
+step_00001000                 32    36.8    0%   0.181    0%  6.5%  286.8    0.0%    0.0%    0.0% 
+step_00001500                 32    40.5    0%   0.193    0%  7.5%  228.5    0.0%    0.0%    0.0% 
+step_00002000                 32    47.8    0%   0.226    0%  7.1%  285.2    0.0%    0.0%    0.0% 
+step_00002500                 32    44.8    3%   0.217    0%  4.8%  257.7    0.0%    0.0%    0.0% 
+step_00003000                 32    41.5    6%   0.201    3%  6.7%  307.5    0.0%    0.0%    0.0% 
+step_00003500                 32    41.6    0%   0.210    0%  9.2%  288.8    0.0%    0.0%    0.0% 
+step_00004000                 32    43.4    6%   0.211    0%  8.9%  242.7    0.9%    0.0%    0.0% 
+step_00004500                 32    42.6    6%   0.203    0%  9.3%  274.0    0.0%    0.0%    0.0% 
+step_00005000                 32    45.9    9%   0.222    0% 12.3%  268.8    0.0%    0.0%    0.0% 
+step_00005500                 32    49.5    6%   0.234    3% 11.0%  290.8    0.0%    0.0%    0.0% 
+step_00006000                 32    39.6    3%   0.188    0%  7.5%  278.2    0.0%    0.0%    0.0% 
+step_00006500                 32    43.8    0%   0.216    0%  9.1%  290.3    0.0%    0.0%    0.0% 
+step_00007000                 32    43.1    6%   0.211    3%  5.4%  251.9    0.0%    0.0%    0.0% 
+step_00007500                 32    44.8    3%   0.225    0%  9.0%  261.5    0.0%    0.0%    0.0% 
+step_00008000                 32    47.0    6%   0.222    0%  7.9%  286.7    0.0%    0.0%    0.0% 
+step_00008500                 32    43.3    3%   0.219    0%  7.7%  257.1    0.0%    0.0%    0.0% 
+step_00009000                 32    41.5    0%   0.209    0%  4.5%  251.0    0.0%    0.0%    0.0% 
+step_00009500                 32    42.9    0%   0.217    0%  7.7%  281.9    0.0%    0.0%    0.0% 
+step_00010000                 32    47.2    3%   0.229    0%  9.5%  270.6    0.0%    0.0%    0.0% 
+step_00010500                 32    45.0    0%   0.217    3%  6.7%  336.7    0.0%    0.0%    0.0% 
+step_00011000                 32    41.7    3%   0.199    0%  4.8%  262.2    0.0%    0.0%    0.0% 
+step_00011500                 32    46.1    3%   0.223    0%  4.7%  245.5    0.0%    0.0%    0.0% 
+step_00012000                 32    45.2    0%   0.228    3%  6.0%  222.9    0.0%    0.0%    0.0% 
+step_00012500                 32    41.8    0%   0.216    3%  7.4%  291.3    0.0%    0.0%    0.0% 
+step_00013000                 32    45.0    0%   0.235    0%  4.5%  232.4    0.0%    0.0%    0.0% 
+step_00013500                 32    42.0    0%   0.210    0%  3.6%  267.5    0.0%    0.0%    0.0% 
+step_00014000                 32    45.6    6%   0.231    3%  7.5%  230.3    0.0%    0.0%    0.0% 
+step_00014500                 32    44.6    3%   0.237    3%  4.6%  254.8    0.0%    0.0%    0.0% 
+step_00015000                 32    46.8    3%   0.245    3%  5.1%  251.9    0.0%    0.0%    0.0% 
+step_00015500                 32    44.3    3%   0.223    0%  5.1%  254.7    0.0%    0.0%    0.0% 
+step_00016000                 32    42.6    0%   0.213    0%  2.4%  296.5    0.0%    0.0%    0.0% 
+step_00016500                 32    45.8    6%   0.253    0%  5.2%  246.6    0.0%    0.0%    0.0% 
+step_00017000                 32    46.6    6%   0.248    0%  4.6%  260.0    0.0%    0.0%    0.0% 
+step_00017500                 32    43.7    3%   0.224    0%  8.8%  277.4    0.0%    0.0%    0.0% 
+----------------------------------------------------------------------------------------------------
+Read every step row against the 'natural' and 'shuffled' rows (src.make_baselines): natural is the ceiling, shuffled the composition-matched floor. A step whose pLDDT sits at or below shuffled has learned composition and not structure.
+DEGENERATE marks k13 repeat coverage above 2.3% (5x the natural row): repetitive sequences fold CONFIDENTLY, so a high pLDDT there is the metric being gamed, not a better model. Also compare the len column before believing a pLDDT gain -- short chains score higher.
+[fold] linalg ops that ran on XPU tensors: det
+[job] fold pass completed cleanly on attempt 4 (1720 PDBs)
+[job] folding done: 1720 structures (started from 0)
+[sc] foldseek structureto3didescriptor /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/pdb /flare/NLDesignProtein/bryan/Diffusion-dev-space/runs/pld2/samples/pdb/descriptor.tsv   (1,720 structures)
+[sc] 1,320 generated 3Di tracks | 1,720 refolded | 0 joined
+nothing joined. The PDB index and the .3di.fa record ids disagree -- check that both came from the same run.
+[job] exit 1
+[job] finished 2026-09-02T22:51:46+0000 exit=1
