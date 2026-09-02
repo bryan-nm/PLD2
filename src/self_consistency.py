@@ -129,6 +129,24 @@ def run_foldseek(pdb_dir, tsv_path, binary="foldseek", threads=0):
     return tsv_path
 
 
+# foldseek names each structure after its FILE, extension included -- "natural_natural_0.pdb" --
+# and appends _<chain> when a structure has more than one. The index is keyed on the bare basename,
+# so the extension comes off first and the chain suffix is only tried if the exact name misses
+# (stripping it eagerly would turn "natural_natural_0" into "natural_natural" and risk a false hit).
+_STRUCT_EXT = (".gz", ".pdb", ".cif", ".mmcif", ".ent")
+
+
+def _index_keys(head):
+    base = os.path.basename(head.split()[0])
+    for ext in _STRUCT_EXT:
+        if base.lower().endswith(ext):
+            base = base[: -len(ext)]
+    yield base
+    stem, _, chain = base.rpartition("_")
+    if stem and 0 < len(chain) <= 2 and chain.isalnum():
+        yield stem
+
+
 def parse_descriptor(tsv_path, index):
     """TSV -> {record id: refolded 3Di}. `index` maps PDB basename -> record id."""
     out, unmatched = {}, 0
@@ -138,8 +156,7 @@ def parse_descriptor(tsv_path, index):
             if len(parts) < 3:
                 continue
             head = parts[0].split()[0]
-            # foldseek's header is the structure name, optionally with a _<chain> suffix appended.
-            for key in (head, head.rsplit("_", 1)[0], os.path.splitext(head)[0]):
+            for key in _index_keys(head):
                 if key in index:
                     out[record_key(index[key])] = parts[2]
                     break
