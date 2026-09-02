@@ -49,6 +49,9 @@ if [ -d "${ESMFOLD_REPO}/src" ]; then
 fi
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 
+# Add Foldseek path
+export PATH=/flare/NLDesignProtein/bryan/tools/foldseek/bin:$PATH
+
 MPI_LAUNCH=(mpiexec -n "${NRANKS}" -ppn "${RANKS_PER_NODE}" --pmi=pmix --cpu-bind depth -d 8)
 
 job_banner() {
