@@ -283,11 +283,101 @@ def collect(paths, out_path, lo, hi, limit=0):
     return todo, len(already), skipped, superseded
 
 
-def fold_all(todo, scorer, out_path, ocfg, t0, tag=""):
-    n_ok = 0
+# --- optional PDB output, for the 3Di self-consistency check (src/self_consistency.py) ---
+# ATOM37 ordering is the AlphaFold convention; foldseek's 3Di encoder needs CA, N, C and CB, and
+# rebuilds the backbone with pulchra if it finds CA only -- so writing the four is enough and
+# writing only CA still works, at some cost in fidelity.
+_ATOM37 = [(0, "N", "N"), (1, "CA", "C"), (2, "C", "C"), (3, "CB", "C"), (4, "O", "O")]
+_AA3 = {"A": "ALA", "C": "CYS", "D": "ASP", "E": "GLU", "F": "PHE", "G": "GLY", "H": "HIS",
+        "I": "ILE", "K": "LYS", "L": "LEU", "M": "MET", "N": "ASN", "P": "PRO", "Q": "GLN",
+        "R": "ARG", "S": "SER", "T": "THR", "V": "VAL", "W": "TRP", "Y": "TYR"}
+
+
+def _coords_from(output):
+    """(L, >=5, 3) backbone coordinates out of an ESMFold output dict, or None.
+
+    The model's exact output keys are a property of the build, so this probes the usual names and
+    reports what it DID find rather than guessing -- a silent None here would look like 'foldseek
+    found no structures' three steps later."""
+    import numpy as np
+    if not hasattr(output, "keys"):
+        return None
+    for k in ("positions", "final_atom_positions", "atom37_positions", "atom_positions",
+              "coords", "all_atom_positions"):
+        if k not in output:
+            continue
+        v = output[k]
+        v = v.detach().float().cpu().numpy() if hasattr(v, "detach") else np.asarray(v)
+        while v.ndim > 3:                       # strip leading recycle/batch/sample axes
+            v = v[-1] if v.shape[0] > 1 and v.ndim == 4 else v[0]
+        if v.ndim == 3 and v.shape[-1] == 3 and v.shape[1] >= 5:
+            return v
+    return None
+
+
+def write_pdb(path, seq, xyz):
+    """Minimal backbone PDB. Only atoms with finite coordinates are emitted, so a model that leaves
+    CB undefined for glycine (or anything else) simply omits it rather than writing NaN."""
+    import numpy as np
+    n = min(len(seq), xyz.shape[0])
+    lines, serial = [], 1
+    for i in range(n):
+        res = _AA3.get(seq[i], "GLY")
+        for j, name, elem in _ATOM37:
+            if j >= xyz.shape[1]:
+                continue
+            x, y, z = (float(c) for c in xyz[i, j])
+            if not all(np.isfinite(v) for v in (x, y, z)):
+                continue
+            if name == "CB" and seq[i] == "G":
+                continue
+            # Column-exact PDB. The fixed-width layout is: 1-6 record, 7-11 serial, 13-16 atom
+            # name, 17 altLoc, 18-20 resName, 22 chain, 23-26 resSeq, 31-38/39-46/47-54 x/y/z.
+            # Gemmi (which foldseek parses with) reads by column, so a single missing space shifts
+            # resName into altLoc and every residue silently becomes unknown.
+            an = f" {name}" if len(name) < 4 else name        # 1-2 char elements are space-padded
+            lines.append(f"ATOM  {serial:>5} {an:<4} {res:>3} A{i + 1:>4}    "
+                         f"{x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          {elem:>2}")
+            serial += 1
+    lines.append("END")
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return serial - 1
+
+
+def _safe_name(sid: str) -> str:
+    """Record id -> a basename foldseek can carry through as its header."""
+    return "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(sid))[:180]
+
+
+def fold_all(todo, scorer, out_path, ocfg, t0, tag="", pdb_dir=None):
+    n_ok, n_pdb, pdb_index = 0, 0, {}
+    if pdb_dir:
+        os.makedirs(pdb_dir, exist_ok=True)
     with open(out_path, "a") as fh:
         for i, (sid, seq) in enumerate(todo):
-            r = scorer.score([seq], num_sampling_steps=ocfg.fold_steps, num_loops=ocfg.fold_loops)
+            if pdb_dir:
+                # score() discards the coordinates, so go through the same private entry point it
+                # uses and keep them. Falls back to score() if this build's output has no usable
+                # coordinate array, so the pLDDT/pTM table never depends on the PDB path working.
+                out = scorer._infer(seq, loops=ocfg.fold_loops, steps=ocfg.fold_steps)
+                xyz = _coords_from(out)
+                if xyz is not None:
+                    base = _safe_name(sid)
+                    if write_pdb(os.path.join(pdb_dir, base + ".pdb"), seq, xyz):
+                        pdb_index[base] = sid
+                        n_pdb += 1
+                elif i == 0:
+                    keys = sorted(out.keys()) if hasattr(out, "keys") else type(out).__name__
+                    print(f"[fold]{tag} WARNING: --pdb-dir given but no coordinate array found in "
+                          f"the model output; keys were {keys}. Folding continues WITHOUT PDBs, so "
+                          f"the self-consistency check will have nothing to read.", flush=True)
+                r = type("R", (), {"per_sequence_plddt": [float(out["plddt"].mean())],
+                                   "per_sequence_ptm": [float(out["ptm"].mean())]})()
+                del out
+            else:
+                r = scorer.score([seq], num_sampling_steps=ocfg.fold_steps,
+                                 num_loops=ocfg.fold_loops)
             fh.write(json.dumps({"id": sid, "length": len(seq), "seq": seq,
                                  "plddt": r.per_sequence_plddt[0],
                                  "ptm": r.per_sequence_ptm[0]}) + "\n")
@@ -299,6 +389,23 @@ def fold_all(todo, scorer, out_path, ocfg, t0, tag=""):
             if (i + 1) % 25 == 0:
                 print(f"[fold]{tag} {i + 1}/{len(todo)} ({time.perf_counter() - t0:.0f}s)",
                       flush=True)
+
+    if pdb_dir and pdb_index:
+        # Sidecar map so the join never has to reverse-engineer a record id out of a filename.
+        # Merged rather than overwritten: ranks and repeated passes both append into one directory.
+        ipath = os.path.join(pdb_dir, "index.json")
+        old = {}
+        if os.path.exists(ipath):
+            try:
+                old = json.load(open(ipath))
+            except Exception:
+                old = {}
+        old.update(pdb_index)
+        tmp = ipath + f".{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(old, fh)
+        os.replace(tmp, ipath)
+        print(f"[fold]{tag} wrote {n_pdb} PDBs to {pdb_dir}", flush=True)
     return n_ok
 
 
@@ -319,6 +426,12 @@ def main():
     ap.add_argument("--min-len", type=int, default=None)
     ap.add_argument("--max-len", type=int, default=None)
     ap.add_argument("--limit", type=int, default=0, help="stop after N sequences per pass (0 = all)")
+    # Opt-in, and off by default, so the pLDDT/pTM path this job exists for is untouched. Writing
+    # PDBs routes folding through scorer._infer to keep the coordinates score() throws away; the
+    # 3Di self-consistency check (src/self_consistency.py) reads them.
+    ap.add_argument("--pdb-dir", default=None,
+                    help="also write one backbone PDB per folded sequence here, for "
+                         "src.self_consistency")
     ap.add_argument("--summarize", action="store_true", help="print the table and exit; no GPU")
     ap.add_argument("--no-ipex", action="store_true")
     args = ap.parse_args()
@@ -387,7 +500,7 @@ def main():
     last_progress = time.perf_counter()
     while True:
         if todo:
-            total += fold_all(todo, scorer, my_out, ocfg, t0, tag)
+            total += fold_all(todo, scorer, my_out, ocfg, t0, tag, pdb_dir=args.pdb_dir)
             last_progress = time.perf_counter()
             # Only rank 0 prints the table; every rank's records are in it, because summarize()
             # globs all the per-rank files. Twelve copies of the same table would bury the log.
