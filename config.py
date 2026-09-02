@@ -42,6 +42,12 @@ AFDB_SHARDS = os.environ.get("PLD2_AFDB_SHARDS", f"{DATASETS_DIR}/afdb_3di_shard
 
 BLOSUM_MAT = os.environ.get("PLD2_BLOSUM", f"{MODELS_DIR}/blosum62-special-MSA.mat")
 
+# Foldseek's 3Di substitution matrix, shipped in the foldseek distribution as data/mat3di.out. It is
+# to the structure track what BLOSUM is to the sequence track, and it ships with the same binary
+# that produced the training labels -- so the corruption process and the tokeniser agree on what
+# "a similar structural state" means.
+MAT3DI = os.environ.get("PLD2_MAT3DI", f"{MODELS_DIR}/mat3di.out")
+
 # --- run outputs ---
 CKPT_DIR = os.environ.get("PLD2_CKPT_DIR", f"{RUNS_DIR}/checkpoints")
 SAMPLES_DIR = os.environ.get("PLD2_SAMPLES_DIR", f"{RUNS_DIR}/samples")   # training-time eval FASTA
@@ -162,7 +168,22 @@ class OptCfg:
     # honest default: Foldseek ships a real 3Di substitution matrix (mat3di.out) and that is the
     # right input here if you can get it, but inventing a similarity structure is worse than
     # declaring none. beta=1 rows are unaffected either way (no substitution channel at all).
-    struct_sub_kernel: str = "uniform"
+    # "mat3di" is Foldseek's own 3Di substitution matrix (config.MAT3DI, shipped as
+    # data/mat3di.out with the binary that produced our labels). "uniform" was the honest default
+    # while nothing was known; the first two-track run then measured the structure track's own local
+    # grammar at H(x_i|x_i-1) = 2.17 against natural 3Di's 2.01, FLAT for all 18k steps -- the model
+    # generating implausible 3Di and matching sequence to it. A uniform kernel means a quarter of
+    # the structure track's corruption (at beta<1) is uniform-random 3Di, i.e. the model is asked to
+    # denoise toward no structure at all, which is a plausible cause of exactly that.
+    # "blosum" is refused: it scores amino-acid exchangeability and the 3Di alphabet only borrows
+    # its letters.
+    struct_sub_kernel: str = "mat3di"
+    # ENTROPY-MATCHED TO BLOSUM, not left at 1.0. mat3di's scores span -17..+9 against BLOSUM62's
+    # -4..+11, so at temp=1.0 its rows come out at 1.24 nats against BLOSUM's 2.10 -- one row puts
+    # 0.98 on a single substitution. The structure track's substitution channel would then be a
+    # near-deterministic process where the sequence track's is a broad one, and beta would not mean
+    # the same thing on the two tracks. 2.28 is the temperature at which the two match (measured).
+    struct_sub_kernel_temp: float = 2.28
     # Multiplier on the structure track's loss. 1.0 weights the two tracks equally per labelled row.
     # Lower it if the structure track dominates early; the tracks' CE values are directly comparable
     # (both are 23-state categoricals) so the log shows immediately whether they are balanced.

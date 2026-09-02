@@ -29,13 +29,17 @@ import torch
 AA = "ACDEFGHIKLMNPQRSTVWY"
 
 
-def load_blosum62(path: str):
-    """Parse a BLOSUM .mat file into {(row_aa, col_aa): score} plus the column-label list."""
+def load_matrix(path: str):
+    """Parse a substitution matrix into {(row, col): score} plus the column-label list.
+
+    Reads BLOSUM .mat and Foldseek's mat3di.out, which share the layout (a header row of symbols,
+    then one row per symbol) and differ only in comment character -- ';' for BLOSUM, '#' for
+    foldseek."""
     labels = None
     score = {}
     with open(path) as f:
         for line in f:
-            if line.startswith(";") or not line.strip():
+            if line.startswith((";", "#")) or not line.strip():
                 continue
             parts = line.split()
             if labels is None:
@@ -45,6 +49,9 @@ def load_blosum62(path: str):
             for clabel, v in zip(labels, vals):
                 score[(rlabel, clabel)] = v
     return score, labels
+
+
+load_blosum62 = load_matrix          # the original name, kept for existing callers
 
 
 def blosum_sub_probs(path: str, temp: float = 1.0, aa: str = AA) -> torch.Tensor:
@@ -108,8 +115,8 @@ def substitution_kernel(path: str, n: int, temp: float = 1.0, aa: str = AA) -> t
     stationary distribution of a mask-free chain; with MASK absorbing, the stationary distribution is
     all-MASK regardless of B, so the only job left for B is to say which substitutions are plausible.
     """
-    assert n >= len(aa), f"n={n} is smaller than the amino-acid alphabet ({len(aa)})"
-    score, _ = load_blosum62(path)
+    assert n >= len(aa), f"n={n} is smaller than the alphabet ({len(aa)})"
+    score, _ = load_matrix(path)
     S = torch.zeros(n, n)                               # 0 = BLOSUM-neutral, used for EOS/PAD
     for i, ai in enumerate(aa):
         for j, aj in enumerate(aa):

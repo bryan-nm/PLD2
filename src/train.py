@@ -41,10 +41,10 @@ import time
 
 import torch
 
-from config import CFG, UNIREF_SHARDS, AFDB_SHARDS, BLOSUM_MAT, CKPT_DIR, SAMPLES_DIR
+from config import CFG, UNIREF_SHARDS, AFDB_SHARDS, BLOSUM_MAT, MAT3DI, CKPT_DIR, SAMPLES_DIR
 from .blosum import substitution_kernel, uniform_substitution_kernel
 from .corruption import CorruptionSchedule
-from .data import MixedShards, ProteinShards, ShardDataset, StepBatchSampler, make_collate
+from .data import DI, MixedShards, ProteinShards, ShardDataset, StepBatchSampler, make_collate
 from .dist import (init_distributed, barrier, cleanup, broadcast_parameters, average_gradients,
                    broadcast_checkpoint_bytes, preallocate_grad_buffer, preallocate_stats_buffer,
                    allreduce_stats)
@@ -94,12 +94,19 @@ def build_struct_schedule(ocfg, mcfg, device):
     span widths -- only the substitution kernel differs, because BLOSUM is a matrix over amino acids
     and carries no meaning over structural states."""
     n = mcfg.vocab_size - 1
-    if ocfg.struct_sub_kernel == "uniform":
+    if ocfg.struct_sub_kernel == "mat3di":
+        if not os.path.exists(MAT3DI):
+            raise FileNotFoundError(
+                f"struct_sub_kernel='mat3di' needs {MAT3DI}. It ships with the foldseek "
+                f"distribution as data/mat3di.out -- copy it there, set PLD2_MAT3DI, or use "
+                f"struct_sub_kernel='uniform'.")
+        B = substitution_kernel(MAT3DI, n, temp=ocfg.struct_sub_kernel_temp, aa=DI)
+    elif ocfg.struct_sub_kernel == "uniform":
         B = uniform_substitution_kernel(n)
     elif ocfg.struct_sub_kernel == "blosum":
         raise ValueError("struct_sub_kernel='blosum' is a category error: BLOSUM scores amino-acid "
                          "exchangeability and the 3Di alphabet only borrows its letters. Use "
-                         "'uniform', or wire in Foldseek's mat3di.")
+                         "'mat3di' (foldseek's own matrix) or 'uniform'.")
     else:
         raise ValueError(f"unknown struct_sub_kernel {ocfg.struct_sub_kernel!r}")
     return CorruptionSchedule(B, mcfg.vocab_size, mcfg.mask_token_id, betas=ocfg.betas,
@@ -332,7 +339,8 @@ def main():
               + ("(amino acid + Foldseek 3Di at the same L positions, separate embeddings and "
                  "heads, INDEPENDENT noise level per track -- shared t would reveal both tracks "
                  f"together and neither could ever inform the other) | 3Di kernel="
-                 f"{ocfg.struct_sub_kernel} struct_weight={ocfg.struct_weight}"
+                 f"{ocfg.struct_sub_kernel}@T={ocfg.struct_sub_kernel_temp} "
+                 f"struct_weight={ocfg.struct_weight}"
                  if two else "(amino acids only)"), flush=True)
         print(f"[train] corruption: kernel={ocfg.sub_kernel} T={sched.T} betas={sched.betas} "
               f"span_width={sched.span_width} "
