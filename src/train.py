@@ -46,7 +46,7 @@ from .blosum import substitution_kernel, uniform_substitution_kernel
 from .corruption import CorruptionSchedule
 from .data import DI, MixedShards, ProteinShards, ShardDataset, StepBatchSampler, make_collate
 from .dist import (init_distributed, barrier, cleanup, broadcast_parameters, average_gradients,
-                   broadcast_checkpoint_bytes, preallocate_grad_buffer, preallocate_stats_buffer,
+                   broadcast_checkpoint_path, preallocate_grad_buffer, preallocate_stats_buffer,
                    allreduce_stats)
 from .metrics import (cross_track_table, flat_len, flatten_kmer, kmer_counts, kmer_line,
                       lcr_counts, mi_from_table, struct_bigram, struct_line, struct_stats,
@@ -436,7 +436,7 @@ def main():
     # --- resume (rank 0 reads latest.txt and broadcasts the BYTES; see dist.py) ---
     start_step = 0
     ckpt_path = find_latest_ckpt(CKPT_DIR) if (env.is_main and not args.fresh) else None
-    raw = None if args.fresh else broadcast_checkpoint_bytes(ckpt_path, dev)
+    resume_path = None if args.fresh else broadcast_checkpoint_path(ckpt_path, dev)
 
     opt = torch.optim.AdamW(model.parameters(), lr=ocfg.lr, weight_decay=ocfg.weight_decay,
                             betas=(0.9, 0.98))
@@ -451,9 +451,14 @@ def main():
     # Built AFTER ipex.optimize so it binds to the optimizer that actually steps.
     lr_sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_lambda(s, ocfg.warmup_steps, total))
 
-    if raw is not None:
-        ck = torch.load(io.BytesIO(raw), map_location=dev, weights_only=True)
-        del raw
+    if resume_path is not None:
+        # map_location="cpu" + mmap: the state dict stays in the mapped FILE and load_state_dict
+        # copies it into the (device) parameters one tensor at a time. map_location=dev instead
+        # materialised all 15.1GB on the tile, on top of a measured 36.8GB training peak.
+        try:
+            ck = torch.load(resume_path, map_location="cpu", mmap=True, weights_only=True)
+        except TypeError:                       # torch < 2.1 has no mmap= argument
+            ck = torch.load(resume_path, map_location="cpu", weights_only=True)
         model.load_state_dict(ck["model"])
         try:
             opt.load_state_dict(ck["opt"])

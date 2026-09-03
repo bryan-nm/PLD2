@@ -160,14 +160,41 @@ def broadcast_parameters(model, src: int = 0):
             torch.distributed.broadcast(p.data, src=src)
 
 
+def broadcast_checkpoint_path(path, device, src: int = 0, maxlen: int = 4096):
+    """Rank `src`'s resume path, agreed by every rank. -> str, or None for "no checkpoint".
+
+    REPLACES broadcasting the checkpoint CONTENT, which does not survive a 1.35B model. That
+    function's own docstring was written around "the same ~650MB checkpoint" -- the 55M model. At
+    1.35B a checkpoint is 15.1GB (5.0 model + 10.1 AdamW), and the byte path cost, per rank, a
+    15.1GB device buffer plus three host copies of the same size: buf.to('cpu'), .numpy().tobytes()
+    (tobytes copies), and the tensors torch.load then built. 45GB a rank, times 12 ranks a node, is
+    543GB against Aurora's 512GB of DDR -- and rank 24 was duly killed by the OOM killer (signal 9)
+    the moment a resume was attempted.
+
+    Only the PATH crosses the fabric now. Both reasons the broadcast existed still hold: the resume
+    decision stays unanimous by construction (a rank that disagreed about whether a checkpoint
+    exists would hang the job), and the I/O is not a storm, because every rank memory-maps the SAME
+    file and the twelve ranks on a node share one page cache for it -- roughly one read per node
+    rather than one per rank.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return path
+    rank = torch.distributed.get_rank()
+    buf = torch.zeros(maxlen, dtype=torch.uint8, device=device)
+    if rank == src and path is not None:
+        b = str(path).encode()[:maxlen - 1]
+        buf[:len(b)] = torch.tensor(list(b), dtype=torch.uint8, device=device)
+    torch.distributed.broadcast(buf, src=src)
+    raw = bytes(buf.to("cpu").numpy().tobytes()).split(b"\x00", 1)[0]
+    return raw.decode() or None
+
+
 def broadcast_checkpoint_bytes(path, device, src: int = 0):
     """Rank `src` reads `path` and broadcasts the raw bytes; every rank returns identical bytes
     (or None if `path` is None on `src`, i.e. there is no checkpoint to resume).
 
-    Only ONE rank touches the filesystem. Having all 192 ranks torch.load the same ~650MB checkpoint
-    off flare at once is an I/O storm that can stall a job for minutes; a fabric broadcast is far
-    cheaper. It also makes the resume decision unanimous by construction -- if each rank resolved
-    latest.txt itself, a rank that disagreed about whether a checkpoint exists would hang the job.
+    SUPERSEDED by broadcast_checkpoint_path for anything above a few hundred MB -- see there for the
+    measured reason. Kept because it is correct for small checkpoints and cheap to leave in place.
     """
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         if path is None:
