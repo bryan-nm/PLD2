@@ -460,8 +460,28 @@ def main():
         except TypeError:                       # torch < 2.1 has no mmap= argument
             ck = torch.load(resume_path, map_location="cpu", weights_only=True)
         model.load_state_dict(ck["model"])
+        # BACK TO THE DEVICE, EXPLICITLY, AND BEFORE THE OPTIMIZER LOAD.
+        # load_state_dict is documented to copy in place and preserve each parameter's device, and
+        # under stock PyTorch it does. This model has been through ipex.optimize first, and there it
+        # does not: loading a CPU state dict left the parameters on the HOST, and the first forward
+        # died with "index is on xpu:9, different from other tensors on cpu" inside self.embed.
+        # The move has to happen before opt.load_state_dict, which casts each state tensor to its
+        # parameter's device -- with CPU parameters the whole optimizer state would follow them
+        # there and the failure would move rather than disappear.
+        model.to(dev)
+        off = [n for n, t in list(model.named_parameters()) + list(model.named_buffers())
+               if t.device.type != dev.type]
+        if off:
+            raise RuntimeError(
+                f"after resume, {len(off)} model tensor(s) are not on {dev.type} (e.g. {off[:4]}). "
+                f"A CPU state dict was loaded and the device was not restored; the first forward "
+                f"would fail inside the embedding. See the note above this check.")
         try:
             opt.load_state_dict(ck["opt"])
+            bad = [k for st in opt.state.values() for k, v in st.items()
+                   if torch.is_tensor(v) and v.is_floating_point() and v.device.type != dev.type]
+            if bad:
+                raise RuntimeError(f"optimizer state landed on the host ({len(bad)} tensor(s))")
         except Exception as ex:
             if env.is_main:
                 print(f"[ckpt] optimizer state not restored ({ex}); re-warming moments.", flush=True)
