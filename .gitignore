@@ -22,5 +22,12 @@ samples/
 *.idx
 *_shards/
 
+# PBS job output. `#PBS -j oe` merges stdout+stderr into <jobname>.o<jobid> in the submit
+# directory, which is the repo root -- so every run drops a log next to the source and a
+# `git add -A` sweeps it in. Three of them (1.6MB) reached main that way before this existed.
+*.o[0-9]*
+*.e[0-9]*
+*.log
+
 # Local env overrides
 .env

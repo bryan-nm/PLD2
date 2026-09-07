@@ -69,23 +69,50 @@ from .blosum import AA
 # ---------------------------------------------------------------------------
 # mini-embed-filip import
 # ---------------------------------------------------------------------------
+# The four modules below import only stdlib, torch and numpy -- no intra-repo imports -- which is
+# what makes loading them by PATH safe.
+_MINI_EMBED_FILES = {"config": "config.py", "encoders": "src/encoders.py",
+                     "model": "src/model.py", "losses": "src/losses.py", "data": "src/data.py"}
+
+
 def _mini_embed(repo: str = None):
-    """Import mini-embed-filip's encoders / model / losses / data / config."""
+    """Load mini-embed-filip's config / encoders / model / losses / data.
+
+    BY FILE PATH, UNDER PRIVATE NAMES, because both repos are laid out the same way and a plain
+    import collides twice. PLD2 runs as `python -m src.sweep_sampler`, so `src` is already in
+    sys.modules as PLD2's package and `import src.encoders` resolves against it -- "No module named
+    'src.encoders'". `config` collides identically: PLD2 has its own, already imported. Putting the
+    repo on sys.path cannot fix either, since sys.modules is consulted first.
+    """
+    import importlib.util
     repo = repo or MINI_EMBED_REPO
     if not os.path.isdir(repo):
         raise SystemExit(
             f"mini-embed-filip not found at {repo}. It provides the AMPLIFY loader (with the "
             f"Aurora xformers stub, RoPE rematerialisation and SDPA patches), the FILIP model and "
             f"the packed text cache reader. Set PLD2_MINI_EMBED_REPO.")
-    if repo not in sys.path:
-        sys.path.insert(0, repo)
-    import importlib
     mods = {}
-    for name in ("config", "src.encoders", "src.model", "src.losses", "src.data"):
+    for name, rel in _MINI_EMBED_FILES.items():
+        path = os.path.join(repo, rel)
+        if not os.path.exists(path):
+            raise SystemExit(f"{path} is missing; is {repo} really mini-embed-filip?")
+        key = f"_mini_embed_filip_{name}"
+        if key in sys.modules:
+            mods[name] = sys.modules[key]
+            continue
+        spec = importlib.util.spec_from_file_location(key, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[key] = mod
         try:
-            mods[name.split(".")[-1]] = importlib.import_module(name)
+            spec.loader.exec_module(mod)
         except Exception as ex:                       # noqa: BLE001 - surface the real cause
-            raise SystemExit(f"importing {name} from {repo} failed: {type(ex).__name__}: {ex}")
+            del sys.modules[key]
+            raise SystemExit(
+                f"loading {path} failed: {type(ex).__name__}: {ex}\n"
+                f"These modules are loaded standalone, so an intra-repo import added to one of "
+                f"them would surface here rather than resolving against PLD2's own src/ or "
+                f"config.py -- which is the point.")
+        mods[name] = mod
     return mods
 
 
@@ -218,7 +245,10 @@ class FilipGuidance:
         assert mode in ("tag", "deg"), mode
         assert likelihood in ("sigmoid", "softmax_bank"), likelihood
         mods = _mini_embed(repo)
-        mcfg = mods["config"].CFG if hasattr(mods["config"], "CFG") else mods["config"].cfg
+        # default_cfg(), not a module-level CFG: mini-embed builds its config with a factory, and
+        # build_retrieval falls back to `from config import default_cfg` when passed None -- which
+        # from inside PLD2 would import PLD2's config. Always pass it explicitly.
+        mcfg = mods["config"].default_cfg()
         self.mods, self.cfg, self.device = mods, cfg, device
         self.gamma, self.mode, self.likelihood = float(gamma), mode, likelihood
         self.tag_normalize = bool(tag_normalize)

@@ -79,3 +79,34 @@ print(f"   all-MASK canvas -> live.any() = {bool(live0.any())}  "
 assert not bool(live0.any())
 
 print("\nall bridge invariants hold")
+
+
+print("\n6. MINI-EMBED LOADS WITHOUT COLLIDING WITH PLD2's OWN src/ AND config.py")
+# This section only means anything when run as `python -m src.tests_filip`, because that is what
+# puts PLD2's `src` into sys.modules -- which is exactly the condition under which a plain
+# `import src.encoders` resolves against PLD2 and dies with "No module named 'src.encoders'".
+import os
+import sys
+
+from config import MINI_EMBED_REPO
+from .filip_guidance import _mini_embed
+
+print(f"   PLD2's 'src' is already imported: {'src' in sys.modules}")
+repo = os.environ.get("PLD2_MINI_EMBED_REPO", MINI_EMBED_REPO)
+if not os.path.isdir(repo):
+    print(f"   SKIP: mini-embed-filip not present at {repo}. Set PLD2_MINI_EMBED_REPO to run this "
+          f"section; it is the one that catches the name collision.")
+else:
+    mods = _mini_embed(repo)
+    for k in ("config", "encoders", "model", "losses", "data"):
+        assert repo in mods[k].__file__, f"{k} came from {mods[k].__file__}, not {repo}"
+    print(f"   loaded {sorted(mods)} from {repo}")
+    assert sys.modules["src"].__path__[0].endswith("PLD2/src"), "PLD2's src was displaced"
+    print(f"   PLD2's src still points at {sys.modules['src'].__path__[0]}")
+    cfg2 = mods["config"].default_cfg()
+    print(f"   mini-embed config reachable: protein_hidden={cfg2.model.protein_hidden} "
+          f"text_hidden={cfg2.model.text_hidden} embed_dim={cfg2.model.embed_dim}")
+    assert callable(mods["losses"].filip_score_matrix)
+    assert hasattr(mods["data"], "PackedPerTokenCache")
+
+print("\nall FILIP guidance invariants hold")
