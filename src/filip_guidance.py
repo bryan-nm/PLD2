@@ -224,6 +224,48 @@ class PromptCache:
         return z, M.to(device)
 
 
+def _input_embedding(model, tok) -> torch.nn.Embedding:
+    """The module whose output TAG differentiates with respect to.
+
+    `hasattr(model, "get_input_embeddings")` is NOT a usable test. Transformers defines the method
+    on the base class, so it is always present, and AMPLIFY does not override it -- calling it
+    raises NotImplementedError rather than returning None. So call it and catch, then fall back to
+    finding the embedding by shape: the one whose row count matches the tokenizer's vocabulary.
+    """
+    try:
+        emb = model.get_input_embeddings()
+        if isinstance(emb, torch.nn.Embedding):
+            return emb
+    except (NotImplementedError, AttributeError):
+        pass
+    vocab = len(getattr(tok, "get_vocab", dict)()) or None
+    named = [(n, m) for n, m in model.named_modules() if isinstance(m, torch.nn.Embedding)]
+    if not named:
+        raise SystemExit(
+            "no nn.Embedding found in the protein encoder, so TAG has nothing to differentiate "
+            "with respect to. Use --guide-mode deg, which needs no gradient.")
+    # Prefer a token embedding (rows == vocabulary) over any positional/auxiliary table.
+    exact = [(n, m) for n, m in named if vocab and m.num_embeddings == vocab]
+    if not exact:
+        if len(named) > 1:
+            # Guessing here is worse than stopping. A positional table is typically LARGER than the
+            # token table, so "take the biggest" picks the wrong one, and TAG would then index it
+            # with token ids and produce a confident, meaningless guidance signal.
+            raise SystemExit(
+                f"cannot identify the token embedding: the tokenizer's vocabulary size is unknown "
+                f"and the encoder has {len(named)} embeddings "
+                f"({[(n, m.num_embeddings) for n, m in named]}). Guiding against the wrong table "
+                f"would produce a plausible-looking signal that means nothing, so this refuses "
+                f"rather than guesses. Use --guide-mode deg, which needs no gradient.")
+        exact = named
+    name, mod = exact[0]
+    print(f"[filip] TAG differentiates at '{name}' "
+          f"({mod.num_embeddings} x {mod.embedding_dim}; tokenizer vocab {vocab})"
+          + (f"; {len(named)} embeddings present, others "
+             f"{[n for n, _ in named if n != name]}" if len(named) > 1 else ""), flush=True)
+    return mod
+
+
 # ---------------------------------------------------------------------------
 # the guidance hook
 # ---------------------------------------------------------------------------
@@ -270,12 +312,16 @@ class FilipGuidance:
 
         # AMPLIFY's input embedding: TAG differentiates with respect to its OUTPUT, and the residue
         # rows of its weight are what a gradient is projected onto.
-        emb = (self.amp.get_input_embeddings() if hasattr(self.amp, "get_input_embeddings")
-               else next(m for m in self.amp.modules() if isinstance(m, torch.nn.Embedding)))
-        if emb is None:
-            raise SystemExit("could not locate AMPLIFY's input embedding; TAG needs it. "
-                             "Use --guide-mode deg.")
-        self.emb_module = emb
+        self.emb_module = _input_embedding(self.amp, self.amp_tok)
+        emb = self.emb_module
+        # The residue rows TAG projects gradients onto. Bounds-checked: if the module located above
+        # were a positional table rather than the token table, this indexing would either throw or
+        # silently read unrelated rows, and the guidance would look fine and mean nothing.
+        if int(self.bridge.aa_ids.max()) >= emb.num_embeddings:
+            raise SystemExit(
+                f"'{getattr(emb, '_filip_name', 'embedding')}' has {emb.num_embeddings} rows but "
+                f"the tokenizer puts residues up to id {int(self.bridge.aa_ids.max())}. That is "
+                f"not the token embedding. Use --guide-mode deg.")
         self.E_aa = emb.weight.detach()[self.bridge.aa_ids]        # [20, d]
         self.calls = 0
         if verbose:
