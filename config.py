@@ -48,6 +48,22 @@ BLOSUM_MAT = os.environ.get("PLD2_BLOSUM", f"{MODELS_DIR}/blosum62-special-MSA.m
 # "a similar structural state" means.
 MAT3DI = os.environ.get("PLD2_MAT3DI", f"{MODELS_DIR}/mat3di.out")
 
+# --- FILIP prompt guidance (src/filip_guidance.py, optional) ---------------------------------
+# A trained text<->protein co-embedding used as a ProteinGuide-style Bayesian classifier:
+# generation is steered by reweighting PLD2's unconditional logits by p(prompt | sequence)^gamma.
+# MINI_EMBED_REPO is imported rather than vendored -- loading AMPLIFY on Aurora needs an xformers
+# stub, a RoPE-cache rematerialisation and two SDPA patches that were established the hard way in
+# that repo, and a second copy of them would rot.
+MINI_EMBED_REPO = os.environ.get(
+    "PLD2_MINI_EMBED_REPO",
+    "/flare/NLDesignProtein/bryan/FILIP-dev-space/small_scale_training/mini-embed-filip")
+FILIP_CKPT = os.environ.get(
+    "PLD2_FILIP_CKPT", f"{MINI_EMBED_REPO}/checkpoints/hard_masking/epoch49.pt")
+# Packed per-token encoder cache: text_h.bin / text_offsets.pt / text_mask.bin plus pair_ids.json.
+# The TEXT side is precomputed, so guidance never loads BioLinkBERT -- only the 768->16 projection
+# head out of the checkpoint. The PROTEIN side cannot be cached: the canvas changes every step.
+FILIP_CACHE = os.environ.get("PLD2_FILIP_CACHE", f"{MINI_EMBED_REPO}/cache")
+
 # --- run outputs ---
 CKPT_DIR = os.environ.get("PLD2_CKPT_DIR", f"{RUNS_DIR}/checkpoints")
 SAMPLES_DIR = os.environ.get("PLD2_SAMPLES_DIR", f"{RUNS_DIR}/samples")   # training-time eval FASTA

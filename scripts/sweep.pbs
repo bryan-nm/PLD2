@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
 #PBS -N pld2_sweep
-#PBS -l walltime=01:00:00
+#PBS -l walltime=04:00:00
 #PBS -l select=1
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fs
@@ -24,16 +24,28 @@
 # was in flight, and re-running the sweep after a NEW checkpoint re-folds properly (same filenames,
 # different sequences -> different content key).
 #
+# WALLTIME IS 4h, NOT 1h. The configuration set now includes nr_steps4x (four times the decoding
+# steps) and nr_best8 (eight candidate draws per slot), so the slowest configuration costs ~8x the
+# baseline one. Trim with --only if the queue is tight.
+#
+# PHASE 1b, CONDITIONAL GENERATION, runs only when GUIDE_PROMPT is set. FILIP guidance replaces the
+# configuration set with one row per gamma -- including gamma=0, which is the unconditional control
+# generated through the identical code path -- so the guided and unguided rows land in the same
+# fold table with the same natural/shuffled reference lines.
+#
 #   qsub scripts/sweep.pbs
 #   qsub -v N=128 scripts/sweep.pbs                        # more sequences per configuration
 #   qsub -v SWEEP_ARGS="--only no_reppen,nr_t0.8" scripts/sweep.pbs
 #   qsub -v CKPT=/path/to/ckpt_00049999.pt scripts/sweep.pbs
+#   qsub -v GUIDE_PROMPT=P12345 scripts/sweep.pbs          # condition on a cached SwissProt caption
+#   qsub -v GUIDE_PROMPT=17,GUIDE_ARGS="--guide-gammas 0,0.5,2,5" scripts/sweep.pbs
 cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./scripts/pbs_common.sh
 
 N=${N:-64}                                  # sequences per configuration
 SAMPLES=$(python -c "from config import SAMPLES_DIR; print(SAMPLES_DIR)")
-job_banner "PLD2 sampler sweep (generate -> fold -> summarise)" N SAMPLES CKPT SWEEP_ARGS FOLD_ARGS
+job_banner "PLD2 sampler sweep (generate -> fold -> summarise)" N SAMPLES CKPT SWEEP_ARGS \
+           GUIDE_PROMPT GUIDE_ARGS FOLD_ARGS
 
 CKPT_FLAG=""
 [ -n "${CKPT:-}" ] && CKPT_FLAG="--ckpt ${CKPT}"
@@ -44,6 +56,19 @@ echo "[sweep] phase 1/3: generating ${N} sequences per configuration on ${NRANKS
 "${MPI_LAUNCH[@]}" python -m src.sweep_sampler --device xpu --n "${N}" ${CKPT_FLAG} ${SWEEP_ARGS:-}
 rc=$?
 if [ $rc -ne 0 ]; then echo "[sweep] generation failed (rc=$rc); nothing to fold." >&2; exit $rc; fi
+
+# --- phase 1b: conditional generation, only when a prompt is named --------------------------
+# A separate invocation because guidance REPLACES the configuration set: every row here is the same
+# decode with a different guidance strength, and gamma=0 is the control. Failure is not fatal --
+# the unconditional rows from phase 1 are still worth folding.
+if [ -n "${GUIDE_PROMPT:-}" ]; then
+    echo "[sweep] phase 1b: FILIP-conditioned generation on prompt '${GUIDE_PROMPT}'"
+    # shellcheck disable=SC2086
+    "${MPI_LAUNCH[@]}" python -m src.sweep_sampler --device xpu --n "${N}" ${CKPT_FLAG} \
+        --guide-prompt "${GUIDE_PROMPT}" ${GUIDE_ARGS:-}
+    grc=$?
+    [ $grc -ne 0 ] && echo "[sweep] conditional round failed (rc=$grc); folding the rest." >&2
+fi
 
 # --- phase 2: fold every sweep FASTA --------------------------------------------------------
 # Only the sweep_*.fasta files: the step_*.fasta from training are already scored and would be
