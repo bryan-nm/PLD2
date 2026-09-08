@@ -224,7 +224,7 @@ class PromptCache:
         return z, M.to(device)
 
 
-def _input_embedding(model, tok) -> torch.nn.Embedding:
+def _input_embedding(model, tok, verbose: bool = True) -> torch.nn.Embedding:
     """The module whose output TAG differentiates with respect to.
 
     `hasattr(model, "get_input_embeddings")` is NOT a usable test. Transformers defines the method
@@ -259,10 +259,11 @@ def _input_embedding(model, tok) -> torch.nn.Embedding:
                 f"rather than guesses. Use --guide-mode deg, which needs no gradient.")
         exact = named
     name, mod = exact[0]
-    print(f"[filip] TAG differentiates at '{name}' "
+    if verbose:
+        print(f"[filip] TAG differentiates at '{name}' "
           f"({mod.num_embeddings} x {mod.embedding_dim}; tokenizer vocab {vocab})"
-          + (f"; {len(named)} embeddings present, others "
-             f"{[n for n, _ in named if n != name]}" if len(named) > 1 else ""), flush=True)
+              + (f"; {len(named)} embeddings present, others "
+                 f"{[n for n, _ in named if n != name]}" if len(named) > 1 else ""), flush=True)
     return mod
 
 
@@ -282,7 +283,7 @@ class FilipGuidance:
     def __init__(self, cfg, device, *, ckpt=FILIP_CKPT, cache_dir=FILIP_CACHE,
                  repo=None, gamma: float = 1.0, mode: str = "tag",
                  likelihood: str = "sigmoid", tag_normalize: bool = True,
-                 deg_positions: int = 4, deg_candidates: int = 8,
+                 deg_positions: int = 4, deg_candidates: int = 8, chunk: int = 8,
                  bank_rows: Optional[Sequence[int]] = None, verbose: bool = True):
         assert mode in ("tag", "deg"), mode
         assert likelihood in ("sigmoid", "softmax_bank"), likelihood
@@ -295,6 +296,7 @@ class FilipGuidance:
         self.gamma, self.mode, self.likelihood = float(gamma), mode, likelihood
         self.tag_normalize = bool(tag_normalize)
         self.deg_positions, self.deg_candidates = int(deg_positions), int(deg_candidates)
+        self.chunk = max(1, int(chunk))
 
         self.filip = mods["model"].load_retrieval(ckpt, device, mcfg, freeze=True)
         self.scale = float(self.filip.logit_scale.exp().item())
@@ -312,7 +314,7 @@ class FilipGuidance:
 
         # AMPLIFY's input embedding: TAG differentiates with respect to its OUTPUT, and the residue
         # rows of its weight are what a gradient is projected onto.
-        self.emb_module = _input_embedding(self.amp, self.amp_tok)
+        self.emb_module = _input_embedding(self.amp, self.amp_tok, verbose=verbose)
         emb = self.emb_module
         # The residue rows TAG projects gradients onto. Bounds-checked: if the module located above
         # were a positional table rather than the token table, this indexing would either throw or
@@ -327,7 +329,7 @@ class FilipGuidance:
         if verbose:
             print(f"[filip] ckpt={ckpt}\n[filip] encoder={mcfg.model.protein_encoder_path} "
                   f"| prompts cached: {len(self.prompts)} rows | mode={mode} "
-                  f"likelihood={likelihood} gamma={gamma}", flush=True)
+                  f"likelihood={likelihood} gamma={gamma} chunk={self.chunk}", flush=True)
 
     # --- prompt ------------------------------------------------------------
     def set_target(self, row) -> str:
@@ -377,7 +379,37 @@ class FilipGuidance:
         return out
 
     def _tag(self, ids, attn, live):
-        """[B, L, 20] first-order guidance from one forward + backward."""
+        """[B, L, 20] first-order guidance.
+
+        CHUNKED AND LENGTH-TRIMMED, because the backward is what costs. AMPLIFY's attention on XPU
+        goes through a MANUAL sdpa (the fused kernel segfaults there past ~512 tokens), which
+        materialises a [B, heads, L, L] score matrix -- and with grad enabled every one of the 32
+        layers keeps its own for the backward. At batch 64 on a 514-token canvas that is 30GB of
+        attention alone, on a tile already holding PLD2: UR_RESULT_ERROR_OUT_OF_RESOURCES.
+
+        Chunking is EXACT, not an approximation: log p(prompt | x) sums over independent rows, so
+        each row's gradient is unaffected by which other rows share its forward. Trimming to the
+        batch's real extent compounds it -- the canvas is 512 wide but a decoded protein is ~250,
+        and the attention matrix goes as L^2, so the padding costs 4x what the molecule does.
+        """
+        B, L = live.shape
+        # PAD is attention-masked already, but it still occupies the L x L score matrix.
+        extent = int(attn.sum(1).max().item())
+        keep = min(max(extent, 4), ids.shape[1])
+        ids, attn = ids[:, :keep], attn[:, :keep]
+        live_t = live[:, :max(keep - 2, 0)]
+        parts = []
+        for s0 in range(0, B, self.chunk):
+            s1 = min(s0 + self.chunk, B)
+            parts.append(self._tag_chunk(ids[s0:s1], attn[s0:s1], live_t[s0:s1]))
+        g = torch.cat(parts, dim=0)
+        # Scatter back onto the full canvas width; trimmed positions were all PAD.
+        full = torch.zeros(B, L, g.shape[-1], device=g.device, dtype=g.dtype)
+        full[:, :g.shape[1]] = g
+        return full
+
+    def _tag_chunk(self, ids, attn, live):
+        """[b, L, 20] for one chunk of rows."""
         L = live.shape[1]
         captured = {}
 
@@ -392,6 +424,15 @@ class FilipGuidance:
             with torch.enable_grad():
                 z_p, mask_p = self._encode(ids, attn, live)
                 self._log_prob(z_p, mask_p).sum().backward()
+        except RuntimeError as ex:
+            if "OUT_OF_RESOURCES" in str(ex) or "out of memory" in str(ex).lower():
+                raise SystemExit(
+                    f"the classifier ran out of device memory at chunk={self.chunk}, "
+                    f"L={ids.shape[1]}. AMPLIFY's manual attention keeps a "
+                    f"[chunk, 15, L, L] matrix per layer for the backward, so the cost is linear in "
+                    f"chunk and quadratic in length: lower --guide-chunk (4, or 2), or use "
+                    f"--guide-mode deg, which needs no gradient.") from ex
+            raise
         finally:
             h.remove()
         g = captured["e"].grad
@@ -399,7 +440,7 @@ class FilipGuidance:
             raise RuntimeError("no gradient reached AMPLIFY's embedding output; TAG cannot run")
         # <grad_i, E[c]>. The <grad_i, e_i> term of the Taylor expansion depends only on the
         # position, so it is constant across candidates and vanishes under the softmax -- dropped.
-        delta = g[:, 1:L + 1, :].detach().float() @ self.E_aa.float().t()      # [B, L, 20]
+        delta = g[:, 1:L + 1, :].detach().float() @ self.E_aa.float().t()      # [b, L, 20]
         if self.tag_normalize:
             # The gradient's SCALE varies by orders of magnitude across a decode (it depends on how
             # many positions are committed and how peaked the max-sim is), so an unnormalised gamma

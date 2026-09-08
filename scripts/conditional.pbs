@@ -32,6 +32,7 @@
 #   qsub -v GUIDE_BEST=8 scripts/conditional.pbs            # compose with the best-of-n win
 #   qsub -v GUIDE_MODE=deg scripts/conditional.pbs          # exact enumeration, far slower
 #   qsub -v N=32,GAMMAS=0,1 scripts/conditional.pbs         # a quick look
+#   qsub -v GUIDE_CHUNK=4 scripts/conditional.pbs           # if the classifier OOMs
 cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./scripts/pbs_common.sh
 
@@ -41,10 +42,15 @@ GAMMAS=${GAMMAS:-0,0.5,1,2,5}               # 0 is the unconditional control
 GUIDE_MODE=${GUIDE_MODE:-tag}
 GUIDE_LIKELIHOOD=${GUIDE_LIKELIHOOD:-sigmoid}
 GUIDE_BEST=${GUIDE_BEST:-1}
+# Rows per classifier forward/backward. TAG's backward keeps a [chunk, 15, L, L] attention matrix
+# per AMPLIFY layer, 32 of them, so peak memory is linear in this and quadratic in length: at
+# chunk=64 on a 514-token canvas that is 30GB of attention on a tile already holding PLD2, which is
+# the UR_RESULT_ERROR_OUT_OF_RESOURCES the first attempt hit. 8 costs ~3.8GB before trimming.
+GUIDE_CHUNK=${GUIDE_CHUNK:-8}
 SAMPLES=$(python -c "from config import SAMPLES_DIR; print(SAMPLES_DIR)")
 
 job_banner "PLD2 conditional generation sweep" N PROMPTS GAMMAS GUIDE_MODE GUIDE_LIKELIHOOD \
-           GUIDE_BEST SAMPLES CKPT
+           GUIDE_BEST GUIDE_CHUNK SAMPLES CKPT
 
 CKPT_FLAG=""
 [ -n "${CKPT:-}" ] && CKPT_FLAG="--ckpt ${CKPT}"
@@ -61,7 +67,7 @@ for prompt in "${PROMPT_LIST[@]}"; do
     "${MPI_LAUNCH[@]}" python -m src.sweep_sampler --device xpu --n "${N}" ${CKPT_FLAG} \
         --guide-prompt "${prompt}" --guide-gammas "${GAMMAS}" \
         --guide-mode "${GUIDE_MODE}" --guide-likelihood "${GUIDE_LIKELIHOOD}" \
-        --guide-best "${GUIDE_BEST}" ${GUIDE_ARGS:-}
+        --guide-best "${GUIDE_BEST}" --guide-chunk "${GUIDE_CHUNK}" ${GUIDE_ARGS:-}
     rc=$?
     if [ $rc -eq 0 ]; then n_ok=$((n_ok + 1))
     else echo "[cond] prompt '${prompt}' failed (rc=$rc); continuing with the rest." >&2; fi

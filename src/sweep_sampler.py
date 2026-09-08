@@ -155,6 +155,10 @@ def main():
     ap.add_argument("--guide-likelihood", default="sigmoid", choices=("sigmoid", "softmax_bank"))
     ap.add_argument("--guide-bank", default=None,
                     help="comma-separated cache rows for softmax_bank normalisation")
+    ap.add_argument("--guide-chunk", type=int, default=8,
+                    help="rows per classifier forward/backward. AMPLIFY keeps a [chunk,15,L,L] "
+                         "attention matrix per layer for TAG's backward, so peak memory is linear "
+                         "in this; lower it on an OUT_OF_RESOURCES")
     ap.add_argument("--guide-best", type=int, default=1,
                     help="best-of-N on top of guidance (the two are independent wins and compose)")
     ap.add_argument("--filip-ckpt", default=None)
@@ -196,7 +200,7 @@ def main():
         guide = FilipGuidance(mcfg, dev, ckpt=args.filip_ckpt or FILIP_CKPT,
                               cache_dir=args.filip_cache or FILIP_CACHE,
                               mode=args.guide_mode, likelihood=args.guide_likelihood,
-                              bank_rows=bank, verbose=(env.rank == 0))
+                              chunk=args.guide_chunk, bank_rows=bank, verbose=(env.rank == 0))
         name = guide.set_target(args.guide_prompt)
         if env.rank == 0:
             print(f"[filip] conditioning on prompt row {args.guide_prompt} ({name})", flush=True)
