@@ -27,18 +27,31 @@
 # knob that moved pTM bought it with degeneracy. GUIDE_BEST turns it on here; leave it at 1 for a
 # clean read on guidance alone, then raise it once gamma is chosen.
 #
+# SEPARATE LIST ITEMS WITH COLONS, NOT COMMAS. `qsub -v` uses the comma to separate VARIABLES, so
+# `-v PROMPTS=0,17,42` is read as PROMPTS=0 followed by a bare token `17`, and qsub rejects the
+# whole submission with "cannot send environment with the job". PROMPTS and GAMMAS accept ':' and
+# translate it below, so the comma never has to survive qsub's parser.
+#
 #   qsub scripts/conditional.pbs
-#   qsub -v PROMPTS=0,17,42,GAMMAS=0,1,3 scripts/conditional.pbs
+#   qsub -v PROMPTS=0:17:42,GAMMAS=0:1:3 scripts/conditional.pbs
 #   qsub -v GUIDE_BEST=8 scripts/conditional.pbs            # compose with the best-of-n win
 #   qsub -v GUIDE_MODE=deg scripts/conditional.pbs          # exact enumeration, far slower
-#   qsub -v N=32,GAMMAS=0,1 scripts/conditional.pbs         # a quick look
+#   qsub -v N=32,GAMMAS=0:1 scripts/conditional.pbs         # a quick look
 #   qsub -v GUIDE_CHUNK=4 scripts/conditional.pbs           # if the classifier OOMs
+#
+# Prompts should be SPREAD ACROSS THE CACHE, not adjacent. The cache is in accession order, so
+# consecutive rows are frequently paralogs or isoforms whose captions read almost the same -- and
+# the specificity test in phase 4 asks whether a sample scores higher against its own prompt than
+# the others. Near-identical prompts make that discrimination impossible whether or not guidance
+# works, so a flat margin would say nothing. The default is deliberately spread.
 cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./scripts/pbs_common.sh
 
 N=${N:-64}                                  # sequences per (prompt, gamma)
-PROMPTS=${PROMPTS:-0,1,2}                   # cache rows or accessions
-GAMMAS=${GAMMAS:-0,0.5,1,2,5}               # 0 is the unconditional control
+PROMPTS=${PROMPTS:-0:150000:300000}         # cache rows or accessions; ':' or ',' separated
+GAMMAS=${GAMMAS:-0:0.5:1:2:5}               # 0 is the unconditional control
+PROMPTS=${PROMPTS//:/,}                     # qsub -v cannot carry a comma INSIDE a value
+GAMMAS=${GAMMAS//:/,}
 GUIDE_MODE=${GUIDE_MODE:-tag}
 GUIDE_LIKELIHOOD=${GUIDE_LIKELIHOOD:-sigmoid}
 GUIDE_BEST=${GUIDE_BEST:-1}

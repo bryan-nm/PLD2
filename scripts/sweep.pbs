@@ -38,14 +38,20 @@
 #   qsub -v SWEEP_ARGS="--only no_reppen,nr_t0.8" scripts/sweep.pbs
 #   qsub -v CKPT=/path/to/ckpt_00049999.pt scripts/sweep.pbs
 #   qsub -v GUIDE_PROMPT=P12345 scripts/sweep.pbs          # condition on a cached SwissProt caption
-#   qsub -v GUIDE_PROMPT=17,GUIDE_ARGS="--guide-gammas 0,0.5,2,5" scripts/sweep.pbs
+#   qsub -v GUIDE_PROMPT=17,GUIDE_GAMMAS=0:0.5:2:5 scripts/sweep.pbs
+#
+# Colons, not commas, in GUIDE_GAMMAS: `qsub -v` separates VARIABLES on commas, so a comma inside a
+# value ends the assignment and qsub rejects the submission with "cannot send environment with the
+# job". The script translates ':' to ',' before passing it on.
 cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./scripts/pbs_common.sh
 
 N=${N:-64}                                  # sequences per configuration
 SAMPLES=$(python -c "from config import SAMPLES_DIR; print(SAMPLES_DIR)")
+GUIDE_GAMMAS=${GUIDE_GAMMAS:-0:1:3:10}
+GUIDE_GAMMAS=${GUIDE_GAMMAS//:/,}
 job_banner "PLD2 sampler sweep (generate -> fold -> summarise)" N SAMPLES CKPT SWEEP_ARGS \
-           GUIDE_PROMPT GUIDE_ARGS FOLD_ARGS
+           GUIDE_PROMPT GUIDE_GAMMAS GUIDE_ARGS FOLD_ARGS
 
 CKPT_FLAG=""
 [ -n "${CKPT:-}" ] && CKPT_FLAG="--ckpt ${CKPT}"
@@ -65,7 +71,7 @@ if [ -n "${GUIDE_PROMPT:-}" ]; then
     echo "[sweep] phase 1b: FILIP-conditioned generation on prompt '${GUIDE_PROMPT}'"
     # shellcheck disable=SC2086
     "${MPI_LAUNCH[@]}" python -m src.sweep_sampler --device xpu --n "${N}" ${CKPT_FLAG} \
-        --guide-prompt "${GUIDE_PROMPT}" ${GUIDE_ARGS:-}
+        --guide-prompt "${GUIDE_PROMPT}" --guide-gammas "${GUIDE_GAMMAS}" ${GUIDE_ARGS:-}
     grc=$?
     [ $grc -ne 0 ] && echo "[sweep] conditional round failed (rc=$grc); folding the rest." >&2
 fi
