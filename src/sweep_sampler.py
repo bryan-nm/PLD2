@@ -155,6 +155,8 @@ def main():
     ap.add_argument("--guide-likelihood", default="sigmoid", choices=("sigmoid", "softmax_bank"))
     ap.add_argument("--guide-bank", default=None,
                     help="comma-separated cache rows for softmax_bank normalisation")
+    ap.add_argument("--guide-best", type=int, default=1,
+                    help="best-of-N on top of guidance (the two are independent wins and compose)")
     ap.add_argument("--filip-ckpt", default=None)
     ap.add_argument("--filip-cache", default=None)
     args = ap.parse_args()
@@ -202,11 +204,14 @@ def main():
                     gumbel_temp=ocfg.sample_gumbel_temp,
                     subst_per_residue=ocfg.sample_subst_per_residue,
                     eos_first=ocfg.sample_eos_first)
+        # The PROMPT is in the filename: sweeping several prompts means several invocations
+        # writing into one directory, and without it they would silently overwrite each other.
+        ptag = "".join(c if c.isalnum() else "_" for c in str(args.guide_prompt))[:24]
         cfgs = {}
         for gstr in args.guide_gammas.split(","):
             g = float(gstr)
             tag = "uncond" if g == 0 else f"g{gstr}"
-            cfgs[f"filip_{tag}"] = dict(base, _gamma=g)
+            cfgs[f"filip_{ptag}_{tag}"] = dict(base, _gamma=g, n_best=args.guide_best)
 
     rank, world = env.rank, env.world_size
     mine = {k: v for i, (k, v) in enumerate(cfgs.items()) if i % world == rank}

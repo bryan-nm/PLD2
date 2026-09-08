@@ -1,0 +1,96 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N pld2_cond
+#PBS -l walltime=06:00:00
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q debug
+#PBS -j oe
+
+# Conditional-generation parameter sweep: prompts x guidance strengths, folded AND scored for
+# SPECIFICITY.
+#
+# WHY THE SPECIFICITY PHASE EXISTS. pLDDT and pTM cannot tell conditioning from a general quality
+# bump: guidance that made every sample slightly more protein-like would raise both while steering
+# nothing, and would read as a success. Phase 4 scores every generated set against EVERY prompt in
+# the sweep and reports the margin between a set's own prompt and the others -- which is immune to
+# a set that simply scores well against everything. Each prompt's gamma=0 row is the null: it never
+# saw a prompt, so its margin should sit at ~0 however well it folds.
+#
+# THE GRID. GAMMAS spans 0 (control) upward; every prompt is run at every gamma. Cost is
+# len(PROMPTS) x len(GAMMAS) generation rounds, each of N sequences, plus folding. Guidance adds one
+# AMPLIFY forward+backward per decoding step, so a guided round is ~2-3x an unguided one.
+#
+# BEST-OF-N COMPOSES WITH THIS and is the larger effect so far: on the unconditional sweep it took
+# pTM 0.237 -> 0.284 (n=4) -> 0.321 (n=8) with k-mer repetition still at 0.0%, where every other
+# knob that moved pTM bought it with degeneracy. GUIDE_BEST turns it on here; leave it at 1 for a
+# clean read on guidance alone, then raise it once gamma is chosen.
+#
+#   qsub scripts/conditional.pbs
+#   qsub -v PROMPTS=0,17,42,GAMMAS=0,1,3 scripts/conditional.pbs
+#   qsub -v GUIDE_BEST=8 scripts/conditional.pbs            # compose with the best-of-n win
+#   qsub -v GUIDE_MODE=deg scripts/conditional.pbs          # exact enumeration, far slower
+#   qsub -v N=32,GAMMAS=0,1 scripts/conditional.pbs         # a quick look
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./scripts/pbs_common.sh
+
+N=${N:-64}                                  # sequences per (prompt, gamma)
+PROMPTS=${PROMPTS:-0,1,2}                   # cache rows or accessions
+GAMMAS=${GAMMAS:-0,0.5,1,2,5}               # 0 is the unconditional control
+GUIDE_MODE=${GUIDE_MODE:-tag}
+GUIDE_LIKELIHOOD=${GUIDE_LIKELIHOOD:-sigmoid}
+GUIDE_BEST=${GUIDE_BEST:-1}
+SAMPLES=$(python -c "from config import SAMPLES_DIR; print(SAMPLES_DIR)")
+
+job_banner "PLD2 conditional generation sweep" N PROMPTS GAMMAS GUIDE_MODE GUIDE_LIKELIHOOD \
+           GUIDE_BEST SAMPLES CKPT
+
+CKPT_FLAG=""
+[ -n "${CKPT:-}" ] && CKPT_FLAG="--ckpt ${CKPT}"
+
+# --- phase 1: generate, one round per prompt ------------------------------------------------
+# One invocation per prompt because guidance conditions on a single target; the gammas inside a
+# round share the AMPLIFY load, which is the expensive part of startup. Filenames carry the prompt
+# (filip_<prompt>_<tag>.fasta) so rounds cannot overwrite one another.
+n_ok=0
+IFS=',' read -ra PROMPT_LIST <<< "${PROMPTS}"
+for prompt in "${PROMPT_LIST[@]}"; do
+    echo "[cond] phase 1/4: prompt '${prompt}' at gammas ${GAMMAS} (${N} seqs each)"
+    # shellcheck disable=SC2086
+    "${MPI_LAUNCH[@]}" python -m src.sweep_sampler --device xpu --n "${N}" ${CKPT_FLAG} \
+        --guide-prompt "${prompt}" --guide-gammas "${GAMMAS}" \
+        --guide-mode "${GUIDE_MODE}" --guide-likelihood "${GUIDE_LIKELIHOOD}" \
+        --guide-best "${GUIDE_BEST}" ${GUIDE_ARGS:-}
+    rc=$?
+    if [ $rc -eq 0 ]; then n_ok=$((n_ok + 1))
+    else echo "[cond] prompt '${prompt}' failed (rc=$rc); continuing with the rest." >&2; fi
+done
+if [ $n_ok -eq 0 ]; then echo "[cond] every prompt failed; nothing to score." >&2; exit 1; fi
+
+# --- phase 2: fold ---------------------------------------------------------------------------
+shopt -s nullglob
+COND_FASTA=( "${SAMPLES}"/sweep_filip_*.fasta )
+shopt -u nullglob
+if [ ${#COND_FASTA[@]} -eq 0 ]; then
+    echo "[cond] no sweep_filip_*.fasta in ${SAMPLES} -- generation wrote nothing." >&2; exit 1
+fi
+echo "[cond] phase 2/4: folding ${#COND_FASTA[@]} FASTA(s) on ${NRANKS} tile(s)"
+# shellcheck disable=SC2086
+"${MPI_LAUNCH[@]}" python -m src.fold_fasta --device xpu "${COND_FASTA[@]}" ${FOLD_ARGS:-}
+frc=$?
+
+# --- phase 3: the fold table -----------------------------------------------------------------
+echo "[cond] phase 3/4: fold summary (natural = ceiling, shuffled = composition-matched floor)"
+python -m src.fold_fasta --summarize
+
+# --- phase 4: SPECIFICITY, which is the phase that answers the question ----------------------
+# Single rank: it is one AMPLIFY pass over a few thousand short sequences, and the scores have to
+# be computed against the same prompt set for every row to be comparable.
+echo "[cond] phase 4/4: FILIP specificity -- does each set score highest against ITS OWN prompt?"
+python -m src.filip_eval --device xpu --prompts "${PROMPTS}" --max-seqs "${N}" \
+    --fasta "${SAMPLES}/sweep_filip_*.fasta"
+erc=$?
+
+rc=$(( frc != 0 ? frc : erc ))
+echo "[job] exit $rc"; exit $rc     # exit $rc so the EXIT trap reports the true code
