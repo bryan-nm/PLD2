@@ -99,7 +99,13 @@ fi
 # rerun skips it on content). Without this a fault partway leaves the later FASTAs unscored, which
 # is what happened on the first attempt -- prompt 2 never got folded at all and several rows came
 # back at n=2..43 instead of n=64, so their pLDDT/pTM were computed over a biased handful.
-n_fold() { python -m src.fold_fasta --summarize 2>/dev/null | grep -c "^sweep_filip_" || true; }
+# COUNT FOLDED RECORDS, NOT SUMMARY ROWS. The first version counted rows matching ^sweep_filip_ in
+# the summary table, which is the number of FASTA GROUPS -- constant from the moment the files
+# exist. So "before" and "after" were always equal, every attempt looked like no progress, and the
+# loop gave up after the first fault having folded hundreds of sequences. Records are what actually
+# accumulate: each is fsynced to a per-rank JSONL as it is scored.
+FOLDS=$(python -c "from config import FOLDS_JSONL; print(FOLDS_JSONL)")
+n_fold() { cat "${FOLDS%.jsonl}"*.jsonl 2>/dev/null | wc -l | tr -d " "; }
 echo "[cond] phase 2/4: folding ${#COND_FASTA[@]} FASTA(s) on ${NRANKS} tile(s)"
 t0=$SECONDS
 for attempt in $(seq 1 "${FOLD_TRIES:-8}"); do
@@ -110,7 +116,7 @@ for attempt in $(seq 1 "${FOLD_TRIES:-8}"); do
     frc=$?
     [ $frc -eq 0 ] && { echo "[cond] folding completed on attempt ${attempt}"; break; }
     after=$(n_fold)
-    echo "[cond] fold attempt ${attempt} exited ${frc} (${before} -> ${after} rows)"
+    echo "[cond] fold attempt ${attempt} exited ${frc} (${before} -> ${after} sequences scored)"
     [ "${after}" -le "${before}" ] && { echo "[cond] no progress; not retrying"; break; }
 done
 

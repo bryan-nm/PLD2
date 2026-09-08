@@ -92,30 +92,84 @@ def main():
             S = fs(z_p, z_t, valid, mask_t)                 # [n_seq, n_prompt]
         out[os.path.basename(path).replace(".fasta", "")] = S.float().cpu()
 
-    w = max(len(k) for k in out) + 2
-    print(f"\n{'sample set':<{w}}" + "".join(f"{n[:11]:>13}" for n in names)
-          + f"{'own':>8}{'margin':>9}{'z':>7}{'top1':>7}")
-    print("-" * (w + 13 * len(names) + 31))
+    _report(out, rows, names)
+
+
+def _parse(name):
+    """'sweep_filip_<prompt>_<uncond|gN>' -> (prompt tag, gamma) or (None, None)."""
+    import re
+    m = re.match(r"^sweep_filip_(.+?)_(uncond|g[\d.]+)$", name)
+    if not m:
+        return None, None
+    return m.group(1), (0.0 if m.group(2) == "uncond" else float(m.group(2)[1:]))
+
+
+def _report(out, rows, names):
+    """Difference-in-differences, because the raw score is dominated by the PROMPT.
+
+    The first version of this compared, within a sample set, its own prompt against the others --
+    and that is confounded, badly. Measured on the first real run, every set scored ~0.90 against
+    one caption, ~0.70 against another and ~0.56 against a third, whatever it had been conditioned
+    on: the spread ACROSS prompts (0.34) dwarfed the spread across sample sets for a fixed prompt
+    (0.04-0.10). So a row-wise margin just reports whether a set's own prompt happens to be the one
+    everything scores highly against, and it duly gave the gamma=0 null -- generated without ever
+    seeing a prompt -- a +0.26 margin and 94% top-1.
+
+    The contrast that isolates guidance holds the PROMPT fixed and varies the sample set:
+
+        lift_own    = s(guided_j, prompt_j) - s(uncond_j, prompt_j)
+        lift_other  = mean over k != j of the same difference on prompt k
+        DiD         = lift_own - lift_other
+
+    lift_own alone would still credit guidance for making samples score higher against everything;
+    subtracting lift_other removes exactly that. DiD > 0 is steering. Each prompt's own gamma=0 run
+    is the baseline, so per-prompt offsets cancel by construction.
+    """
+    import torch
+    # sample set -> (prompt index it was conditioned on, gamma)
+    tagged = {}
     for name, S in out.items():
-        mean = S.mean(0)
-        # Which prompt was this set generated for? The filename carries it (filip_<prompt>_<tag>).
-        own = next((j for j, r in enumerate(rows)
-                    if f"filip_{_tag(str(r))}_" in name or f"filip_{_tag(names[j])}_" in name), None)
-        cells = "".join(f"{v:>13.4f}" for v in mean.tolist())
-        if own is None or len(rows) < 2:
-            print(f"{name:<{w}}{cells}{'--':>8}{'--':>9}{'--':>7}{'--':>7}")
+        ptag, gamma = _parse(name)
+        if ptag is None:
             continue
-        others = [j for j in range(len(rows)) if j != own]
-        margin = float(mean[own] - mean[others].mean())
-        z = margin / float(mean.std().clamp_min(1e-6))
-        top1 = float((S.argmax(1) == own).float().mean())
-        print(f"{name:<{w}}{cells}{mean[own]:>8.4f}{margin:>+9.4f}{z:>7.2f}{top1:>6.0%}")
-    print("-" * (w + 13 * len(names) + 31))
-    print(f"MARGIN is the own-prompt score minus the mean over the others, for the SAME samples --\n"
-          f"so it is immune to a set that simply scores high against everything. TOP1 is the "
-          f"fraction of\nindividual sequences whose own prompt ranks first; chance is "
-          f"{1 / max(len(rows), 1):.0%}. The gamma=0 rows are the\nnull: generated without seeing "
-          f"any prompt, they should sit at margin ~0 however they fold.")
+        j = next((i for i, (r, nm) in enumerate(zip(rows, names))
+                  if ptag == str(r) or ptag == _tag(str(r)) or ptag == _tag(nm)), None)
+        if j is not None:
+            tagged[name] = (j, gamma, S.mean(0))
+    skipped = len(out) - len(tagged)
+    if skipped:
+        print(f"\n[eval] {skipped} FASTA(s) skipped: conditioned on a prompt outside --prompts "
+              f"(left over from an earlier run with a different prompt set)")
+    if not tagged:
+        raise SystemExit("no sample set matched the given --prompts")
+
+    base = {j: v for (jj, g, v) in tagged.values() for j in [jj] if g == 0.0}
+    missing = {j for j, _, _ in tagged.values()} - set(base)
+    if missing:
+        print(f"[eval] no gamma=0 control for prompt(s) {[names[j] for j in sorted(missing)]}; "
+              f"their rows cannot be differenced and are omitted.")
+
+    print(f"\n{'prompt':<16}{'gamma':>7}{'own score':>11}{'lift_own':>10}"
+          f"{'lift_other':>12}{'DiD':>9}   steering?")
+    print("-" * 78)
+    for j in sorted({j for j, _, _ in tagged.values()}):
+        if j not in base:
+            continue
+        b = base[j]
+        rowset = sorted(((g, v) for (jj, g, v) in tagged.values() if jj == j and g > 0),
+                        key=lambda t: t[0])
+        others = [k for k in range(len(rows)) if k != j]
+        for g, v in rowset:
+            d = v - b
+            lo, lt = float(d[j]), float(d[others].mean()) if others else 0.0
+            did = lo - lt
+            print(f"{names[j][:15]:<16}{g:>7.1f}{float(v[j]):>11.4f}{lo:>+10.4f}"
+                  f"{lt:>+12.4f}{did:>+9.4f}   {'yes' if did > 0.01 else 'no'}")
+    print("-" * 78)
+    print("Every number is differenced against THAT PROMPT'S OWN gamma=0 run, so the per-prompt\n"
+          "offset cancels. lift_own is the gain on the prompt the samples were conditioned on;\n"
+          "lift_other is the gain on prompts they were not. DiD is the difference, and only DiD\n"
+          "distinguishes steering from guidance that raises every score at once.")
 
 
 def _tag(s):
