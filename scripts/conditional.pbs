@@ -81,10 +81,25 @@ shopt -u nullglob
 if [ ${#COND_FASTA[@]} -eq 0 ]; then
     echo "[cond] no sweep_filip_*.fasta in ${SAMPLES} -- generation wrote nothing." >&2; exit 1
 fi
+# RELAUNCHED IN A LOOP, like scripts/self_consistency.pbs and for the same reason: ESMFold on
+# Aurora aborts unpredictably, and folding is resumable (every scored sequence is fsynced and a
+# rerun skips it on content). Without this a fault partway leaves the later FASTAs unscored, which
+# is what happened on the first attempt -- prompt 2 never got folded at all and several rows came
+# back at n=2..43 instead of n=64, so their pLDDT/pTM were computed over a biased handful.
+n_fold() { python -m src.fold_fasta --summarize 2>/dev/null | grep -c "^sweep_filip_" || true; }
 echo "[cond] phase 2/4: folding ${#COND_FASTA[@]} FASTA(s) on ${NRANKS} tile(s)"
-# shellcheck disable=SC2086
-"${MPI_LAUNCH[@]}" python -m src.fold_fasta --device xpu "${COND_FASTA[@]}" ${FOLD_ARGS:-}
-frc=$?
+t0=$SECONDS
+for attempt in $(seq 1 "${FOLD_TRIES:-8}"); do
+    before=$(n_fold)
+    [ $(( SECONDS - t0 )) -ge "${FOLD_BUDGET:-10800}" ] && { echo "[cond] fold budget spent"; break; }
+    # shellcheck disable=SC2086
+    "${MPI_LAUNCH[@]}" python -m src.fold_fasta --device xpu "${COND_FASTA[@]}" ${FOLD_ARGS:-}
+    frc=$?
+    [ $frc -eq 0 ] && { echo "[cond] folding completed on attempt ${attempt}"; break; }
+    after=$(n_fold)
+    echo "[cond] fold attempt ${attempt} exited ${frc} (${before} -> ${after} rows)"
+    [ "${after}" -le "${before}" ] && { echo "[cond] no progress; not retrying"; break; }
+done
 
 # --- phase 3: the fold table -----------------------------------------------------------------
 echo "[cond] phase 3/4: fold summary (natural = ceiling, shuffled = composition-matched floor)"

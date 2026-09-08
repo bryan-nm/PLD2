@@ -81,8 +81,13 @@ def main():
         if not seqs:
             continue
         with torch.no_grad():
+            # max_protein_tokens lives on DataCfg, not ModelCfg. getattr across both rather than
+            # hard-coding one, since this reads another repo's config and a rename there should
+            # degrade to the default rather than crash after the expensive phases have run.
+            max_len = getattr(getattr(mcfg, "data", None), "max_protein_tokens",
+                              getattr(mcfg.model, "max_protein_tokens", 512))
             h, valid = mods["encoders"].encode_protein_batch(
-                pmodel, ptok, seqs, dev, mcfg.model.max_protein_tokens)
+                pmodel, ptok, seqs, dev, max_len)
             z_p = filip.protein_proj(h)
             S = fs(z_p, z_t, valid, mask_t)                 # [n_seq, n_prompt]
         out[os.path.basename(path).replace(".fasta", "")] = S.float().cpu()
