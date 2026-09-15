@@ -64,6 +64,15 @@ FILIP_CKPT = os.environ.get(
 # head out of the checkpoint. The PROTEIN side cannot be cached: the canvas changes every step.
 FILIP_CACHE = os.environ.get("PLD2_FILIP_CACHE", f"{MINI_EMBED_REPO}/cache")
 
+# The SwissProt text<->protein pair corpus the FILIP cache was built from. It lives under PLD2's own
+# DATASETS_DIR, NOT inside the mini-embed repo -- an earlier version of src/reference_set.py derived
+# it from MINI_EMBED_REPO's parent and sent a job looking in FILIP-dev-space, which cost a queue
+# slot. Columns are fixed by the SwissProt-full file and mirrored from mini-embed's config.DataCfg;
+# captions contain commas, so anything reading this must use the csv module.
+SWISSPROT_CSV = os.environ.get("PLD2_SWISSPROT_CSV",
+                               f"{DATASETS_DIR}/fully_annotated_swiss_prot_080326.csv")
+SWISSPROT_COLS = ("primary_Accession", "protein_sequence", "[final]text_caption")
+
 # --- preference tuning (src/align.py and friends) ---------------------------------------------
 # One directory per alignment ROUND. IRPO is iterative: round 2 must generate from the policy round
 # 1 produced, on a fresh prompt set, and its pairs must not be mixed with round 1's -- data from a
@@ -550,6 +559,11 @@ if __name__ == "__main__":
     print("SAMPLES_DIR    :", SAMPLES_DIR)
     print("FOLDS_JSONL    :", FOLDS_JSONL)
     print("ALIGN_DIR      :", ALIGN_DIR)
+    # The alignment inputs, checked here because every job script banners this output: a path that
+    # is only resolved inside phase 0 fails minutes in, after the queue slot is already spent.
+    print("SWISSPROT_CSV  :", SWISSPROT_CSV, " exists:", os.path.exists(SWISSPROT_CSV))
+    print("FILIP_CACHE    :", FILIP_CACHE, " exists:", os.path.isdir(FILIP_CACHE))
+    print("FILIP_CKPT     :", FILIP_CKPT, " exists:", os.path.exists(FILIP_CKPT))
     print(f"model          : d_model={m.d_model} d_ff={m.d_ff} heads={m.n_heads} "
           f"layers={m.n_upstream}+{m.n_middle}(x{m.n_recurrence})+{m.n_downstream} "
           f"vocab={m.vocab_size} (eos={m.eos_token_id} pad={m.pad_token_id} mask={m.mask_token_id})")

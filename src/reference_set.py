@@ -41,17 +41,13 @@ import os
 import random
 import sys
 
-from config import CFG, FILIP_CACHE, MINI_EMBED_REPO
+from config import CFG, FILIP_CACHE, SWISSPROT_COLS, SWISSPROT_CSV
 from .fold_fasta import load_pdb_index, read_records
 from .self_consistency import parse_descriptor, record_key, run_foldseek
 
-# Column names ship with the SwissProt-full CSV and are mirrored from mini-embed-filip's
-# config.DataCfg. Read with the csv module, never by splitting on commas: captions contain them.
-ID_COL, PROT_COL, TEXT_COL = "primary_Accession", "protein_sequence", "[final]text_caption"
-DEFAULT_CSV = os.environ.get(
-    "PLD2_SWISSPROT_CSV",
-    os.path.join(os.path.dirname(MINI_EMBED_REPO.rstrip("/")), "datasets", "SwissProt_full",
-                 "fully_annotated_swiss_prot_080326.csv"))
+# config.py owns the path and the column names. Read with the csv module, never by splitting on
+# commas: the captions contain them.
+ID_COL, PROT_COL, TEXT_COL = SWISSPROT_COLS
 
 
 def load_rows(csv_path, cache_dir, split=None, splits_path=None):
@@ -63,7 +59,11 @@ def load_rows(csv_path, cache_dir, split=None, splits_path=None):
     condition every generation on somebody else's caption and still look completely healthy.
     """
     if not os.path.exists(csv_path):
-        raise SystemExit(f"no SwissProt CSV at {csv_path} (set PLD2_SWISSPROT_CSV)")
+        raise SystemExit(
+            f"no SwissProt CSV at {csv_path}.\n"
+            f"config.py owns this path as SWISSPROT_CSV; `python config.py` prints what it "
+            f"resolves to and whether it exists, and every job script banners that output. "
+            f"Override with PLD2_SWISSPROT_CSV, or pass --csv.")
     rows = []
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
@@ -204,7 +204,7 @@ def main():
     f.add_argument("--dir", default=acfg.round_dir)
     f.add_argument("--n", type=int, default=int(acfg.n_prompts * 1.2),
                    help="draw more than n_prompts: folding and foldseek both lose some")
-    f.add_argument("--csv", default=DEFAULT_CSV)
+    f.add_argument("--csv", default=SWISSPROT_CSV)
     f.add_argument("--cache", default=FILIP_CACHE)
     f.add_argument("--split", default="test", help="'' for the whole corpus")
     f.add_argument("--splits", default=None)
