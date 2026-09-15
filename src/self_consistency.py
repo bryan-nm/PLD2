@@ -148,7 +148,13 @@ def _index_keys(head):
 
 
 def parse_descriptor(tsv_path, index):
-    """TSV -> {record id: refolded 3Di}. `index` maps PDB basename -> record id."""
+    """TSV -> ({record id: refolded 3Di}, n_unmatched). `index` maps PDB basename -> record id.
+
+    RETURNS A PAIR. The count is how many foldseek rows named a structure the index could not
+    resolve, which is the signal that the index and the PDB directory have drifted apart -- so it
+    is part of the result, not a diagnostic to drop. Spelled out because the old one-line docstring
+    described only the mapping, and a caller duly wrote `di = parse_descriptor(...)`.
+    """
     out, unmatched = {}, 0
     with open(tsv_path) as fh:
         for line in fh:

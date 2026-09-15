@@ -152,7 +152,10 @@ def cmd_join(a):
     tsv = os.path.join(a.dir, "refs.3di.tsv")
     if a.refresh or not os.path.exists(tsv):
         run_foldseek(pdb_dir, tsv, a.foldseek, a.threads)
-    di = parse_descriptor(tsv, load_pdb_index(pdb_dir))          # {record_key: 3Di}
+    # parse_descriptor returns (mapping, n_unmatched) -- the second value is not decoration. An
+    # unmatched row is a structure foldseek typed but whose PDB the index cannot name, which means
+    # the index and the directory have drifted apart, and every such reference is silently lost.
+    di, unmatched = parse_descriptor(tsv, load_pdb_index(pdb_dir))
 
     folds = {}
     for r in read_records(a.folds or os.path.join(a.dir, "reffolds.jsonl")):
@@ -183,6 +186,11 @@ def cmd_join(a):
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+    if unmatched:
+        print(f"[refs] WARNING: foldseek typed {unmatched:,} structure(s) the PDB index could not "
+              f"name, and those references are lost. A stale index.rank*.jsonl in {pdb_dir} is the "
+              f"usual cause -- it is append-only, so a directory reused across rounds accumulates "
+              f"entries for PDBs that are no longer there.", flush=True)
     mean_p = sum(r["plddt"] for r in out) / max(len(out), 1)
     conf = sum(r["plddt"] > CFG.opt.plddt_confident for r in out)
     print(f"[refs] {len(out):,}/{len(meta):,} references complete "

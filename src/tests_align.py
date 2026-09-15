@@ -251,6 +251,63 @@ g3 = given.unsqueeze(0).expand(3, -1, -1)
 check("real prompt survives a full decode", bool((cv[g3] == tok.unsqueeze(0).expand(3, -1, -1)[g3]).all()))
 check("real prompt fixes the length", lens == [r["L"]] * 3, f"got {lens} want {r['L']}")
 
+
+# ------------------------------------------------- 9. reference_set join, on a faithful fixture
+# This phase reads three files written by three different tools (fold_fasta's PDB index, its
+# results JSONL, and foldseek's descriptor TSV) and has to agree with all of them. It failed in
+# production on `di = parse_descriptor(...)` -- which returns a PAIR -- after phase 0 had already
+# folded 1,200 references. A fixture is cheap; a queue slot is not.
+import json as _json                                                              # noqa: E402
+import os as _os                                                                  # noqa: E402
+import tempfile                                                                   # noqa: E402
+import types                                                                      # noqa: E402
+
+from src.reference_set import cmd_join                                            # noqa: E402
+
+_tmp = tempfile.mkdtemp(prefix="pld2refs_")
+_os.makedirs(_os.path.join(_tmp, "refpdb"))
+_rr = random.Random(7)
+_meta, _idx, _folds, _tsv = [], [], [], []
+for _i in range(10):
+    _rid, _L = f"r{1000 + _i}", _rr.randint(40, 90)
+    _seq = "".join(_rr.choice("ACDEFGHIKLMNPQRSTVWY") for _ in range(_L))
+    _meta.append({"rid": _rid, "row": 1000 + _i, "acc": f"P{_i}", "seq": _seq})
+    if _i == 9:                                   # folded never landed for this one
+        continue
+    _safe = f"refs_{_rid}"                        # fold_fasta._safe_name flattens '|' to '_'
+    _idx.append({"file": _safe, "id": f"refs|{_rid}"})
+    _folds.append({"id": f"refs|{_rid}", "length": _L, "seq": _seq,
+                   "plddt": round(_rr.uniform(0.5, 0.95), 4), "ptm": 0.7})
+    open(_os.path.join(_tmp, "refpdb", _safe + ".pdb"), "w").write("ATOM\n")
+    _dl = _L if _i != 8 else _L - 3               # one 3Di that does not cover its sequence
+    _tsv.append(f"{_safe}.pdb\t{_seq}\t"
+                + "".join(_rr.choice("ACDEFGHIKLMNPQRSTVWY") for _ in range(_dl)) + "\tfeat")
+_tsv.append("orphan_structure.pdb\tAAAA\tDDDD\tfeat")     # typed, but not in the index
+for _name, _rows in (("refs.meta.jsonl", _meta), ("reffolds.jsonl", _folds)):
+    open(_os.path.join(_tmp, _name), "w").write(
+        "".join(_json.dumps(r) + "\n" for r in _rows))
+open(_os.path.join(_tmp, "refpdb", "index.rank000.jsonl"), "w").write(
+    "".join(_json.dumps(r) + "\n" for r in _idx))
+open(_os.path.join(_tmp, "refs.3di.tsv"), "w").write("\n".join(_tsv) + "\n")
+
+cmd_join(types.SimpleNamespace(dir=_tmp, pdb_dir=None, folds=None, foldseek="foldseek",
+                               threads=0, refresh=False))
+_out = [_json.loads(l) for l in open(_os.path.join(_tmp, "refs.jsonl"))]
+check("reference join drops the unfolded and the length-mismatched",
+      len(_out) == 8, f"got {len(_out)} want 8")
+check("every reference's 3Di covers its sequence",
+      all(len(r["di"]) == len(r["seq"]) for r in _out))
+check("every reference carries its caption row and scores",
+      all({"rid", "row", "acc", "seq", "di", "plddt", "ptm"} <= set(r) for r in _out))
+
+# and the contract that broke: the callee returns a pair, so the call site must unpack one
+from src.self_consistency import parse_descriptor                                 # noqa: E402
+_r = parse_descriptor(_os.path.join(_tmp, "refs.3di.tsv"),
+                      {r["file"]: r["id"] for r in _idx})
+check("parse_descriptor returns (mapping, n_unmatched)",
+      isinstance(_r, tuple) and len(_r) == 2 and isinstance(_r[0], dict) and _r[1] == 1,
+      f"got {type(_r).__name__}")
+
 print(f"\n{checks - len(fails)}/{checks} checks pass")
 if fails:
     print("FAILURES:")
