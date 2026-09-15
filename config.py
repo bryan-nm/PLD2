@@ -64,6 +64,13 @@ FILIP_CKPT = os.environ.get(
 # head out of the checkpoint. The PROTEIN side cannot be cached: the canvas changes every step.
 FILIP_CACHE = os.environ.get("PLD2_FILIP_CACHE", f"{MINI_EMBED_REPO}/cache")
 
+# --- preference tuning (src/align.py and friends) ---------------------------------------------
+# One directory per alignment ROUND. IRPO is iterative: round 2 must generate from the policy round
+# 1 produced, on a fresh prompt set, and its pairs must not be mixed with round 1's -- data from a
+# policy that no longer exists is exactly what a preference loss must not train on. The round number
+# is in the path so that is structurally hard to get wrong.
+ALIGN_DIR = os.environ.get("PLD2_ALIGN_DIR", f"{RUNS_DIR}/align")
+
 # --- run outputs ---
 CKPT_DIR = os.environ.get("PLD2_CKPT_DIR", f"{RUNS_DIR}/checkpoints")
 SAMPLES_DIR = os.environ.get("PLD2_SAMPLES_DIR", f"{RUNS_DIR}/samples")   # training-time eval FASTA
@@ -387,10 +394,119 @@ class OptCfg:
 
 
 @dataclass
+class AlignCfg:
+    """Preference tuning, following ESM3's IRPO (Appendix A.4) with three deliberate departures.
+
+    IPO, NOT DPO, BY DEFAULT. DPO's log-sigmoid is unbounded, so its implicit KL constraint
+    collapses when preferences are near-deterministic (Azar et al.) -- and ours are deterministic by
+    construction, because pairs are built from a hard metric gap rather than noisy human labels.
+    Three things make drift a bigger risk here than it was for ESM3: that determinism, positives
+    that are good only relative to their own prompt, and a reward that is a folder's opinion about a
+    generated sequence. IPO's squared loss has a finite optimum, so the margin stops growing.
+    `loss="dpo"` switches back for comparison; the two differ by four lines.
+
+    RELATIVE, WITHIN-PROMPT THRESHOLDS, NOT ABSOLUTE ONES. ESM3 could demand pTM > 0.8 and
+    cRMSD < 1.5A because its base model produced such samples in quantity. Ours clears an absolute
+    bar about 1% of the time, so at n_gen=16 only ~11% of prompts would contain a single qualifying
+    sample and 89% of the fold budget would be discarded. Ranking within a prompt yields a usable
+    pair at every difficulty instead. success_weight is the knob that reintroduces absolute quality
+    -- it upweights pairs whose winner clears the bar outright -- and it is 1.0, i.e. OFF.
+
+    THE MARGIN IS PER POSITION. Our surrogate log-likelihood comes out of a weighted row MEAN
+    (objective._weighted_row_mean), so the IPO target is a per-token nat budget rather than a
+    sequence-level one: length-invariant, and a number that can be reasoned about.
+    """
+    dir: str = ALIGN_DIR
+    round: int = 1
+
+    @property
+    def round_dir(self) -> str:
+        return os.path.join(self.dir, f"round{int(self.round)}")
+
+    # --- the reference set (src/reference_set.py) ---
+    # Captioned SwissProt proteins, ESMFolded once. The scaffold's 3Di, the TM target and the
+    # caption all come from that single fold, so no predictor change sits inside the measurement --
+    # which is what carving prompts out of the AlphaFold-derived AFDB shards would have done.
+    n_refs_factor: float = 1.2       # draw this many x n_prompts: folding and foldseek lose some
+    ref_split: str = "test"          # rows the FILIP co-embedding never trained on
+    ref_min_plddt: float = 0.70      # a reference ESMFold is unsure about is a bad prompt AND a bad
+                                     # TM target: its 3Di is a guess in both roles
+
+    # --- prompts (src/prompts.py) ---
+    n_prompts: int = 1_000
+    prompt_seed: int = 0
+    # Mask rate = the fraction of residues the model must generate. 1.0 is the cold start and takes
+    # the largest single share on purpose: it is the condition we deploy in, and the supervised half
+    # of the loss would otherwise fill up with easy low-mask completions.
+    mask_bins: tuple = (0.5, 0.7, 0.85, 1.0)
+    bin_weights: tuple = (1.0, 1.0, 1.0, 1.5)      # -> 22/22/22/33%
+    span_widths: tuple = (8, 32, 128)
+
+    # --- generation (src/align_sample.py) ---
+    # Also records the model's OWN surrogate log-likelihood for each completion. That column is the
+    # whole diagnosis: best-of-N by log-likelihood is worse than a random draw (0.007 at N=1 falling
+    # monotonically to 0.000 at N=8) while pLDDT selection tracks the oracle exactly. The model
+    # makes good proteins and ranks them below the bad ones, and the gap between those two columns
+    # is what preference tuning is for -- so watch it shrink across rounds.
+    n_gen: int = 16                  # completions per prompt. This sets the CEILING: the winner is
+                                     # a best-of-n draw, and the model is being taught to imitate
+                                     # it, so n is the height of the target. Prompts buy fidelity to
+                                     # that target; only n moves it.
+    gen_temperature: float = 1.0
+    gen_steps: int = 512
+    # FILIP caption guidance during generation, when a prompt carries a caption. Measured: best-of-N
+    # gain collapses monotonically as guidance rises (5.7x at g10, 2.7x at g30, 1.9x at g100) and by
+    # N=10 the ordering reverses. Guidance and best-of-N draw on the same resource -- within-prompt
+    # spread -- and spread is the raw material every preference pair is cut from. So: a little.
+    gen_gamma: float = 10.0
+
+    # --- reward (src/preference.py) ---
+    # The success criterion, measured: pLDDT > 70 AND TM > 0.5 to the ESMFolded query. TM is what
+    # makes this safe to optimise -- a poly-alanine helix scores well on pLDDT and nowhere on TM, so
+    # the degenerate solution is not on the reward's frontier.
+    plddt_success: float = 0.70
+    tm_success: float = 0.50
+    tm_field: str = "ttmscore"       # normalised by the TARGET, which is the natural query
+    reward_plddt: float = 1.0        # reward = w_plddt * pLDDT + w_tm * TM, for RANKING only
+    reward_tm: float = 1.0
+    top_k: int = 2                   # winners per prompt
+    bot_k: int = 2                   # losers per prompt
+    # Reward gap a pair must clear. NOT zero, and this matters more than it looks: both DPO and
+    # IPO treat preference as BINARY, so a mislabelled pair contributes a gradient of exactly the
+    # same size as a correct one. Measured, the successes cluster into a minority of prompts --
+    # oracle pass@10 is 0.040 against 0.068 for independent draws at the same per-draw rate -- so
+    # most prompts produce 16 uniformly mediocre completions whose ordering is metric noise. This
+    # discards them, which is what ESM3 did with a much larger gap (dpTM >= 0.2) for the same reason.
+    min_gap: float = 0.05
+    success_weight: float = 1.0      # >1 upweights pairs whose winner clears the absolute bar. OFF.
+    matched_frac: float = 0.5        # share of pairs built matched-on-pLDDT / split-on-TM, which
+                                     # holds quality fixed so the gradient can only carry
+                                     # prompt-consistency. 0 disables.
+    matched_plddt_tol: float = 0.05  # "same pLDDT" for that construction
+
+    # --- the loss (src/align.py) ---
+    loss: str = "ipo"                # "ipo" | "dpo"
+    alpha: float = 0.8               # weight on the contrastive term (ESM3's value)
+    beta: float = 0.05               # DPO temperature / IPO regularisation (ESM3's value)
+    ipo_margin: float = 0.04         # IPO target margin, NATS PER POSITION
+    nll_weight: float = 1.0          # the supervised anchor. ESM3 keeps it at 1 and leans on it.
+    steps: int = 1_000
+    lr: float = 1e-5
+    warmup_steps: int = 150
+    grad_clip: float = 1.0
+    optimizer: str = "rmsprop"       # ESM3 used RMSProp for every IRPO run
+    pairs_per_rank: int = 1          # pairs per rank per optimizer step
+    score_struct: bool = False       # score the 3Di track in the surrogate too, not just residues
+    eval_every: int = 50
+    drift_natural_n: int = 64        # held-out natural sequences for the drift monitor
+
+
+@dataclass
 class RunCfg:
     device: str = "auto"                 # auto -> xpu on Aurora, cpu on a laptop
     data: DataCfg = field(default_factory=DataCfg)
     opt: OptCfg = field(default_factory=OptCfg)
+    align: AlignCfg = field(default_factory=AlignCfg)
 
     def model_config(self) -> ModelConfig:
         # Same dims as ProLoopDiff (~55M params) so the two runs are comparable. What changed is
@@ -433,6 +549,7 @@ if __name__ == "__main__":
     print("CKPT_DIR       :", CKPT_DIR)
     print("SAMPLES_DIR    :", SAMPLES_DIR)
     print("FOLDS_JSONL    :", FOLDS_JSONL)
+    print("ALIGN_DIR      :", ALIGN_DIR)
     print(f"model          : d_model={m.d_model} d_ff={m.d_ff} heads={m.n_heads} "
           f"layers={m.n_upstream}+{m.n_middle}(x{m.n_recurrence})+{m.n_downstream} "
           f"vocab={m.vocab_size} (eos={m.eos_token_id} pad={m.pad_token_id} mask={m.mask_token_id})")

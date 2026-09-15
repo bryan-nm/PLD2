@@ -77,6 +77,7 @@ of the per-sequence loss -- ~25x its unweighted share, and still far from domina
 from __future__ import annotations
 from typing import Optional
 
+import zlib
 import torch
 
 from .corruption import CorruptionSchedule, kl_categorical, x0_probs
@@ -320,3 +321,87 @@ if __name__ == "__main__":
           "through to the loss at all. It does NOT measure eos_loss_weight: 8 uniformly random "
           "sequences make their lengths 8 arbitrary facts to memorise rather than a rule to learn. "
           "The real EOS check is the `no-EOS` column of the [eval] line during training.")
+
+
+# --------------------------------------------------------------------------------------
+# Likelihood surrogate for preference tuning (src/align.py)
+# --------------------------------------------------------------------------------------
+def surrogate_mask(pair_id: str, generated, canvas: int, device, epoch: int = 0,
+                   rate: float = None):
+    """(canvas,) bool: the positions to score, drawn reproducibly from (pair_id, epoch).
+
+    WHY A SURROGATE AT ALL. An any-order model can produce y from x by any of L! decoding paths, so
+    the exact log pi(y|x) is a sum over all of them and is not computable. ESM3 hit the same wall
+    (Appendix A.4.1) and used the same substitute: mask y on a noise schedule, prompt the model with
+    what is left, and take the cross-entropy at the masked positions --
+
+        log pi(y|x) ~= E_m [ sum_{i in m} log p(y_i | y_\\m, x) ]
+
+    which mirrors pretraining exactly, and at the pure-masking end of our beta slider is the same
+    quantity the ARDM identity makes equal to the generative NLL. That is why the surrogate masks
+    rather than substitutes: beta = 1 is the setting where this number means something.
+
+    THE SAME MASK FOR WINNER AND LOSER, AND FOR POLICY AND REFERENCE. All four log-likelihoods in
+    the IPO/DPO term are estimates of an expectation over masks, and their DIFFERENCES are what the
+    loss uses. Sharing the draw cancels the estimation noise at first order instead of accumulating
+    it four times. ESM3 says the same in one line; it is close to free and it is not optional at
+    these margins.
+
+    Our pairs make this exact rather than approximate, which ESM3's could not be: a prompt owns its
+    length (src/prompts.py), so both completions of a pair are the same length and the mask is
+    literally identical rather than merely identically distributed.
+
+    ONLY GENERATED POSITIONS ARE SCORED. The prompt is x, not y. Masking revealed scaffold would
+    score the model on reproducing context it was handed, which every candidate does equally well
+    and which therefore only adds variance.
+
+    `rate` defaults to a draw from U(0,1) -- ESM3's linear schedule -- so a pair is seen at a
+    different corruption level each time it comes round, and the expectation is over the whole
+    schedule rather than one arbitrary level.
+    """
+    g = torch.Generator(device="cpu").manual_seed(
+        (zlib.crc32(pair_id.encode()) ^ (0x9E3779B9 * (epoch + 1))) & 0x7FFFFFFF)
+    if rate is None:
+        rate = float(torch.rand(1, generator=g).item())
+    u = torch.rand(canvas, generator=g)
+    m = (u < rate) & generated.cpu()
+    if not bool(m.any()):
+        # An empty mask scores nothing and would make the row's mean a 0/0. Take the single most
+        # likely position to have been drawn rather than falling back to the whole sequence.
+        idx = torch.nonzero(generated.cpu(), as_tuple=False)
+        if idx.numel():
+            m[int(idx[int(torch.randint(len(idx), (1,), generator=g))])] = True
+    return m.to(device)
+
+
+def surrogate_logp(model, y: torch.Tensor, mask: torch.Tensor, cfg,
+                   score_struct: bool = False) -> torch.Tensor:
+    """(B,) mean log p per scored position.
+
+    y      (B,K,L) the full canvas -- prompt context, completion, EOS and the PAD tail.
+    mask   (B,L) bool, the positions to hide and score. Applied to BOTH tracks: the model generated
+           them jointly and scoring the residues while handing back the 3Di for the same position
+           would measure inverse folding, not generation.
+
+    A MEAN, NOT A SUM, which makes the IPO target margin a per-token nat budget -- length-invariant,
+    and a number that can be reasoned about and checked. ESM3 length-normalises its supervised term
+    for the same reason and leaves the contrastive one unnormalised; normalising both keeps the two
+    on one scale.
+    """
+    K = y.shape[1]
+    m3 = mask.unsqueeze(1).expand(-1, K, -1)
+    xt = torch.where(m3, torch.full_like(y, cfg.mask_token_id), y)
+    if K == 1:
+        logits = model(xt[:, 0]).unsqueeze(1)
+    else:
+        logits = model(xt[:, 0], struct=xt[:, 1])
+    with torch.autocast(device_type=y.device.type, enabled=False):
+        lp = torch.log_softmax(logits.float(), dim=-1)
+        tgt = lp.gather(-1, y.unsqueeze(-1)).squeeze(-1)            # (B,K,L)
+        w = mask.to(tgt.dtype)
+        num = tgt[:, 0] * w
+        den = w
+        if score_struct and K > 1:
+            num = num + tgt[:, 1] * w
+            den = den * 2.0
+        return num.sum(dim=1) / den.sum(dim=1).clamp_min(1e-6)

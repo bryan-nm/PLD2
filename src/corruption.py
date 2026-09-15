@@ -327,13 +327,19 @@ class CorruptionSchedule:
 # helpers
 # ---------------------------------------------------------------------------
 def span_mask_field(p_mask: torch.Tensor, L: int, widths: Sequence[int],
-                    span_idx: torch.Tensor | None = None) -> torch.Tensor:
+                    span_idx: torch.Tensor | None = None,
+                    generator: torch.Generator | None = None) -> torch.Tensor:
     """(B,L) bool mask indicator, True where masked. See CorruptionSchedule.span_field for the
     argument that the per-position marginal is exactly p_mask. Module-level so a caller that only
-    wants the field (src/ce_curve.py) need not build a 500-matrix schedule to get it."""
+    wants the field (src/ce_curve.py) need not build a 500-matrix schedule to get it.
+
+    `generator` makes a draw reproducible without touching global RNG state, which is what
+    src/prompts.py needs: a prompt manifest has to be a pure function of its seed, and what
+    src/align.py masks for its likelihood surrogate has to be a pure function of the pair id.
+    """
     B = p_mask.shape[0]
     dev, dt = p_mask.device, p_mask.dtype
-    z = torch.randn(B, 1, L, device=dev, dtype=dt)
+    z = torch.randn(B, 1, L, device=dev, dtype=dt, generator=generator)
     if len(widths) == 1:
         sel = _smooth(z, widths[0]).squeeze(1)
     else:
@@ -341,7 +347,8 @@ def span_mask_field(p_mask: torch.Tensor, L: int, widths: Sequence[int],
         if span_idx is None:
             span_idx = torch.zeros(B, dtype=torch.long, device=dev)
         sel = stack.gather(0, span_idx.view(1, B, 1).expand(1, B, L)).squeeze(0)
-    k = torch.floor(p_mask * L + torch.rand(B, device=dev, dtype=dt)).long().clamp_(0, L)
+    k = torch.floor(p_mask * L
+                    + torch.rand(B, device=dev, dtype=dt, generator=generator)).long().clamp_(0, L)
     return sel.argsort(dim=1).argsort(dim=1) < k.unsqueeze(1)
 
 

@@ -1,0 +1,206 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N pld2_align
+#PBS -l walltime=01:00:00
+#PBS -l select=16
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q debug-scaling
+#PBS -j oe
+
+# One round of preference tuning, end to end:
+#   references -> prompts -> generate -> fold -> TM -> pairs -> tune
+#
+#   qsub scripts/align.pbs                                  # round 1, IPO, 1k prompts x 16
+#   qsub -v LOSS=dpo scripts/align.pbs                      # the same pairs under DPO
+#   qsub -v ALPHA=0 scripts/align.pbs                       # the SFT baseline (ESM3's A.4.6)
+#   qsub -v ROUND=2,CKPT=<round1>/policy/ckpt_00000999.pt scripts/align.pbs   # iterate
+#   qsub -v PHASES=45 scripts/align.pbs                     # re-pair and re-tune, no regeneration
+#
+# ONE PREDICTOR, END TO END. Phase 0 folds captioned SwissProt proteins with ESMFold and reads their
+# 3Di off THOSE structures. The prompt's structure track, the TM target and the caption therefore
+# all trace back to one fold of one protein. The alternative -- carving prompts out of the AFDB
+# shards, whose 3Di comes from AlphaFold -- would put a predictor change inside the reward, and the
+# disagreement between two predictors is not a constant offset: it is largest exactly where
+# prediction is hardest, which is where the interesting samples are.
+#
+# IT IS ITERATIVE, AND THE ROUND NUMBER IS LOAD-BEARING. Round 2 must generate from the policy round
+# 1 produced, on a FRESH prompt set. Preference losses are on-policy: pairs drawn from a policy that
+# no longer exists are not just stale, they are mislabelled, because the reference term measures
+# movement away from a model that is no longer the one being moved. ROUND picks the directory and
+# PROMPT_SEED picks the prompts, so neither is shared by accident.
+#
+# ESMFOLD CRASHES; THE FOLD PASSES ARE BUILT AROUND THAT, NOT IN SPITE OF IT. Folding on Aurora
+# aborts with "Segmentation fault from GPU ... NotPresent" at a rate that survived four hypotheses
+# and four refutations (see src/fold_fasta.py). So nothing here tries to prevent it. Every scored
+# sequence is fsynced to a per-rank JSONL and a rerun skips it on CONTENT, so a crash costs only
+# what was in flight; fold_loop() relaunches until a pass exits clean or stops making progress.
+# Three escalations, in order: retry (most faults are transient), tolerate consecutive stalls (a
+# fault during startup scores nothing and is not evidence of a dead end), and finally fall back to
+# one rank per node, the configuration with direct evidence behind it -- 12 ranks with a process
+# group died 3 for 3, 1 rank with none folded 100 sequences cleanly.
+#
+# SCALING TO HUNDREDS OF NODES. Nothing here is O(world). Prompts are partitioned by a stable crc32
+# of the pid rather than a stride over a list, every phase writes per-rank files and never shares
+# one, no phase but the tuner creates a process group, and per-rank work is constant as nodes are
+# added. To run it large: raise N_PROMPTS with select= in proportion (a node does ~60 prompts/hour
+# end to end at n_gen=16) and leave everything else alone.
+#
+# Two things do NOT scale as written, both fine at 1k prompts and both needing attention past ~10k:
+#   * the PDB directory -- 1k x 16 is ~17k small files in one Lustre directory, 100k would be 1.6M.
+#     Shard PDB_DIR by a prefix of the pid.
+#   * the prompt manifest -- ~1KB a row, read whole by every rank (1MB at 1k, 100MB at 100k).
+# The single-process phases (reference selection, prompts, pair construction) are seconds at 1k and
+# minutes at 100k, which is not yet the problem.
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./scripts/pbs_common.sh
+
+ROUND=${ROUND:-1}
+N_PROMPTS=${N_PROMPTS:-1000}
+N_GEN=${N_GEN:-16}
+GAMMA=${GAMMA:-10}            # caption guidance during generation. Measured: the best-of-N gain
+                              # collapses as this rises (5.7x at 10, 2.7x at 30, 1.9x at 100) and by
+                              # N=10 the ordering reverses. Guidance and best-of-N spend the same
+                              # resource -- within-prompt spread -- which is what pairs are cut from.
+LOSS=${LOSS:-ipo}
+ALPHA=${ALPHA:-0.8}
+STEPS=${STEPS:-1000}
+PROMPT_SEED=${PROMPT_SEED:-$ROUND}
+REF_SPLIT=${REF_SPLIT:-test}
+PHASES=${PHASES:-012345}
+FOLD_TRIES=${FOLD_TRIES:-20}
+FOLD_STALL=${FOLD_STALL:-3}   # consecutive no-progress passes tolerated before escalating
+FOLD_BUDGET=${FOLD_BUDGET:-10800}
+
+RDIR=$(python -c "from config import CFG; CFG.align.round=${ROUND}; print(CFG.align.round_dir)")
+PDB_DIR="${RDIR}/pdb"; REF_PDB_DIR="${RDIR}/refpdb"
+FOLDS="${RDIR}/folds.jsonl"; REF_FOLDS="${RDIR}/reffolds.jsonl"
+mkdir -p "${RDIR}" "${PDB_DIR}" "${REF_PDB_DIR}"
+
+job_banner "PLD2 preference tuning, round ${ROUND}" ROUND N_PROMPTS N_GEN GAMMA LOSS ALPHA STEPS \
+           PROMPT_SEED REF_SPLIT PHASES RDIR CKPT
+
+CKPT_FLAG=""; [ -n "${CKPT:-}" ] && CKPT_FLAG="--ckpt ${CKPT}"
+has() { [[ "${PHASES}" == *"$1"* ]]; }
+rc=0
+
+# --- the fold loop, used twice: references in phase 0, generations in phase 2 -------------------
+# COUNT RECORDS, NOT FILES. An earlier version counted FASTA groups in the summary table, which is
+# constant from the moment the files exist -- so every attempt read as "no progress" and the loop
+# gave up after the first fault having folded hundreds of sequences.
+fold_loop() {                          # $1 = out jsonl, $2 = pdb dir, rest = FASTA paths
+    local out="$1" pdbd="$2"; shift 2
+    local t0=$SECONDS stalls=0 rpn=${RANKS_PER_NODE} attempt before after frc
+    _nf() { cat "${out%.jsonl}"*.jsonl 2>/dev/null | wc -l | tr -d " "; }
+    _np() { cat "${pdbd}"/index.rank*.jsonl 2>/dev/null | wc -l | tr -d " "; }
+    for attempt in $(seq 1 "${FOLD_TRIES}"); do
+        if [ $(( SECONDS - t0 )) -ge "${FOLD_BUDGET}" ]; then
+            echo "[align] fold budget (${FOLD_BUDGET}s) spent after ${attempt} attempt(s)"; break
+        fi
+        before=$(_nf)
+        # shellcheck disable=SC2086
+        mpiexec -n "$(( NNODES * rpn ))" -ppn "${rpn}" --pmi=pmix --cpu-bind depth -d 8 \
+            python -m src.fold_fasta --device xpu --out "${out}" --pdb-dir "${pdbd}" \
+            "$@" ${FOLD_ARGS:-}
+        frc=$?
+        after=$(_nf)
+        if [ $frc -eq 0 ]; then
+            echo "[align] folding completed on attempt ${attempt} (${after} records, $(_np) PDBs)"
+            return 0
+        fi
+        echo "[align] fold attempt ${attempt} exited ${frc} at ${rpn} rank(s)/node: "\
+             "${before} -> ${after} records, $(_np) PDBs, $(( SECONDS - t0 ))s elapsed"
+        if [ "${after}" -gt "${before}" ]; then
+            stalls=0                                   # it crashed, but it also got work done
+        else
+            stalls=$(( stalls + 1 ))
+            # A fault during model load scores nothing and says nothing about whether the remaining
+            # sequences are foldable, so one stall is not evidence. Several in a row are.
+            if [ "${stalls}" -ge "${FOLD_STALL}" ]; then
+                if [ "${rpn}" -gt 1 ]; then
+                    echo "[align] ${stalls} stalled attempts; falling back to 1 rank/node, the"\
+                         "configuration with direct evidence behind it (see src/fold_fasta.py)."
+                    rpn=1; stalls=0
+                else
+                    echo "[align] ${stalls} stalled attempts at 1 rank/node; giving up on folding."
+                    return 1
+                fi
+            fi
+        fi
+    done
+    return 1
+}
+
+# --- phase 0: the reference set, then the prompts ------------------------------------------------
+if has 0; then
+    echo "[align] phase 0/5a: selecting captioned SwissProt proteins (split ${REF_SPLIT})"
+    N_REFS=$(python -c "print(int(${N_PROMPTS} * $(python -c 'from config import CFG; print(CFG.align.n_refs_factor)')))")
+    python -m src.reference_set fasta --dir "${RDIR}" --n "${N_REFS}" \
+        --split "${REF_SPLIT}" --seed "${PROMPT_SEED}" || exit 1
+
+    echo "[align] phase 0/5b: folding ${N_REFS} references -- these ARE the ground truth"
+    fold_loop "${REF_FOLDS}" "${REF_PDB_DIR}" "${RDIR}/refs.fasta"
+
+    echo "[align] phase 0/5c: foldseek 3Di off the reference structures"
+    python -m src.reference_set join --dir "${RDIR}" || exit 1
+
+    echo "[align] phase 0/5d: ${N_PROMPTS} partial-scaffold prompts (seed ${PROMPT_SEED})"
+    python -m src.prompts --dir "${RDIR}" --n "${N_PROMPTS}" --seed "${PROMPT_SEED}" || exit 1
+fi
+
+# --- phase 1: generate ---------------------------------------------------------------------------
+if has 1; then
+    echo "[align] phase 1/5: ${N_GEN} completions per prompt on ${NRANKS} tile(s)"
+    # shellcheck disable=SC2086
+    "${MPI_LAUNCH[@]}" python -m src.align_sample --device xpu --dir "${RDIR}" \
+        --n-gen "${N_GEN}" --gamma "${GAMMA}" ${CKPT_FLAG} ${GEN_ARGS:-}
+    rc=$?
+    [ $rc -ne 0 ] && echo "[align] generation exited ${rc}; folding what it did write." >&2
+fi
+
+# --- phase 2: fold the generations ---------------------------------------------------------------
+if has 2; then
+    shopt -s nullglob
+    GEN_FASTA=( "${RDIR}"/gen.rank*.fasta )
+    shopt -u nullglob
+    if [ ${#GEN_FASTA[@]} -eq 0 ]; then
+        echo "[align] no gen.rank*.fasta in ${RDIR} -- generation wrote nothing." >&2; exit 1
+    fi
+    echo "[align] phase 2/5: folding ${#GEN_FASTA[@]} generation FASTA(s)"
+    fold_loop "${FOLDS}" "${PDB_DIR}" "${GEN_FASTA[@]}"
+    echo "[align] fold summary:"
+    python -m src.fold_fasta --summarize --out "${FOLDS}" || true
+fi
+
+# --- phase 3: TM to the reference ----------------------------------------------------------------
+# CPU only, and foldseek is a subprocess, so this does not inherit the folding fault. A bad chunk is
+# skipped and the rank carries on (src/tm_align.py).
+if has 3; then
+    echo "[align] phase 3/5: TM-align every generation to its prompt's reference structure"
+    # shellcheck disable=SC2086
+    "${MPI_LAUNCH[@]}" python -m src.tm_align --dir "${RDIR}" --pdb-dir "${PDB_DIR}" \
+        --ref-pdb-dir "${REF_PDB_DIR}" ${TM_ARGS:-}
+    trc=$?
+    [ $trc -ne 0 ] && echo "[align] TM pass exited ${trc}; pairing what it did write." >&2
+fi
+
+# --- phase 4: pairs, and the pass@k table --------------------------------------------------------
+# Read the loglik column even if nothing else works. pLDDT selection already tracks the oracle, so
+# there is no selection loss left to recover; the model's own likelihood is the broken ranker, and
+# the distance between those two columns is exactly what phase 5 is trying to close.
+if has 4; then
+    echo "[align] phase 4/5: preference pairs"
+    python -m src.preference --dir "${RDIR}" --folds "${FOLDS%.jsonl}*.jsonl" ${PREF_ARGS:-} || exit 1
+fi
+
+# --- phase 5: tune -------------------------------------------------------------------------------
+if has 5; then
+    echo "[align] phase 5/5: ${LOSS} for ${STEPS} steps (alpha=${ALPHA})"
+    # shellcheck disable=SC2086
+    "${MPI_LAUNCH[@]}" python -m src.align --device xpu --dir "${RDIR}" --loss "${LOSS}" \
+        --alpha "${ALPHA}" --steps "${STEPS}" ${CKPT_FLAG} ${ALIGN_ARGS:-}
+    rc=$?
+fi
+
+echo "[align] round ${ROUND} artefacts in ${RDIR}"
+echo "[job] exit $rc"; exit $rc     # exit $rc so the EXIT trap reports the true code

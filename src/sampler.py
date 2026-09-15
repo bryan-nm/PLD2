@@ -299,7 +299,7 @@ def _place_eos_first(model, canvas, is_masked, guidance_fn, min_len, greedy, eos
 # --------------------------------------------------------------------------------------
 # Unified edit candidates (unmask OR substitute), scored on one confidence scale
 # --------------------------------------------------------------------------------------
-def _edit_candidates(probs, canvas, is_masked, n_aa, greedy):
+def _edit_candidates(probs, canvas, is_masked, n_aa, greedy, frozen=None):
     """One candidate edit per position, with a confidence comparable across both move types.
 
     masked position    -> the edit is an UNMASK.     token ~ p,          confidence = p(token)
@@ -336,6 +336,11 @@ def _edit_candidates(probs, canvas, is_masked, n_aa, greedy):
     token = torch.where(is_masked, tok_unmask, tok_sub)
     conf = torch.where(is_masked, conf_unmask, conf_sub)
     eligible = is_masked | is_residue
+    if frozen is not None:
+        # PROMPT POSITIONS ARE NOT EDITABLE. Substitution makes every committed residue a standing
+        # candidate, so without this the decoder would happily rewrite the scaffold it was given --
+        # and a prompt the generation is free to edit is not a prompt, it is an initialisation.
+        eligible = eligible & ~frozen
     return token, conf.masked_fill(~eligible, float("-inf")), eligible
 
 
@@ -343,7 +348,8 @@ def _edit_candidates(probs, canvas, is_masked, n_aa, greedy):
 # Correctors
 # --------------------------------------------------------------------------------------
 @torch.no_grad()
-def _corrector_sweep(model, canvas, frac, guidance_fn, greedy, temperature, min_len=0):
+def _corrector_sweep(model, canvas, frac, guidance_fn, greedy, temperature, min_len=0,
+                     frozen=None):
     """Remask the lowest-confidence committed positions and redecode them.
 
     min_len is threaded through for the same reason it exists in the main loop: a redecoded position
@@ -357,13 +363,18 @@ def _corrector_sweep(model, canvas, frac, guidance_fn, greedy, temperature, min_
     # position the structure track was already padded at, whose 3Di token is gone and cannot be
     # recovered. The two tracks then disagree about the length by one. Everything else the sweep
     # does is safe (a boundary moving LEFT just pads more), so only EOS is taken off the table.
-    fixed = canvas.dim() == 3 and canvas.shape[1] > 1
+    # A PROMPT ALSO FIXES THE BOUNDARY. The EOS came with the scaffold, so a sweep that deleted
+    # or moved it would change the length the prompt specified -- and PAD spreading left over frozen
+    # positions would overwrite context the caller guaranteed was preserved.
+    fixed = (canvas.dim() == 3 and canvas.shape[1] > 1) or frozen is not None
     lg = _step_logits(model, canvas, guidance_fn, ban_eos=fixed, eos_min_pos=min_len)[:, 0]
     probs = torch.softmax(lg / max(temperature, 1e-6), dim=-1)
     conf = probs.gather(-1, cv.unsqueeze(-1)).squeeze(-1)
     eligible = cv != cfg.pad_token_id                           # remask AAs / EOS, never PAD
     if fixed:
         eligible = eligible & (cv != cfg.eos_token_id)
+    if frozen is not None:
+        eligible = eligible & ~aa_track(frozen)                  # never remask the prompt
     conf_e = conf.masked_fill(~eligible, float("inf"))          # inf -> never picked as lowest
     k = (frac * eligible.sum(dim=1).float()).long().clamp(min=1)
     pick = _topk_mask(conf_e, k, largest=False) & eligible
@@ -377,7 +388,7 @@ def _corrector_sweep(model, canvas, frac, guidance_fn, greedy, temperature, min_
 
 @torch.no_grad()
 def _substitution_corrector_sweep(model, canvas, frac, guidance_fn, greedy, temperature,
-                                  min_len=0):
+                                  min_len=0, frozen=None):
     """Resample the lowest-confidence RESIDUES straight to new tokens -- no MASK detour.
 
     This is the corrector the D3PM half of the objective exists for: absorbing-state training only
@@ -388,12 +399,14 @@ def _substitution_corrector_sweep(model, canvas, frac, guidance_fn, greedy, temp
     """
     cfg = model.cfg
     cv = aa_track(canvas)                        # a VIEW; edits write through to `canvas`
-    lg = _step_logits(model, canvas, guidance_fn,
-                      eos_min_pos=min_len)[:, 0]            # MASK/PAD out; EOS allowed
+    lg = _step_logits(model, canvas, guidance_fn, ban_eos=frozen is not None,
+                      eos_min_pos=min_len)[:, 0]            # MASK/PAD out; EOS allowed unprompted
     probs = torch.softmax(lg / max(temperature, 1e-6), dim=-1)
     conf = probs.gather(-1, cv.unsqueeze(-1)).squeeze(-1)
     eligible = ((cv != cfg.pad_token_id) & (cv != cfg.eos_token_id)
                 & (cv != cfg.mask_token_id))
+    if frozen is not None:
+        eligible = eligible & ~aa_track(frozen)                  # never resample the prompt
     conf_e = conf.masked_fill(~eligible, float("inf"))
     k = (frac * eligible.sum(dim=1).float()).long().clamp(min=1)
     pick = _topk_mask(conf_e, k, largest=False) & eligible
@@ -415,6 +428,8 @@ def generate(model: LoopedDiffusionLM, Lmax: int, batch_size: int,
              rep_penalty: float = 1.5, rep_periods=(1, 2, 3, 4, 5), max_run: int = 5,
              n_recurrence: Optional[int] = None,
              subst_per_residue: float = 0.0, struct_first: float = 0.0,
+             prompt: Optional[torch.Tensor] = None,
+             prompt_mask: Optional[torch.Tensor] = None,
              stats: Optional[dict] = None):
     """Returns (canvas, lengths). canvas is (B, Lmax) at n_tracks=1 and (B, 2, Lmax) at n_tracks=2
     -- use sampler.aa_track() / sampler.struct_track() rather than indexing. Always well-formed
@@ -473,6 +488,24 @@ def generate(model: LoopedDiffusionLM, Lmax: int, batch_size: int,
                 the canvas filling up rather than needing a schedule. 0.0 disables substitution
                 entirely, recovering pure absorbing decoding bit-for-bit.
     stats       optional dict, filled with edit accounting if given.
+
+    ------------------------------------------------------------------------------------------
+    PROMPTING (prompt / prompt_mask)
+
+    prompt      (B,K,Lmax) or (B,Lmax) token ids. prompt_mask marks which of them are GIVEN.
+    prompt_mask (B,K,Lmax) or (B,Lmax) bool. True = this position is context, not something to
+                generate: it is written into the canvas before step 0 and FROZEN -- never unmasked,
+                never substituted, never remasked by a corrector.
+
+    The prompt owns the length. A prompted row must supply EOS and the whole PAD tail as given
+    positions (src.prompts builds them that way), so eos_first is skipped: the boundary is not a
+    decision the model makes when it has been handed a scaffold to complete. That also keeps the
+    cosine schedule honest -- n_active counts only what is actually still masked, so a 40%-masked
+    prompt spends its whole step budget on the 40% rather than idling over committed context.
+
+    A (B,L) prompt on a two-track model conditions the SEQUENCE track only; pass (B,K,L) to give
+    3Di context as well. Positions given in one track and masked in the other are the interesting
+    ones -- they are what makes this inverse folding or structure prediction rather than completion.
     """
     cfg = model.cfg
     B = batch_size
@@ -500,12 +533,50 @@ def generate(model: LoopedDiffusionLM, Lmax: int, batch_size: int,
     canvas = torch.full((B, K, Lmax), cfg.mask_token_id, dtype=torch.long, device=device)
     is_masked = torch.ones((B, K, Lmax), dtype=torch.bool, device=device)
 
+    frozen = None
+    if prompt is not None:
+        if prompt_mask is None:
+            raise ValueError("prompt needs prompt_mask: without it there is no way to tell given "
+                             "context from a position that merely happens to hold a token.")
+        _as3 = lambda t: (t if t.dim() == 3 else t.unsqueeze(1).expand(-1, K, -1))
+        pr, given = _as3(prompt).to(device), _as3(prompt_mask).to(device)
+        if pr.shape != canvas.shape:
+            raise ValueError(f"prompt is {tuple(pr.shape)}, canvas is {tuple(canvas.shape)}")
+        # A (B,L) prompt broadcasts across tracks, which would silently hand the structure track the
+        # amino-acid tokens. Only the sequence track takes a 1-track prompt.
+        if prompt.dim() == 2 and K > 1:
+            given = given.clone()
+            given[:, 1:] = False
+        frozen = given.clone()
+        canvas = torch.where(given, pr, canvas)
+        is_masked &= ~given
+        if not bool((aa_track(canvas) == cfg.eos_token_id).any(dim=1).all()):
+            raise ValueError(
+                "every prompted row must give an EOS in track 0. The prompt fixes the length -- a "
+                "row without one has no boundary, so _enforce_eos cannot lay down the PAD tail, "
+                "the model would be completing a 512-wide canvas instead of the scaffold, and "
+                "_place_eos_first would be free to write its EOS on top of frozen context. "
+                "src.prompts.materialize gives EOS and the whole PAD tail; a free-length prompt "
+                "would need the boundary draw restricted to non-frozen positions first.")
+        _enforce_eos(canvas, is_masked, cfg)
+        frozen |= ~is_masked                    # the PAD tail EOS pinned is context too
+        eos_first = False                       # the boundary came with the prompt
+
     if eos_first:
         _place_eos_first(model, canvas, is_masked, guide, min_len, greedy, eos_temp)
+
+    # THE BOUNDARY IS ALREADY FIXED IN BOTH CASES, and EOS has to be banned in both. eos_first
+    # commits it before step 0; a prompt arrives with it already committed. Without this the decoder
+    # can emit an EOS to the LEFT of the prompt's, _enforce_eos honours the leftmost one, and the
+    # PAD tail spreads back over frozen context -- silently truncating the scaffold the caller was
+    # promised would be preserved.
+    boundary_fixed = eos_first or frozen is not None
 
     # Per-ROW schedule budget. A cosine schedule over Lmax would assume the whole canvas is still in
     # play; after eos_first most of it is already committed PAD, so an Lmax-based target sits above
     # the true masked count for most of the run and commits nothing until a rush at the very end.
+    # With a prompt the same argument applies to the revealed scaffold, so a 40%-masked prompt
+    # spends its whole step budget on the 40%.
     # Summed over BOTH tracks: the schedule's budget is slots, and a structure slot costs a commit
     # exactly like a residue slot does.
     n_active = is_masked.flatten(1).sum(dim=1).to(torch.float32)
@@ -519,12 +590,12 @@ def generate(model: LoopedDiffusionLM, Lmax: int, batch_size: int,
     for step in range(n_steps):
         if not bool(is_masked.any()) and not use_subst:
             break
-        lg = _step_logits(model, canvas, guide, ban_eos=eos_first,
-                          eos_min_pos=(0 if eos_first else min_len))
+        lg = _step_logits(model, canvas, guide, ban_eos=boundary_fixed,
+                          eos_min_pos=(0 if boundary_fixed else min_len))
         probs = torch.softmax(lg / max(temperature, 1e-6), dim=-1)
 
         if use_subst:
-            tok, conf, eligible = _edit_candidates(probs, canvas, is_masked, 20, greedy)
+            tok, conf, eligible = _edit_candidates(probs, canvas, is_masked, 20, greedy, frozen)
         else:                                    # absorbing-only: identical to the previous sampler
             tok, conf = _sample(probs, greedy)
             eligible = is_masked
@@ -576,10 +647,10 @@ def generate(model: LoopedDiffusionLM, Lmax: int, batch_size: int,
     for _ in range(n_corrector):
         if corrector_type == "substitution":
             _substitution_corrector_sweep(model, canvas, corrector_frac, guide, greedy,
-                                          temperature, min_len=min_len)
+                                          temperature, min_len=min_len, frozen=frozen)
         else:
             _corrector_sweep(model, canvas, corrector_frac, guide, greedy, temperature,
-                             min_len=min_len)
+                             min_len=min_len, frozen=frozen)
 
     if was_training:
         model.train()

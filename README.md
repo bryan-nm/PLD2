@@ -343,7 +343,15 @@ src/
   preprocess_fasta.py # UniRef FASTA -> packed uint8 shards
   dist.py             # Aurora XPU + oneCCL bootstrap, grad/stat all-reduce buffers
   xpu_linalg_guard.py # CPU round-trip for torch.linalg ops that lack XPU kernels
-scripts/              # pbs_common.sh, train.pbs, fold.pbs, sweep.pbs, sample.pbs, preprocess.pbs
+  reference_set.py    # captioned SwissProt proteins, ESMFolded once: scaffold + TM target + caption
+  prompts.py          # partial-scaffold prompt manifest: the x in (y_w, y_l, x)
+  align_sample.py     # N completions per prompt, resumable at prompt granularity
+  tm_align.py         # foldseek TMalign: every generation vs its prompt's reference structure
+  preference.py       # reward -> pairs, and the pass@k vs best-of-k table
+  align.py            # IPO (default) / DPO preference tuning, with the drift monitors
+  tests_align.py      # prompt freezing, shared masks, the surrogate, IPO stops / DPO does not
+scripts/              # pbs_common.sh, train.pbs, fold.pbs, sweep.pbs, sample.pbs,
+                      #   preprocess.pbs, conditional.pbs, align.pbs
 ```
 
 ## Run
@@ -361,6 +369,7 @@ python -m src.objective        # one loss trains both move types; corruption lin
 python -m src.metrics          # a hidden 20-mer repeat is invisible to LCR, visible at k13
 python -m src.tests_sampler    # 36 decode configs: well-formed, and exactly N forwards
 python -m src.tests_corruption # MASK absorbing, L_T ~ 0, Qbar vs explicit product, KL identities
+python -m src.tests_align      # prompts stay frozen; masks are shared; IPO stops, DPO does not
 
 # diagnosis, when generations fold at the floor
 python -m src.ce_curve         # does the model know anything at COLD START, or only composition?
@@ -370,6 +379,20 @@ qsub scripts/sweep.pbs         # ...the same thing on Aurora: generate, fold, on
 # Aurora
 qsub scripts/train.pbs                 # training + co-scheduled ESMFold watcher
 python -m src.fold_fasta --summarize   # the results table, any time, no GPU
+
+# preference tuning, one round end to end (16 nodes)
+qsub scripts/align.pbs                              # IPO, 1k prompts x 16 completions
+qsub -v PHASES=0 scripts/align.pbs                  # reference set + prompts only
+qsub -v LOSS=dpo scripts/align.pbs                  # the same pairs under DPO
+qsub -v ALPHA=0 scripts/align.pbs                   # the SFT baseline (ESM3's A.4.6)
+qsub -v PHASES=4 scripts/align.pbs                  # re-pair only -- the pass@k table is free
+python -m src.preference --report --dir <round>     # ...or read it without a queue slot
+
+# laptop smoke: tiny random model, every phase but ESMFold and foldseek
+python -m src.prompts --dir /tmp/r --n 10 --canvas 64 --min-len 20
+python -m src.align_sample --smoke --device cpu --dir /tmp/r --n-gen 6 --canvas 64 --gamma 0
+python -m src.align --smoke --device cpu --dir /tmp/r --canvas 64 --steps 4
+python -m src.align --smoke --device cpu --dir /tmp/r --steps 0   # drift baseline, no checkpoint
 ```
 
 ## Data
@@ -420,6 +443,82 @@ Regenerating `natural.fasta` with entirely different sequences reuses `natural|n
 id-only key silently reported "400 already scored | 0 to do" for two files whose contents had
 completely changed. The summary also keeps the newest record per id, so stale rows heal themselves
 rather than needing the JSONL deleted.
+
+## Preference tuning (`scripts/align.pbs`)
+
+ESM3's alignment procedure (Appendix A.4), with departures where our situation differs from theirs.
+The measurement that motivates it: **best-of-N by an external scorer beats best-of-N by the model's
+own log-likelihood by 5-40x, and at low guidance the likelihood ranker is worse than a random
+draw** -- 0.7% at N=1 falling monotonically to 0.0% at N=8. The model produces successful proteins
+at ~1% per draw and then ranks them below the bad ones. Fixing a ranking is what DPO and IPO do;
+that is a far better fit than inducing a capability that is not there.
+
+```
+phase 0  src.reference_set  captioned SwissProt proteins -> ESMFold -> foldseek 3Di. ONE PREDICTOR:
+     +   src.prompts        the scaffold's 3Di, the TM target and the caption all come from one
+                            fold of one protein. Prompts are span-masked on the same correlated
+                            field the objective corrupts with, stratified by mask rate with a
+                            third at 1.0, which is the cold start.
+phase 1  src.align_sample   16 completions per prompt, and the model's own log-likelihood for each.
+                            The prompt owns the length, so a pair's two sides are the same length.
+phase 2  src.fold_fasta     pLDDT/pTM + PDBs. Relaunched in a loop; ESMFold aborts and the pipeline
+                            is built around that, not in spite of it.
+phase 3  src.tm_align       TM to the reference structure. The half of the reward that makes the
+                            other half safe: a poly-alanine helix scores well on pLDDT, and nowhere
+                            here.
+phase 4  src.preference     pairs, plus the pass@k vs best-of-k table
+phase 5  src.align          IPO by default, DPO wired, alpha=0 gives SFT
+```
+
+**One predictor, end to end.** Carving prompts out of the AFDB shards would hand the model an
+AlphaFold-derived 3Di scaffold and grade it against an ESMFold structure -- a predictor change
+inside the measurement, and not a constant offset: the disagreement is largest exactly where
+prediction is hardest, which is where the interesting samples are. Building the reference set from
+captioned SwissProt instead removes that, and it is also what makes caption guidance possible at
+all, since AFDB records have no text side. It costs a small, symmetric distribution shift the other
+way (PLD2 was *trained* on AlphaFold-derived 3Di), which is exactly the quantity the
+`natural (ceiling)` row of `src/self_consistency.py` measures.
+
+Four departures from ESM3, each because our numbers differ from theirs:
+
+**IPO, not DPO.** DPO's log-sigmoid is unbounded, so its implicit KL constraint collapses when
+preferences are near-deterministic -- and ours are deterministic by construction, built from a
+metric gap rather than noisy human labels. IPO's squared loss has a finite optimum. The margin is
+expressed **per position**, since the surrogate is a masked mean, which makes it a legible
+nats-per-token budget rather than a length-dependent number.
+
+**Relative, within-prompt thresholds.** ESM3 demanded pTM > 0.8 and cRMSD < 1.5A and discarded
+prompts producing none; its base model made such samples in quantity. Ours clears an absolute bar
+~1% of the time, so at n_gen=16 only ~11% of prompts would contain one and 89% of the fold budget
+would be thrown away. `align.success_weight` reintroduces absolute quality by upweighting pairs
+whose winner clears the bar outright; it is **1.0, i.e. off**.
+
+**n_gen is the ceiling, prompts are the fidelity.** The winner is a best-of-n order statistic and
+the supervised term teaches the model to imitate it, so `E[max of n] * sigma` is how far one round
+can pull the one-shot distribution. More prompts estimate that target better; only n moves it.
+Prompt diversity is bought across rounds instead, which on-policy data requires anyway.
+
+**Generate at low guidance.** Measured: the best-of-N multiplier collapses monotonically with
+caption-guidance strength (5.7x at g10, 2.7x at g30, 1.9x at g100) and by N=10 the ordering
+reverses. Guidance and best-of-N spend the same resource -- within-prompt spread -- and spread is
+what every pair is cut from.
+
+**pLDDT selection already tracks the oracle.** Measured at n=100 queries: `best-of-k pLDDT` equals
+`pass@k` at every k, so there is no selection loss left to recover and a better ranker buys nothing.
+The broken ranker is the model's own likelihood -- 0.007 at N=1 falling monotonically to 0.000 at
+N=8 where pLDDT runs 0.007 to 0.040. `src.preference` prints all three columns side by side, and
+`src.align_sample` records the log-likelihood at generation time so the gap can be watched closing
+round over round. If it does not close, the tuning is not working.
+
+**What to watch during tuning.** Not the margin. DPO's characteristic failure lowers `log pi(y_w)` while the
+margin rises, so the log line reports the winner's **absolute** log-likelihood, and every eval
+reports the surrogate NLL on held-out **natural** sequences. That second number is decisive: if it
+rises, the policy has left the data manifold whatever the preference metrics say.
+
+**It is iterative and the round number is load-bearing.** Round 2 generates from the policy round 1
+produced, on a fresh prompt set. Pairs from a policy that no longer exists are not merely stale,
+they are mislabelled -- the reference term measures movement away from a model that is no longer
+the one being moved.
 
 ## Deviations from ProLoopDiff beyond the eight instructions
 

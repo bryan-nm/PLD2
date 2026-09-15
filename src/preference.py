@@ -1,0 +1,309 @@
+"""Turn folded, TM-scored generations into preference pairs -- and report what the pool contains.
+
+    python -m src.preference --report          # the pass@k table; no pairs written
+    python -m src.preference                   # write <round>/pairs.jsonl
+
+WITHIN-PROMPT RANKING, NOT ABSOLUTE THRESHOLDS. ESM3 kept generations with pTM > 0.8 and
+cRMSD < 1.5A and threw away every prompt that produced none (Appendix A.4.4). It could afford to:
+its base model hit pTM 0.85 on ordinary prompted generation, so positives were abundant. Ours clear
+an absolute bar about 1% of the time, so at n_gen=16 roughly 11% of prompts would contain a single
+qualifying sample and the other 89% of the fold budget would be discarded. Ranking inside a prompt
+yields a usable pair at every difficulty instead, and difficulty cancels exactly because both sides
+of a pair saw the same context.
+
+What that costs is the absolute quality of the winner, and align.success_weight is the knob that
+buys some of it back: it upweights pairs whose winner clears the absolute bar outright. It is 1.0
+by default -- OFF -- because the relative construction should be shown to work on its own first.
+
+TWO PAIR CONSTRUCTIONS, AND THE SECOND IS THE ONE AIMED AT OUR ACTUAL FAILURE MODE.
+
+  rank      top_k winners x bot_k losers by the scalar reward. The workhorse.
+  matched   two generations with nearly the SAME pLDDT and different TM. Quality is held fixed
+            across the pair, so the only thing the gradient can carry is prompt consistency --
+            "fold into the right shape", not "fold". This is the construction that needs n_gen to
+            be large: it is a matched-pair design on a second variable, and at n_gen=2 you take
+            whatever you are given. It is also the one that pushes away from the degenerate
+            solution, since a confident wrong fold is exactly what sits on the loser side.
+
+REWARD. w_plddt * pLDDT + w_tm * TM, used for RANKING ONLY -- the loss never sees its magnitude,
+because DPO and IPO both treat preference as binary. That is precisely why min_gap exists: a
+mislabelled pair contributes a gradient of exactly the same size as a correct one, so pairs whose
+two sides differ by less than the metric's own noise are worse than no pairs at all.
+"""
+from __future__ import annotations
+import argparse
+import glob as glob_
+import json
+import math
+import os
+import sys
+from collections import defaultdict
+
+import numpy as np
+
+from config import CFG
+from .self_consistency import record_key
+
+
+def _read_jsonl(paths):
+    for p in paths:
+        with open(p) as fh:
+            for line in fh:
+                try:
+                    yield json.loads(line)
+                except Exception:
+                    continue                    # truncated final line after an abort
+
+
+def load_pool(rdir, folds=None):
+    """-> {pid: [sample dicts]} joined across generation, folding and TM.
+
+    A sample is kept only if all three sides are present. They are produced by three separate
+    passes that each crash and resume independently, so partial coverage is the normal state of
+    this directory mid-campaign, not an error.
+    """
+    gen = {}
+    for r in _read_jsonl(sorted(glob_.glob(os.path.join(rdir, "gen.rank*.jsonl")))):
+        gen[r["gid"]] = r
+    fold = {}
+    for r in _read_jsonl(sorted(glob_.glob(folds or os.path.join(rdir, "folds*.jsonl")))):
+        if "id" in r:
+            fold[record_key(r["id"])] = r       # "gen|p0000042_7" -> "p0000042_7"
+    tm = {}
+    for r in _read_jsonl(sorted(glob_.glob(os.path.join(rdir, "tm.rank*.jsonl")))):
+        tm[r["gid"]] = r
+
+    pool = defaultdict(list)
+    for gid, g in gen.items():
+        f, t = fold.get(gid), tm.get(gid)
+        if f is None or t is None:
+            continue
+        pool[g["pid"]].append({**g, "plddt": float(f["plddt"]), "ptm": float(f["ptm"]),
+                               "tm": float(t.get(CFG.align.tm_field, 0.0)),
+                               "alntm": float(t.get("alntmscore", 0.0))})
+    return dict(pool), len(gen), len(fold), len(tm)
+
+
+def score(s, acfg):
+    return acfg.reward_plddt * s["plddt"] + acfg.reward_tm * s["tm"]
+
+
+def succeeded(s, acfg):
+    return s["plddt"] > acfg.plddt_success and s["tm"] > acfg.tm_success
+
+
+# --------------------------------------------------------------------------------------
+# the pass@k table
+# --------------------------------------------------------------------------------------
+def pass_at_k(n, c, k):
+    """Chen et al.'s unbiased estimator: P(at least one of k draws succeeds) given c of n do."""
+    if n - c < k:
+        return 1.0
+    return 1.0 - math.comb(n - c, k) / math.comb(n, k)
+
+
+def selector_at_k(succ_sorted, k):
+    """P(the top-1 BY SELECTOR of a random k-subset is a success), exactly.
+
+    Sort the pool by the selector, descending. The top-1 of a random k-subset is the sample at rank
+    r exactly when the other k-1 all come from the n-1-r samples ranked below it, so the weight on
+    rank r is C(n-1-r, k-1) / C(n, k). This is the number the best-of-N curve reports, and it is
+    NOT pass@k: pass@k is what an oracle would find, and the difference between them is how much
+    the selector is leaving on the table.
+    """
+    n = len(succ_sorted)
+    if k > n:
+        return float("nan")
+    tot = math.comb(n, k)
+    return sum(math.comb(n - 1 - r, k - 1) for r, ok in enumerate(succ_sorted) if ok
+               and n - 1 - r >= k - 1) / tot
+
+
+def report(pool, acfg, max_k=None):
+    pids = sorted(pool)
+    ns = [len(pool[p]) for p in pids]
+    n_min = min(ns) if ns else 0
+    max_k = max_k or n_min
+    all_s = [s for p in pids for s in pool[p]]
+    if not all_s:
+        print("[pref] nothing scored yet")
+        return
+
+    succ = [succeeded(s, acfg) for s in all_s]
+    print(f"[pref] {len(pids):,} prompts, {len(all_s):,} scored generations "
+          f"({np.mean(ns):.1f} per prompt, min {n_min})")
+    print(f"[pref] success = pLDDT > {acfg.plddt_success} AND {acfg.tm_field} > {acfg.tm_success}"
+          f"  ->  per-draw rate {np.mean(succ):.3%}")
+    print(f"[pref] pLDDT {np.mean([s['plddt'] for s in all_s]):.3f}"
+          f" +- {np.std([s['plddt'] for s in all_s]):.3f}   "
+          f"TM {np.mean([s['tm'] for s in all_s]):.3f}"
+          f" +- {np.std([s['tm'] for s in all_s]):.3f}   "
+          f"pTM {np.mean([s['ptm'] for s in all_s]):.3f}")
+
+    # WITHIN-PROMPT sigma is the quantity that sets the ceiling of this whole exercise: the winner
+    # is a best-of-n order statistic, the supervised term teaches the model to imitate it, so
+    # E[max of n] * sigma is how far the one-shot distribution can be pulled in one round.
+    within = [np.std([score(s, acfg) for s in pool[p]]) for p in pids if len(pool[p]) > 1]
+    if within:
+        sig = float(np.mean(within))
+        base = float(np.mean([score(s, acfg) for s in all_s]))
+        rng = np.random.default_rng(0)
+        print(f"[pref] reward {base:.3f}, within-prompt sigma {sig:.3f}, "
+              f"between-prompt sigma {np.std([np.mean([score(s, acfg) for s in pool[p]]) for p in pids]):.3f}")
+        print("[pref] implied one-shot ceiling (reward the tuned model is being aimed at):")
+        for k in (1, 2, 4, 8, 16, 32):
+            if k <= max_k or k <= 32:
+                e = float(rng.standard_normal((200_000, k)).max(axis=1).mean())
+                print(f"[pref]     n={k:<3} {base + e * sig:.3f}")
+
+    print(f"\n{'k':>4} {'pass@k (oracle)':>16} {'best-of-k pLDDT':>17} "
+          f"{'best-of-k loglik':>17} {'best-of-k reward':>17}")
+    print("-" * 77)
+    for k in range(1, max_k + 1):
+        row = [k]
+        row.append(float(np.mean([pass_at_k(len(pool[p]), sum(succeeded(s, acfg) for s in pool[p]), k)
+                                  for p in pids if len(pool[p]) >= k])))
+        for key in ("plddt", "loglik", "_reward"):
+            vals = []
+            for p in pids:
+                ss = pool[p]
+                if len(ss) < k or any(s.get(key) is None for s in ss if key != "_reward"):
+                    continue
+                order = sorted(ss, key=(lambda s: score(s, acfg)) if key == "_reward"
+                               else (lambda s: s.get(key, 0.0)), reverse=True)
+                vals.append(selector_at_k([succeeded(s, acfg) for s in order], k))
+            row.append(float(np.mean(vals)) if vals else float("nan"))
+        print(f"{row[0]:>4} {row[1]:>16.4f} {row[2]:>17.4f} {row[3]:>17.4f} {row[4]:>17.4f}")
+    print("\n[pref] THE COLUMN TO READ IS loglik. pLDDT selection already tracks the oracle -- "
+          "measured, at\n[pref] n=100 queries, identically at every k -- so there is no selection "
+          "loss left to recover and\n[pref] a better ranker buys nothing. The model's OWN "
+          "likelihood is the broken one: best-of-N by it\n[pref] runs 0.007 -> 0.000 where pLDDT "
+          "runs 0.007 -> 0.040. The generator makes good proteins\n[pref] and ranks them below the "
+          "bad ones. That gap is exactly what a preference loss repairs, so\n[pref] it should "
+          "narrow round over round; if it does not, the tuning is not doing its job.",
+          flush=True)
+
+
+# --------------------------------------------------------------------------------------
+# pair construction
+# --------------------------------------------------------------------------------------
+def rank_pairs(ss, acfg):
+    order = sorted(ss, key=lambda s: score(s, acfg), reverse=True)
+    wins, losses = order[:acfg.top_k], order[-acfg.bot_k:]
+    out = []
+    for w in wins:
+        for l in losses:
+            if w["gid"] == l["gid"]:
+                continue
+            gap = score(w, acfg) - score(l, acfg)
+            if gap < acfg.min_gap:
+                continue
+            out.append((w, l, gap, "rank"))
+    return out
+
+
+def matched_pairs(ss, acfg, limit):
+    """Pairs matched on pLDDT and split on TM: same confidence, different correctness.
+
+    Both sides fold; only one folds into the shape it was asked for. Nothing about overall quality
+    distinguishes them, so nothing about overall quality can be what the gradient learns.
+    """
+    out = []
+    for i, a in enumerate(ss):
+        for b in ss[i + 1:]:
+            if abs(a["plddt"] - b["plddt"]) > acfg.matched_plddt_tol:
+                continue
+            w, l = (a, b) if a["tm"] >= b["tm"] else (b, a)
+            gap = w["tm"] - l["tm"]
+            if gap < max(acfg.min_gap, 1e-9):
+                continue
+            out.append((w, l, gap, "matched"))
+    out.sort(key=lambda t: t[2], reverse=True)
+    return out[:limit]
+
+
+def build_pairs(pool, acfg):
+    pairs, n_succ_w = [], 0
+    for pid in sorted(pool):
+        ss = pool[pid]
+        if len(ss) < 2:
+            continue
+        got = rank_pairs(ss, acfg)
+        if acfg.matched_frac > 0:
+            got += matched_pairs(ss, acfg, max(1, int(round(acfg.matched_frac * max(len(got), 1)))))
+        for w, l, gap, kind in got:
+            ok = succeeded(w, acfg)
+            n_succ_w += ok
+            pairs.append({
+                "pair_id": f"{pid}:{w['gid']}:{l['gid']}:{kind}",
+                "pid": pid, "kind": kind, "gap": round(gap, 5),
+                "L": int(w["ref_len"]), "bin": w["bin"], "rate": w["rate"],
+                "winner_success": bool(ok),
+                "weight": float(acfg.success_weight if ok else 1.0),
+                "w": {"gid": w["gid"], "seq": w["seq"], "di": w["di"],
+                      "plddt": w["plddt"], "tm": w["tm"]},
+                "l": {"gid": l["gid"], "seq": l["seq"], "di": l["di"],
+                      "plddt": l["plddt"], "tm": l["tm"]},
+            })
+    return pairs, n_succ_w
+
+
+def main():
+    sys.stdout.reconfigure(line_buffering=True)
+    acfg = CFG.align
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dir", default=None, help="round directory (default: config align.round_dir)")
+    ap.add_argument("--folds", default=None, help="folds JSONL glob (default: <round>/folds*.jsonl)")
+    ap.add_argument("--out", default=None, help="default: <round>/pairs.jsonl")
+    ap.add_argument("--report", action="store_true", help="print the pass@k table and exit")
+    ap.add_argument("--success-weight", type=float, default=None,
+                    help="override align.success_weight (1.0 = off)")
+    ap.add_argument("--min-gap", type=float, default=None)
+    a = ap.parse_args()
+    if a.success_weight is not None:
+        acfg.success_weight = a.success_weight
+    if a.min_gap is not None:
+        acfg.min_gap = a.min_gap
+
+    rdir = a.dir or acfg.round_dir
+    pool, n_gen, n_fold, n_tm = load_pool(rdir, a.folds)
+    print(f"[pref] {rdir}: {n_gen:,} generated | {n_fold:,} folded | {n_tm:,} TM-scored | "
+          f"{sum(len(v) for v in pool.values()):,} joined across all three", flush=True)
+    if not pool:
+        raise SystemExit("nothing joined. Check that folding used --out <round>/folds.jsonl and "
+                         "--pdb-dir <round>/pdb, and that src.tm_align has run.")
+    report(pool, acfg)
+    if a.report:
+        return
+
+    pairs, n_succ_w = build_pairs(pool, acfg)
+    out = a.out or os.path.join(rdir, "pairs.jsonl")
+    tmp = out + ".tmp"
+    with open(tmp, "w") as fh:
+        for p in pairs:
+            fh.write(json.dumps(p) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, out)
+
+    kinds = defaultdict(int)
+    for p in pairs:
+        kinds[p["kind"]] += 1
+    n_prompts_with = len({p["pid"] for p in pairs})
+    print(f"\n[pref] {len(pairs):,} pairs from {n_prompts_with:,} prompts "
+          f"({dict(kinds)}), min_gap={acfg.min_gap}")
+    print(f"[pref] winner clears the absolute bar in {n_succ_w:,} pairs "
+          f"({n_succ_w / max(len(pairs), 1):.1%}); success_weight={acfg.success_weight}"
+          f"{'  (OFF)' if acfg.success_weight == 1.0 else ''}")
+    print(f"[pref] mean reward gap {np.mean([p['gap'] for p in pairs]):.3f}, "
+          f"median {np.median([p['gap'] for p in pairs]):.3f}")
+    for b in sorted({p["bin"] for p in pairs}):
+        sel = [p for p in pairs if p["bin"] == b]
+        print(f"[pref]   mask rate {sel[0]['rate']:<5} {len(sel):>7,} pairs "
+              f"({len(sel) / len(pairs):5.1%})"
+              + ("   <- cold start" if sel[0]["rate"] >= 1.0 else ""))
+    print(f"[pref] wrote {out}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

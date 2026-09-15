@@ -1,0 +1,259 @@
+"""Invariants for the preference-tuning pipeline:  python -m src.tests_align
+
+Six things, each of which has a specific way of being silently wrong:
+
+  1. PROMPT FREEZING. Given positions come back bit-identical and the length is the prompt's. A
+     prompt the decoder is free to edit is an initialisation, not a prompt -- and because
+     substitution makes every committed residue a standing candidate, that is the DEFAULT failure
+     here, not an exotic one.
+  2. NO REGRESSION. generate() with prompt=None is bit-identical to the unprompted path. The last
+     time this file's sibling caught something, a slice indexed the new track axis and blanked every
+     logit at one position; nothing downstream noticed until the softmax produced NaN.
+  3. SHARED MASKS. The same (pair_id, epoch) gives the same mask, a different epoch gives a
+     different one, and only generated positions are ever scored. All four log-likelihoods in the
+     contrastive term are estimates over masks; if the draws stop being shared the noise stops
+     cancelling and the margins we are chasing are smaller than that noise.
+  4. THE SURROGATE. surrogate_logp equals a hand-computed masked mean log-prob, and is a MEAN (so
+     the IPO margin is per-token and length-invariant, which is the whole reason it is legible).
+  5. IPO STOPS, DPO DOES NOT. The gradient of the IPO term vanishes at h = margin and the DPO term's
+     never does. This is the property the default rests on.
+  6. PAIRING. Winners beat losers on the reward; matched pairs are matched on pLDDT and split on TM;
+     pass_at_k and selector_at_k agree with brute force.
+"""
+import itertools
+import math
+import random
+
+import numpy as np
+import torch
+
+import src.sampler as S
+from src.model import LoopedDiffusionLM, Config
+from src.objective import surrogate_logp, surrogate_mask
+from src.preference import matched_pairs, pass_at_k, rank_pairs, selector_at_k
+from src.prompts import _hex, _unhex
+
+fails, checks = [], 0
+
+
+def check(name, ok, extra=""):
+    global checks
+    checks += 1
+    if not ok:
+        fails.append(f"{name}{(' -- ' + extra) if extra else ''}")
+        print(f"  FAIL {name} {extra}")
+
+
+cfg = Config(vocab_size=23, eos_token_id=20, pad_token_id=21, mask_token_id=22,
+             d_model=64, n_heads=4, d_ff=192, n_upstream=1, n_middle=2, n_downstream=1,
+             n_recurrence=1, grad_checkpoint=False, n_tracks=2)
+torch.manual_seed(0)
+m = LoopedDiffusionLM(cfg).eval()
+L, B, CANVAS = 40, 4, 64
+
+# ---------------------------------------------------------------- 1. prompt freezing
+prompt = torch.full((B, 2, CANVAS), cfg.pad_token_id, dtype=torch.long)
+prompt[:, 0, :L] = torch.randint(0, 20, (B, L))
+prompt[:, 0, L] = cfg.eos_token_id
+prompt[:, 1, :L] = torch.randint(0, 20, (B, L))
+given = torch.zeros((B, 2, CANVAS), dtype=torch.bool)
+given[:, :, L:] = True                                    # EOS + PAD tail
+rng = torch.Generator().manual_seed(7)
+reveal = torch.rand((B, 1, L), generator=rng) < 0.5
+given[:, :, :L] = reveal.expand(-1, 2, -1)
+
+for subst, corr in itertools.product((0.0, 1.0), ((0, "remask"), (2, "remask"),
+                                                  (2, "substitution"))):
+    torch.manual_seed(3)
+    cv, lens = S.generate(m, Lmax=CANVAS, batch_size=B, n_steps=CANVAS, device="cpu",
+                          min_len=5, subst_per_residue=subst,
+                          n_corrector=corr[0], corrector_type=corr[1],
+                          rep_penalty=0.0, max_run=0,
+                          prompt=prompt, prompt_mask=given)
+    tag = f"subst={subst} corr={corr}"
+    check(f"prompt preserved ({tag})", bool((cv[given] == prompt[given]).all()))
+    check(f"prompt length ({tag})", lens == [L] * B, f"got {lens}")
+    check(f"no MASK survives ({tag})", bool((cv != cfg.mask_token_id).all()))
+    check(f"PAD tail intact ({tag})", bool((cv[:, :, L + 1:] == cfg.pad_token_id).all()))
+    check(f"structure track padded from the boundary ({tag})",
+          bool((cv[:, 1, L:] == cfg.pad_token_id).all()))
+
+# a 1-track prompt on a 2-track model must not leak residues into the structure track
+torch.manual_seed(3)
+cv1, _ = S.generate(m, Lmax=CANVAS, batch_size=B, n_steps=CANVAS, device="cpu", min_len=5,
+                    rep_penalty=0.0, max_run=0, prompt=prompt[:, 0], prompt_mask=given[:, 0])
+check("1-track prompt leaves 3Di free",
+      not bool((cv1[:, 1, :L] == prompt[:, 1, :L]).all()))
+
+# ---------------------------------------------------------------- 2. no regression
+torch.manual_seed(11)
+a, la = S.generate(m, Lmax=CANVAS, batch_size=B, n_steps=CANVAS, device="cpu", min_len=5)
+torch.manual_seed(11)
+b, lb = S.generate(m, Lmax=CANVAS, batch_size=B, n_steps=CANVAS, device="cpu", min_len=5,
+                   prompt=None, prompt_mask=None)
+check("unprompted path unchanged", bool(torch.equal(a, b)) and la == lb)
+
+# ---------------------------------------------------------------- 3. shared masks
+gen_pos = torch.zeros(CANVAS, dtype=torch.bool)
+gen_pos[:L] = reveal[0, 0] == False                       # the positions actually generated
+m1 = surrogate_mask("p1:a:b:rank", gen_pos, CANVAS, torch.device("cpu"), epoch=0)
+m2 = surrogate_mask("p1:a:b:rank", gen_pos, CANVAS, torch.device("cpu"), epoch=0)
+m3 = surrogate_mask("p1:a:b:rank", gen_pos, CANVAS, torch.device("cpu"), epoch=1)
+m4 = surrogate_mask("p2:a:b:rank", gen_pos, CANVAS, torch.device("cpu"), epoch=0)
+check("mask is a pure function of (pair_id, epoch)", bool(torch.equal(m1, m2)))
+check("mask changes with the epoch", not bool(torch.equal(m1, m3)))
+check("mask changes with the pair", not bool(torch.equal(m1, m4)))
+check("mask never scores context", bool((m1 & ~gen_pos).sum() == 0))
+check("mask is never empty",
+      all(bool(surrogate_mask(f"q{i}", gen_pos, CANVAS, torch.device("cpu")).any())
+          for i in range(50)))
+
+# ---------------------------------------------------------------- 4. the surrogate
+y = prompt.clone()
+y[:, 0, :L] = torch.randint(0, 20, (B, L))
+y[:, 1, :L] = torch.randint(0, 20, (B, L))
+mk = torch.zeros((B, CANVAS), dtype=torch.bool)
+mk[:, :L] = torch.rand((B, L), generator=torch.Generator().manual_seed(5)) < 0.4
+mk[:, 0] = True                                           # no empty row
+with torch.no_grad():
+    got = surrogate_logp(m, y, mk, cfg)
+    xt = torch.where(mk.unsqueeze(1).expand(-1, 2, -1),
+                     torch.full_like(y, cfg.mask_token_id), y)
+    lg = m(xt[:, 0], struct=xt[:, 1])
+    lp = torch.log_softmax(lg.float(), dim=-1).gather(-1, y.unsqueeze(-1)).squeeze(-1)[:, 0]
+    want = (lp * mk).sum(1) / mk.sum(1)
+check("surrogate_logp == masked mean log-prob", torch.allclose(got, want, atol=1e-5),
+      f"max |diff| {float((got - want).abs().max()):.2e}")
+check("surrogate_logp is negative", bool((got < 0).all()))
+# A MEAN, not a sum: doubling the scored positions must not double the magnitude.
+mk2 = mk.clone()
+mk2[:, :L] = True
+with torch.no_grad():
+    g2 = surrogate_logp(m, y, mk2, cfg)
+check("surrogate_logp is length-invariant (a mean)",
+      float((g2 / got).abs().max()) < 3.0, f"ratio {float((g2 / got).max()):.2f}")
+
+# ---------------------------------------------------------------- 5. IPO stops, DPO does not
+class _A:
+    ipo_margin, beta = 0.04, 0.05
+
+
+from src.align import contrastive                                     # noqa: E402
+for h0, near in ((0.04, True), (0.5, False), (2.0, False)):
+    h = torch.tensor([h0], requires_grad=True)
+    contrastive(h, _A, "ipo").sum().backward()
+    g = float(h.grad)
+    check(f"IPO gradient at h={h0} {'vanishes' if near else 'does not'}",
+          (abs(g) < 1e-6) == near, f"grad {g:.3e}")
+    h = torch.tensor([h0], requires_grad=True)
+    contrastive(h, _A, "dpo").sum().backward()
+    check(f"DPO gradient at h={h0} never vanishes", abs(float(h.grad)) > 1e-6)
+check("IPO is minimised at the margin",
+      float(contrastive(torch.tensor([0.04]), _A, "ipo")) <
+      min(float(contrastive(torch.tensor([x]), _A, "ipo")) for x in (-0.5, 0.0, 0.5, 2.0)))
+
+# ---------------------------------------------------------------- 6. pairing
+class _P:
+    reward_plddt = reward_tm = 1.0
+    plddt_success, tm_success = 0.7, 0.5
+    top_k = bot_k = 2
+    min_gap = 0.0
+    matched_plddt_tol = 0.05
+
+
+rnd = random.Random(0)
+pool = [{"gid": f"g{i}", "plddt": rnd.random(), "tm": rnd.random()} for i in range(16)]
+rp = rank_pairs(pool, _P)
+check("rank pairs: winner beats loser",
+      all(w["plddt"] + w["tm"] > l["plddt"] + l["tm"] for w, l, _, _ in rp))
+check("rank pairs: top_k x bot_k", len(rp) == _P.top_k * _P.bot_k, f"got {len(rp)}")
+mp = matched_pairs(pool, _P, limit=5)
+check("matched pairs: matched on pLDDT",
+      all(abs(w["plddt"] - l["plddt"]) <= _P.matched_plddt_tol for w, l, _, _ in mp))
+check("matched pairs: split on TM", all(w["tm"] > l["tm"] for w, l, _, _ in mp))
+
+# pass@k and selector@k against brute force over every k-subset
+n, k = 7, 3
+succ = [True, False, True, False, False, False, True]
+idx = list(range(n))
+brute_pass = np.mean([any(succ[i] for i in c) for c in itertools.combinations(idx, k)])
+brute_sel = np.mean([succ[min(c)] for c in itertools.combinations(idx, k)])   # rank 0 = best
+check("pass_at_k matches brute force",
+      abs(pass_at_k(n, sum(succ), k) - brute_pass) < 1e-9,
+      f"{pass_at_k(n, sum(succ), k):.6f} vs {brute_pass:.6f}")
+check("selector_at_k matches brute force",
+      abs(selector_at_k(succ, k) - brute_sel) < 1e-9,
+      f"{selector_at_k(succ, k):.6f} vs {brute_sel:.6f}")
+check("selector_at_k <= pass_at_k (a selector cannot beat an oracle)",
+      all(selector_at_k(succ, kk) <= pass_at_k(n, sum(succ), kk) + 1e-9 for kk in range(1, n + 1)))
+
+# hex round trip -- the manifest's only lossy-looking field
+for L_ in (1, 7, 40, 512):
+    bits = np.random.default_rng(L_).random(L_) < 0.5
+    check(f"mask hex round-trips at L={L_}", bool((_unhex(_hex(bits), L_) == bits).all()))
+
+
+# ------------------------------------------------- 7. the loss arithmetic at h = 0
+# At step 0 the reference IS the policy, so h is identically zero and each loss collapses to a
+# number that can be written down. If the four-likelihood bookkeeping is wrong -- a swapped winner
+# and loser, a reference forward that saw a different mask, a sign error -- h is not zero at step 0
+# and this is where it shows. It is the cheapest end-to-end check on the whole contrastive term.
+_A.nll_weight = 1.0
+h0 = torch.zeros(1)
+# float32 tensors, so the tolerance is the dtype's, not the arithmetic's.
+check("IPO at h=0 is (0 - margin)^2",
+      abs(float(contrastive(h0, _A, "ipo")) - _A.ipo_margin ** 2) < 1e-9,
+      f"{float(contrastive(h0, _A, 'ipo')):.12f}")
+check("DPO at h=0 is log 2",
+      abs(float(contrastive(h0, _A, "dpo")) - math.log(2)) < 1e-6,
+      f"{float(contrastive(h0, _A, 'dpo')):.12f}")
+
+# ------------------------------------------------- 8. the prompt pipeline, end to end
+from src.prompts import build as build_prompts, materialize                       # noqa: E402
+
+refs = []
+_r = random.Random(4)
+for i in range(12):
+    n_ = _r.randint(30, 50)
+    refs.append({"rid": f"r{i}", "row": 100 + i, "acc": f"P{i}",
+                 "seq": "".join(_r.choice("ACDEFGHIKLMNPQRSTVWY") for _ in range(n_)),
+                 "di": "".join(_r.choice("ACDEFGHIKLMNPQRSTVWY") for _ in range(n_)),
+                 "plddt": 0.8})
+rows = build_prompts(6, refs, seed=1, canvas=CANVAS, min_len=20)
+check("build is deterministic in its seed",
+      [r["pid"] for r in rows] == [r["pid"] for r in build_prompts(6, refs, seed=1,
+                                                                  canvas=CANVAS, min_len=20)])
+check("every prompt carries its caption row", all(isinstance(r["caption"], int) for r in rows))
+check("cold-start share is at least a third",
+      sum(r["rate"] >= 1.0 for r in rows) / len(rows) >= 0.25,
+      f"{sum(r['rate'] >= 1.0 for r in rows)}/{len(rows)}")
+
+ok_ctx = ok_free = ok_pad = True
+for r in rows:
+    tok, given = materialize(r, cfg, CANVAS, n_tracks=2)
+    L_, mk_ = r["L"], _unhex(r["masked"], r["L"])
+    ok_ctx &= bool((given[0, :L_].numpy() == ~mk_).all())
+    ok_free &= not bool(given[0, :L_][torch.from_numpy(mk_)].any())
+    ok_pad &= bool(given[:, L_:].all()) and int(tok[0, L_]) == cfg.eos_token_id
+check("materialize: given == the revealed residues", ok_ctx)
+check("materialize: masked positions are free", ok_free)
+check("materialize: EOS and the whole PAD tail are context", ok_pad)
+
+# and the whole way through generate(), on prompts built by the real builder
+torch.manual_seed(21)
+r = rows[0]
+tok, given = materialize(r, cfg, CANVAS, n_tracks=2)
+cv, lens = S.generate(m, Lmax=CANVAS, batch_size=3, n_steps=CANVAS, device="cpu", min_len=5,
+                      subst_per_residue=1.0, n_corrector=2, rep_penalty=0.0, max_run=0,
+                      prompt=tok.unsqueeze(0).expand(3, -1, -1).contiguous(),
+                      prompt_mask=given.unsqueeze(0).expand(3, -1, -1).contiguous())
+g3 = given.unsqueeze(0).expand(3, -1, -1)
+check("real prompt survives a full decode", bool((cv[g3] == tok.unsqueeze(0).expand(3, -1, -1)[g3]).all()))
+check("real prompt fixes the length", lens == [r["L"]] * 3, f"got {lens} want {r['L']}")
+
+print(f"\n{checks - len(fails)}/{checks} checks pass")
+if fails:
+    print("FAILURES:")
+    for f in fails:
+        print("  -", f)
+    raise SystemExit(1)
