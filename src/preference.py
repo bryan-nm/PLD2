@@ -42,6 +42,7 @@ from collections import defaultdict
 import numpy as np
 
 from config import CFG
+from .metrics import kmer_counts, lcr_counts
 from .self_consistency import record_key
 
 
@@ -78,14 +79,45 @@ def load_pool(rdir, folds=None):
         f, t = fold.get(gid), tm.get(gid)
         if f is None or t is None:
             continue
+        lcr, k13 = degeneracy_of(g.get("seq", ""))
         pool[g["pid"]].append({**g, "plddt": float(f["plddt"]), "ptm": float(f["ptm"]),
                                "tm": float(t.get(CFG.align.tm_field, 0.0)),
-                               "alntm": float(t.get("alntmscore", 0.0))})
+                               "alntm": float(t.get("alntmscore", 0.0)),
+                               "lcr": lcr, "k13": k13, "deg": max(lcr, k13)})
     return dict(pool), len(gen), len(fold), len(tm)
 
 
+def degeneracy_of(seq, k=None):
+    """(LCR fraction, k-mer repeat coverage) for one sequence. ~0.12 ms, so ~2s a round.
+
+    Two detectors because they see different things: SEG-style low complexity within a 12-residue
+    window, and repetition at a k LONGER than that window, which LCR cannot see at all -- a
+    sequence built from one repeated 20-mer reads LCR 0.0% and k13 100%.
+    """
+    if not seq:
+        return 0.0, 0.0
+    k = k or CFG.align.deg_kmer_k
+    lcr, tot = lcr_counts([seq])
+    c = kmer_counts([seq], (k,))
+    return lcr / max(tot, 1), c[k]["rep_pos"] / max(c[k]["n_pos"], 1)
+
+
 def score(s, acfg):
-    return acfg.reward_plddt * s["plddt"] + acfg.reward_tm * s["tm"]
+    """The RANKING reward. Its magnitude never reaches the loss -- DPO and IPO treat preference as
+    binary -- so this only has to order samples within a prompt correctly."""
+    return (acfg.reward_plddt * s["plddt"] + acfg.reward_tm * s["tm"]
+            - acfg.reward_deg * s.get("deg", 0.0))
+
+
+def eligible_winner(s, acfg):
+    """Can this sample sit on the preferred side at all? A hard gate, not a penalty.
+
+    Measured on round 1: at a mask rate of 1.0 the soft terms alone promoted winners carrying 12.6
+    points MORE LCR than their losers, because pLDDT's spread there is 2.4x TM's and r(LCR, pLDDT)
+    is +0.277. No weighting of a sum fixes a term that is itself the confound; the degenerate
+    samples have to be taken off the winner side outright.
+    """
+    return s.get("deg", 0.0) <= acfg.deg_max_winner
 
 
 def succeeded(s, acfg):
@@ -134,6 +166,10 @@ def report(pool, acfg, max_k=None):
           f"({np.mean(ns):.1f} per prompt, min {n_min})")
     print(f"[pref] success = pLDDT > {acfg.plddt_success} AND {acfg.tm_field} > {acfg.tm_success}"
           f"  ->  per-draw rate {np.mean(succ):.3%}")
+    print(f"[pref] reward = {acfg.reward_plddt}*pLDDT + {acfg.reward_tm}*TM "
+          f"- {acfg.reward_deg}*max(LCR, k{acfg.deg_kmer_k}) | winner gate: degeneracy <= "
+          f"{acfg.deg_max_winner:.0%} ({np.mean([s['deg'] > acfg.deg_max_winner for s in all_s]):.1%} "
+          f"of generations are above it)")
     print(f"[pref] pLDDT {np.mean([s['plddt'] for s in all_s]):.3f}"
           f" +- {np.std([s['plddt'] for s in all_s]):.3f}   "
           f"TM {np.mean([s['tm'] for s in all_s]):.3f}"
@@ -188,8 +224,10 @@ def report(pool, acfg, max_k=None):
 # pair construction
 # --------------------------------------------------------------------------------------
 def rank_pairs(ss, acfg):
+    """top_k winners x bot_k losers by the scalar reward, winners passing the degeneracy gate."""
     order = sorted(ss, key=lambda s: score(s, acfg), reverse=True)
-    wins, losses = order[:acfg.top_k], order[-acfg.bot_k:]
+    clean = [s for s in order if eligible_winner(s, acfg)]
+    wins, losses = clean[:acfg.top_k], order[-acfg.bot_k:]
     out = []
     for w in wins:
         for l in losses:
@@ -202,11 +240,35 @@ def rank_pairs(ss, acfg):
     return out
 
 
+def clean_pairs(ss, acfg, limit):
+    """Matched on pLDDT, split on DEGENERACY: both sides fold equally well, one of them cheats.
+
+    The direct expression of "fold without cheating". Quality is held fixed across the pair, so the
+    gradient cannot carry anything else -- and unlike the reward penalty, which competes with pLDDT
+    inside a sum, this construction cannot be outvoted. It is the same design as matched_pairs, one
+    axis over.
+    """
+    out = []
+    for i, a in enumerate(ss):
+        for b in ss[i + 1:]:
+            if abs(a["plddt"] - b["plddt"]) > acfg.matched_plddt_tol:
+                continue
+            w, l = (a, b) if a.get("deg", 0) <= b.get("deg", 0) else (b, a)
+            gap = l.get("deg", 0) - w.get("deg", 0)
+            if gap < acfg.clean_min_gap or not eligible_winner(w, acfg):
+                continue
+            out.append((w, l, gap, "clean"))
+    out.sort(key=lambda t: t[2], reverse=True)
+    return out[:limit]
+
+
 def matched_pairs(ss, acfg, limit):
     """Pairs matched on pLDDT and split on TM: same confidence, different correctness.
 
     Both sides fold; only one folds into the shape it was asked for. Nothing about overall quality
-    distinguishes them, so nothing about overall quality can be what the gradient learns.
+    distinguishes them, so nothing about overall quality can be what the gradient learns -- and
+    measured on round 1, that alone was enough to make this construction ANTI-degenerate where the
+    rank construction was strongly degenerate (-5.9 vs +12.6 points of winner LCR at cold start).
     """
     out = []
     for i, a in enumerate(ss):
@@ -215,7 +277,7 @@ def matched_pairs(ss, acfg, limit):
                 continue
             w, l = (a, b) if a["tm"] >= b["tm"] else (b, a)
             gap = w["tm"] - l["tm"]
-            if gap < max(acfg.min_gap, 1e-9):
+            if gap < max(acfg.min_gap, 1e-9) or not eligible_winner(w, acfg):
                 continue
             out.append((w, l, gap, "matched"))
     out.sort(key=lambda t: t[2], reverse=True)
@@ -223,14 +285,23 @@ def matched_pairs(ss, acfg, limit):
 
 
 def build_pairs(pool, acfg):
-    pairs, n_succ_w = [], 0
+    pairs, n_succ_w, n_gated = [], 0, 0
     for pid in sorted(pool):
         ss = pool[pid]
         if len(ss) < 2:
             continue
+        if not any(eligible_winner(s, acfg) for s in ss):
+            # Every sample this prompt produced is too degenerate to promote. ESM3 discarded
+            # prompts with no valid pair for the same reason: a pair whose winner is bad is not a
+            # weak training signal, it is a wrong one.
+            n_gated += 1
+            continue
         got = rank_pairs(ss, acfg)
+        n_rank = max(len(got), 1)
         if acfg.matched_frac > 0:
-            got += matched_pairs(ss, acfg, max(1, int(round(acfg.matched_frac * max(len(got), 1)))))
+            got += matched_pairs(ss, acfg, max(1, int(round(acfg.matched_frac * n_rank))))
+        if acfg.clean_frac > 0:
+            got += clean_pairs(ss, acfg, max(1, int(round(acfg.clean_frac * n_rank))))
         for w, l, gap, kind in got:
             ok = succeeded(w, acfg)
             n_succ_w += ok
@@ -241,11 +312,49 @@ def build_pairs(pool, acfg):
                 "winner_success": bool(ok),
                 "weight": float(acfg.success_weight if ok else 1.0),
                 "w": {"gid": w["gid"], "seq": w["seq"], "di": w["di"],
-                      "plddt": w["plddt"], "tm": w["tm"]},
+                      "plddt": w["plddt"], "tm": w["tm"], "deg": w.get("deg", 0.0)},
                 "l": {"gid": l["gid"], "seq": l["seq"], "di": l["di"],
-                      "plddt": l["plddt"], "tm": l["tm"]},
+                      "plddt": l["plddt"], "tm": l["tm"], "deg": l.get("deg", 0.0)},
             })
-    return pairs, n_succ_w
+    return pairs, n_succ_w, n_gated
+
+
+def degeneracy_report(pairs, acfg):
+    """Winner vs loser degeneracy, per mask rate and per construction.
+
+    THE TABLE THAT WOULD HAVE CAUGHT ROUND 1. The pairs looked fine by every number that was
+    printed; what they were actually teaching was only visible here. `d deg` must not be positive:
+    a positive value means the preferred side of the average pair is the MORE repetitive one, and
+    the tuning will faithfully learn that.
+    """
+    if not pairs:
+        return
+    by = defaultdict(list)
+    for p in pairs:
+        by[(p["rate"], p["kind"])].append(p)
+    print(f"\nDEGENERACY ACROSS THE PAIR   (d deg > 0 means the winner is the MORE repetitive side)")
+    print(f"{'rate':>5} {'kind':>8} {'n':>7} {'win deg':>8} {'lose deg':>9} {'d deg':>8} "
+          f"{'d pLDDT':>8} {'d TM':>7} {'winner worse':>13}")
+    print("-" * 80)
+    bad = []
+    for key in sorted(by):
+        v = by[key]
+        dd = [x["w"]["deg"] - x["l"]["deg"] for x in v]
+        m = float(np.mean(dd))
+        print(f"{key[0]:>5.2f} {key[1]:>8} {len(v):>7,} "
+              f"{np.mean([x['w']['deg'] for x in v]):>7.1%} "
+              f"{np.mean([x['l']['deg'] for x in v]):>8.1%} {m:>+7.1%} "
+              f"{np.mean([x['w']['plddt'] - x['l']['plddt'] for x in v]):>+8.3f} "
+              f"{np.mean([x['w']['tm'] - x['l']['tm'] for x in v]):>+7.3f} "
+              f"{np.mean([d > 1e-9 for d in dd]):>12.1%}")
+        if m > 0.01:
+            bad.append((key, m))
+    for key, m in bad:
+        print(f"[pref] WARNING: rate {key[0]} '{key[1]}' pairs prefer the MORE repetitive side by "
+              f"{m:+.1%} on average. That is what the tuning will learn. Raise align.reward_deg, "
+              f"lower align.deg_max_winner, or drop this construction at this rate.")
+    if not bad:
+        print(f"[pref] no construction prefers the degenerate side at any mask rate.")
 
 
 def main():
@@ -259,7 +368,15 @@ def main():
     ap.add_argument("--success-weight", type=float, default=None,
                     help="override align.success_weight (1.0 = off)")
     ap.add_argument("--min-gap", type=float, default=None)
+    ap.add_argument("--reward-deg", type=float, default=None,
+                    help="coefficient on the degeneracy penalty (0 reproduces round 1's reward)")
+    ap.add_argument("--deg-max-winner", type=float, default=None,
+                    help="a sample above this degeneracy can never be a winner (1.0 disables)")
     a = ap.parse_args()
+    if a.reward_deg is not None:
+        acfg.reward_deg = a.reward_deg
+    if a.deg_max_winner is not None:
+        acfg.deg_max_winner = a.deg_max_winner
     if a.success_weight is not None:
         acfg.success_weight = a.success_weight
     if a.min_gap is not None:
@@ -276,7 +393,7 @@ def main():
     if a.report:
         return
 
-    pairs, n_succ_w = build_pairs(pool, acfg)
+    pairs, n_succ_w, n_gated = build_pairs(pool, acfg)
     out = a.out or os.path.join(rdir, "pairs.jsonl")
     tmp = out + ".tmp"
     with open(tmp, "w") as fh:
@@ -292,6 +409,10 @@ def main():
     n_prompts_with = len({p["pid"] for p in pairs})
     print(f"\n[pref] {len(pairs):,} pairs from {n_prompts_with:,} prompts "
           f"({dict(kinds)}), min_gap={acfg.min_gap}")
+    if n_gated:
+        print(f"[pref] {n_gated:,} prompt(s) dropped: every generation was above the degeneracy "
+              f"gate ({acfg.deg_max_winner:.0%}), so there was nothing legitimate to promote.")
+    degeneracy_report(pairs, acfg)
     print(f"[pref] winner clears the absolute bar in {n_succ_w:,} pairs "
           f"({n_succ_w / max(len(pairs), 1):.1%}); success_weight={acfg.success_weight}"
           f"{'  (OFF)' if acfg.success_weight == 1.0 else ''}")

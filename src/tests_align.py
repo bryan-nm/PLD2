@@ -155,6 +155,8 @@ check("IPO is minimised at the margin",
 # ---------------------------------------------------------------- 6. pairing
 class _P:
     reward_plddt = reward_tm = 1.0
+    reward_deg = 0.0                  # this section tests the rank/matched geometry alone
+    deg_max_winner, deg_kmer_k = 1.0, 13
     plddt_success, tm_success = 0.7, 0.5
     top_k = bot_k = 2
     min_gap = 0.0
@@ -356,6 +358,7 @@ check("sign test is nan when nothing differs", sign_test(0, 0) != sign_test(0, 0
 
 class _R:
     reward_plddt = reward_tm = 1.0
+    reward_deg = 0.0
 
 
 _pool = [{"plddt": v, "tm": 0.0, "loglik": -v} for v in (0.1, 0.4, 0.5, 0.9)]
@@ -418,6 +421,84 @@ check("paired_delta counts better/worse", (_nb, _nw) == (2, 1), f"{(_nb, _nw)}")
 check("paired_delta mean is the mean difference", abs(_d - (0.5 - 0.5 + 2.0) / 3) < 1e-12)
 check("paired_delta only uses shared prompts",
       paired_delta(_A, {"_per_prompt": {"a": 0.0}})[1:3] == (1, 0))
+
+
+# ------------------------------------------------- 12. degeneracy on the loser side
+# Round 1's pairs, at a mask rate of 1.0, promoted winners carrying +12.6 points MORE LCR than
+# their losers -- 69% of pairs preferred the more repetitive side. The reward there was effectively
+# pLDDT alone (TM's spread was sd 0.061 against pLDDT's 0.148) and r(LCR, pLDDT) = +0.277, so the
+# ranking WAS the confound. These are the three things that had to change.
+from src.preference import (build_pairs, clean_pairs, degeneracy_of, eligible_winner,   # noqa: E402
+                            rank_pairs, score)
+
+
+class _D:
+    reward_plddt = reward_tm = 1.0
+    reward_deg = 0.5
+    deg_max_winner = 0.15
+    deg_kmer_k = 13
+    top_k = bot_k = 2
+    min_gap = 0.0
+    matched_frac = 0.0
+    clean_frac = 1.0
+    clean_min_gap = 0.10
+    matched_plddt_tol = 0.05
+    plddt_success, tm_success = 0.7, 0.5
+    success_weight = 1.0
+
+
+# Hoist the generator: `random.Random(seed).choice(...)` inside a comprehension reseeds on every
+# iteration and yields a homopolymer, which made this check fail against perfectly good code.
+_dr = random.Random(2)
+_real = "".join(_dr.choice("ACDEFGHIKLMNPQRSTVWY") for _ in range(250))
+_rep20 = "".join(_dr.choice("ACDEFGHIKLMNPQRSTVWY") for _ in range(20)) * 13
+check("degeneracy_of is ~0 on real-looking sequence", max(degeneracy_of(_real)) < 0.05,
+      f"{degeneracy_of(_real)}")
+check("degeneracy_of is 1.0 on poly-A", min(degeneracy_of("A" * 250)) > 0.99)
+check("degeneracy_of catches a repeat LCR cannot see",
+      degeneracy_of(_rep20)[1] > 0.99 and degeneracy_of(_rep20)[0] < 0.05,
+      f"{degeneracy_of(_rep20)}")
+
+# the exact shape of the round 1 failure: the degenerate sample has the best pLDDT
+_deg = {"gid": "d", "plddt": 0.90, "tm": 0.20, "deg": 0.60, "seq": "A" * 200}
+_ok = {"gid": "c", "plddt": 0.70, "tm": 0.30, "deg": 0.02, "seq": "ACDE" * 50}
+_mid = {"gid": "m", "plddt": 0.68, "tm": 0.25, "deg": 0.05, "seq": "ACDF" * 50}
+_bad = {"gid": "b", "plddt": 0.30, "tm": 0.10, "deg": 0.03, "seq": "ACDG" * 50}
+check("the degeneracy gate refuses a repetitive winner", not eligible_winner(_deg, _D))
+check("...and admits a clean one", eligible_winner(_ok, _D))
+_D.reward_deg = 0.0
+check("without the penalty the degenerate sample ranks FIRST",
+      score(_deg, _D) > score(_ok, _D), "round 1's reward")
+_D.reward_deg = 0.5
+check("with it, the clean sample ranks first", score(_ok, _D) > score(_deg, _D))
+
+_ss = [_deg, _ok, _mid, _bad]
+_rp = rank_pairs(_ss, _D)
+check("no rank pair promotes a gated sample",
+      all(w["gid"] != "d" for w, _, _, _ in _rp), f"{[w['gid'] for w, _, _, _ in _rp]}")
+check("the gated sample can still be a LOSER",
+      any(l["gid"] == "d" for _, l, _, _ in _rp))
+
+_cp = clean_pairs([_deg, {"gid": "x", "plddt": 0.88, "tm": 0.2, "deg": 0.01, "seq": "A"}], _D, 5)
+check("clean pairs put the repetitive side second",
+      len(_cp) == 1 and _cp[0][0]["gid"] == "x" and _cp[0][1]["gid"] == "d")
+check("clean pairs are matched on pLDDT",
+      all(abs(w["plddt"] - l["plddt"]) <= _D.matched_plddt_tol for w, l, _, _ in _cp))
+check("clean pairs need a real degeneracy split",
+      clean_pairs([_ok, _mid], _D, 5) == [])
+
+_meta = {"ref_len": 200, "bin": 3, "rate": 1.0, "di": None}
+_pool = {"p0": [dict(_deg, gid="d0", **_meta), dict(_ok, gid="c0", **_meta),
+                dict(_mid, gid="m0", **_meta), dict(_bad, gid="b0", **_meta)]}
+_pairs, _ns, _ng = build_pairs(_pool, _D)
+check("build_pairs never promotes a gated sample",
+      all(p["w"]["deg"] <= _D.deg_max_winner for p in _pairs))
+check("build_pairs reports pairs, winner-successes and gated prompts",
+      isinstance(_ns, int) and isinstance(_ng, int))
+_allgated, _, _ng2 = build_pairs(
+    {"p1": [dict(_deg, gid="z1", **_meta), dict(_deg, gid="z2", **_meta)]}, _D)
+check("a prompt with nothing promotable is dropped, not forced",
+      _allgated == [] and _ng2 == 1)
 
 print(f"\n{checks - len(fails)}/{checks} checks pass")
 if fails:

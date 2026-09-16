@@ -491,6 +491,22 @@ metric gap rather than noisy human labels. IPO's squared loss has a finite optim
 expressed **per position**, since the surrogate is a masked mean, which makes it a legible
 nats-per-token budget rather than a length-dependent number.
 
+**Degeneracy is on the loser side, because the reward was teaching the opposite.** TM is the half
+of the reward that cannot be gamed — but only where TM carries signal, and at mask rate 1.0 it does
+not: over 2,217 cold-start generations TM's spread is sd 0.061 against pLDDT's 0.148, so the sum is
+99% pLDDT, and `r(LCR, pLDDT) = +0.277`. Round 1's rank-built pairs at that rate promoted winners
+with **+12.6 points more LCR** than their losers (69% of pairs preferred the more repetitive side),
+and the tuned policies duly learned it — SFT took cold-start LCR from 26.8% to **45.0%**. Three
+changes: a degeneracy term in the ranking reward, weighted so its spread matches pLDDT's rather than
+swamping it; a hard gate so a repetitive sample can never be a *winner* (25% of cold-start
+generations already have LCR = 0%, so clean winners were always available); and a `clean` pair kind
+— matched on pLDDT, split on degeneracy — that carries "fold without cheating" and nothing else.
+Rebuilt on round 1's own samples this takes cold-start winner-minus-loser degeneracy from **+6.6% to
+−18.1%**, and as a side effect lets TM through: the rank pairs' `d TM` at cold start goes +0.003 →
++0.044, because pLDDT's degenerate component was drowning it. `src.preference` now prints the
+winner-vs-loser degeneracy table per bin and per construction, which is the table that would have
+caught this before a single GPU-hour was spent.
+
 **Relative, within-prompt thresholds.** ESM3 demanded pTM > 0.8 and cRMSD < 1.5A and discarded
 prompts producing none; its base model made such samples in quantity. Ours clears an absolute bar
 ~1% of the time, so at n_gen=16 only ~11% of prompts would contain one and 89% of the fold budget

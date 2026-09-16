@@ -480,8 +480,31 @@ class AlignCfg:
     plddt_success: float = 0.70
     tm_success: float = 0.50
     tm_field: str = "ttmscore"       # normalised by the TARGET, which is the natural query
-    reward_plddt: float = 1.0        # reward = w_plddt * pLDDT + w_tm * TM, for RANKING only
+    # reward = w_plddt*pLDDT + w_tm*TM - w_deg*degeneracy, for RANKING only.
+    reward_plddt: float = 1.0
     reward_tm: float = 1.0
+    # DEGENERACY HAS TO BE IN THE REWARD, and round 1 is the measurement that says so. TM is the
+    # half of the reward that cannot be gamed -- but only where TM carries signal, and at a mask
+    # rate of 1.0 it does not: measured over 2,217 cold-start generations, TM's spread is sd 0.061
+    # against pLDDT's 0.148, so the sum is 99% pLDDT. Within the rank-built pairs at that rate the
+    # winner beat the loser by +0.303 pLDDT and +0.003 TM, and carried +12.6 POINTS MORE LCR.
+    # r(LCR, pLDDT) = +0.277 there. The pairs were teaching degeneracy directly, and SFT -- which
+    # has no contrastive term to push back -- took cold-start LCR from 26.8% to 45.0%.
+    #
+    # w_deg is set so the penalty's spread matches pLDDT's rather than swamping it: cold-start LCR
+    # has sd ~0.28, so 0.5 * 0.28 = 0.14 against pLDDT's 0.148. In the scaffold bins LCR is flat at
+    # ~6% and the term correctly does almost nothing.
+    reward_deg: float = 0.5
+    # A sample this degenerate can NEVER be a winner, whatever its pLDDT. A soft penalty alone is
+    # not enough: pLDDT and LCR both have long tails at cold start, so some pairing would still
+    # find a repetitive sample worth promoting. 0.15 is ~2.5x the natural reference (5.7%) and
+    # ~2.5x what this model produces in the scaffold bins, and it leaves over half of cold-start
+    # generations eligible -- 25% of them have LCR exactly 0%. Clean samples were always there; the
+    # ranking simply was not choosing them.
+    deg_max_winner: float = 0.15
+    # max(LCR, k-mer repeat coverage): whichever detector fires. They see different things -- a
+    # repeated 20-mer is INVISIBLE to LCR (it is longer than the SEG window) and reads 100% at k13.
+    deg_kmer_k: int = 13
     top_k: int = 2                   # winners per prompt
     bot_k: int = 2                   # losers per prompt
     # Reward gap a pair must clear. NOT zero, and this matters more than it looks: both DPO and
@@ -492,10 +515,18 @@ class AlignCfg:
     # discards them, which is what ESM3 did with a much larger gap (dpTM >= 0.2) for the same reason.
     min_gap: float = 0.05
     success_weight: float = 1.0      # >1 upweights pairs whose winner clears the absolute bar. OFF.
-    matched_frac: float = 0.5        # share of pairs built matched-on-pLDDT / split-on-TM, which
-                                     # holds quality fixed so the gradient can only carry
-                                     # prompt-consistency. 0 disables.
-    matched_plddt_tol: float = 0.05  # "same pLDDT" for that construction
+    # MATCHED PAIRS ALREADY WORKED, and that is the other half of the round 1 measurement. Holding
+    # pLDDT fixed removes the degenerate direction from the comparison, so the surviving signal is
+    # clean: at rate 1.0 the matched construction produced winners with 5.9 points LESS LCR than
+    # their losers, while the rank construction produced +12.6. It was simply outnumbered 1,360 to
+    # 652. Both fractions below are the share of pairs each construction contributes, relative to
+    # the rank pairs a prompt yields.
+    matched_frac: float = 0.5        # matched on pLDDT, split on TM -> carries prompt consistency
+    matched_plddt_tol: float = 0.05  # "same pLDDT" for both matched constructions
+    # Matched on pLDDT, split on DEGENERACY: both sides fold equally well, one of them cheats. That
+    # gradient can only carry "fold without cheating", because quality is held fixed across it.
+    clean_frac: float = 0.5
+    clean_min_gap: float = 0.10      # degeneracy difference a clean pair must show
 
     # --- the loss (src/align.py) ---
     # ESM3's alpha=0.8 / beta=0.05 DO NOT TRANSFER, and round 1 is the evidence. They
