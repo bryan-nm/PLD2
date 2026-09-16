@@ -308,6 +308,78 @@ check("parse_descriptor returns (mapping, n_unmatched)",
       isinstance(_r, tuple) and len(_r) == 2 and isinstance(_r[0], dict) and _r[1] == 1,
       f"got {type(_r).__name__}")
 
+
+# ------------------------------------------------- 10. tuner scale and loss scale
+from src.align import loss_scale, recommended_ranks                               # noqa: E402
+from src.align_compare import best_of, sign_test                                  # noqa: E402
+from src.prompts import split_refs                                                # noqa: E402
+
+
+class _S:
+    nll_weight, ipo_margin, beta = 1.0, 0.04, 10.0
+    alpha = 25.0
+
+
+# The equilibrium derivation is the whole reason round 1 was an SFT run wearing an IPO label:
+#     dL/dlp_w = -w_nll + 2*alpha*(h - m) = 0  =>  h* = m + w_nll/(2*alpha)
+# At ESM3's alpha=0.8 that is 0.665 against a margin of 0.04, which is what the log showed.
+check("IPO equilibrium is m + w/(2a)", abs(loss_scale(_S, "ipo")[1] - (0.04 + 1 / 50)) < 1e-12)
+_S.alpha = 0.8
+check("ESM3's alpha reproduces round 1's h*", abs(loss_scale(_S, "ipo")[1] - 0.665) < 1e-9,
+      f"{loss_scale(_S, 'ipo')[1]:.6f}")
+_S.alpha = 0.0
+check("alpha=0 has no equilibrium (it is SFT)", loss_scale(_S, "ipo")[1] != loss_scale(_S, "ipo")[1])
+check("DPO reports its saturation scale 1/beta", abs(loss_scale(_S, "dpo")[1] - 0.1) < 1e-12)
+# and the IPO gradient really does vanish there, which is what "equilibrium" has to mean
+_S.alpha = 25.0
+_hq = torch.tensor([loss_scale(_S, "ipo")[1]], requires_grad=True)
+(_S.nll_weight * (-_hq) + _S.alpha * contrastive(_hq, _S, "ipo")).sum().backward()
+check("the two terms' gradients cancel at h*", abs(float(_hq.grad)) < 1e-5,
+      f"net grad {float(_hq.grad):.3e}")
+
+for n_pairs, steps, eps in ((5680, 500, 2.0), (170000, 500, 2.0), (83, 6, 2.0)):
+    r = recommended_ranks(n_pairs, steps, eps)
+    check(f"recommended_ranks({n_pairs},{steps}) hits ~{eps} epochs",
+          abs(steps * r / n_pairs - eps) < max(0.5 * eps, 12 * steps / n_pairs),
+          f"{r} ranks -> {steps * r / n_pairs:.2f} epochs")
+    check(f"recommended_ranks({n_pairs}) is whole nodes", r % 12 == 0 and r >= 12, f"{r}")
+# round 1, diagnosed: 192 ranks x 1000 steps over 5,680 pairs is 33.8 epochs
+check("round 1's configuration reads as ~34 epochs",
+      abs(1000 * 192 / 5680 - 33.8) < 0.1)
+
+check("sign test is 1.0 on an even split", abs(sign_test(5, 5) - 1.0) < 1e-12)
+check("sign test is symmetric", sign_test(9, 1) == sign_test(1, 9))
+check("sign test matches the exact binomial",
+      abs(sign_test(9, 1) - 2 * (math.comb(10, 0) + math.comb(10, 1)) / 2 ** 10) < 1e-12)
+check("sign test is nan when nothing differs", sign_test(0, 0) != sign_test(0, 0))
+
+
+class _R:
+    reward_plddt = reward_tm = 1.0
+
+
+_pool = [{"plddt": v, "tm": 0.0, "loglik": -v} for v in (0.1, 0.4, 0.5, 0.9)]
+check("best_of at k=1 is the mean reward",
+      abs(best_of(_pool, _R, 1, "plddt") - 0.475) < 1e-12)
+check("best_of at k=n is the max reward",
+      abs(best_of(_pool, _R, 4, "plddt") - 0.9) < 1e-12)
+check("best_of is monotone in k",
+      all(best_of(_pool, _R, k, "plddt") <= best_of(_pool, _R, k + 1, "plddt") + 1e-12
+          for k in range(1, 4)))
+# a selector anti-correlated with reward must do WORSE than one draw -- the loglik pathology
+check("an anti-correlated selector is worse than random",
+      best_of(_pool, _R, 4, "loglik") < best_of(_pool, _R, 1, "loglik"),
+      f"{best_of(_pool, _R, 4, 'loglik'):.3f} vs {best_of(_pool, _R, 1, 'loglik'):.3f}")
+
+_refs = [{"rid": f"r{i}", "acc": f"A{i}"} for i in range(50)]
+_tr, _ev = split_refs(_refs, 10, seed=3)
+check("holdout is disjoint", not ({r["rid"] for r in _tr} & {r["rid"] for r in _ev}))
+check("holdout is exhaustive", len(_tr) + len(_ev) == 50 and len(_ev) == 10)
+check("holdout is deterministic",
+      [r["rid"] for r in split_refs(_refs, 10, seed=3)[1]] == [r["rid"] for r in _ev])
+check("holdout moves with the seed",
+      [r["rid"] for r in split_refs(_refs, 10, seed=4)[1]] != [r["rid"] for r in _ev])
+
 print(f"\n{checks - len(fails)}/{checks} checks pass")
 if fails:
     print("FAILURES:")

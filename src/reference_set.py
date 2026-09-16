@@ -104,9 +104,27 @@ def load_rows(csv_path, cache_dir, split=None, splits_path=None):
     return rows
 
 
-def select(rows, n, seed, min_len, max_len):
+def excluded_accessions(paths):
+    """Accessions already spent, read from any refs.jsonl / refs.meta.jsonl."""
+    out = set()
+    for p in paths:
+        if not p or not os.path.exists(p):
+            continue
+        with open(p) as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("acc"):
+                    out.add(r["acc"])
+    return out
+
+
+def select(rows, n, seed, min_len, max_len, exclude=()):
     ok = [r for r in rows if min_len <= len(r["seq"]) <= max_len
-          and set(r["seq"]) <= set("ACDEFGHIKLMNPQRSTVWY")]
+          and set(r["seq"]) <= set("ACDEFGHIKLMNPQRSTVWY")
+          and r["acc"] not in exclude]
     # Shuffled, not strided. The corpus is in accession order, so consecutive rows are frequently
     # paralogs or isoforms whose captions read almost the same -- and a prompt set full of near
     # duplicates makes caption guidance untestable whether or not it works.
@@ -121,7 +139,10 @@ def cmd_fasta(a):
     rows = load_rows(a.csv, a.cache, a.split or None, a.splits)
     print(f"[refs] {len(rows):,} captioned proteins"
           + (f" in split '{a.split}'" if a.split else " (whole corpus)"), flush=True)
-    sel = select(rows, a.n, a.seed, a.min_len, a.max_len)
+    ex = excluded_accessions((a.exclude or "").split(":"))
+    if ex:
+        print(f"[refs] excluding {len(ex):,} accession(s) already spent elsewhere", flush=True)
+    sel = select(rows, a.n, a.seed, a.min_len, a.max_len, ex)
     os.makedirs(a.dir, exist_ok=True)
     fa, meta = os.path.join(a.dir, "refs.fasta"), os.path.join(a.dir, "refs.meta.jsonl")
     with open(fa, "w") as f, open(meta, "w") as m:
@@ -217,6 +238,9 @@ def main():
     f.add_argument("--split", default="test", help="'' for the whole corpus")
     f.add_argument("--splits", default=None)
     f.add_argument("--seed", type=int, default=acfg.prompt_seed)
+    f.add_argument("--exclude", default=None,
+                   help="colon-separated refs.jsonl / refs.meta.jsonl whose accessions to avoid. "
+                        "An evaluation reference set must not reuse a training protein.")
     f.add_argument("--min-len", type=int, default=40)
     f.add_argument("--max-len", type=int, default=CFG.data.canvas - 1)
     f.set_defaults(fn=cmd_fasta)

@@ -1,0 +1,210 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N pld2_aligntest
+#PBS -l walltime=04:00:00
+#PBS -l select=16
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q prod
+#PBS -j oe
+
+# Decide the loss and its scaling, on pairs that ALREADY EXIST. No regeneration.
+#
+#   qsub -v ROUND=1 scripts/align_test.pbs
+#   qsub -v ROUND=1,VARIANTS=base:sft:ipo scripts/align_test.pbs        # skip DPO
+#   qsub -v ROUND=1,VARIANTS=base:ipo:ipo_esm3 scripts/align_test.pbs   # does alpha actually matter
+#   qsub -v ROUND=1,PHASES=C scripts/align_test.pbs                     # re-read the table only
+#
+# WHY THIS EXISTS. Round 1 used ESM3's alpha=0.8 against per-position log-likelihoods. We
+# length-normalise BOTH terms where ESM3 normalises only the anchor, so at L~250 our contrastive
+# term is ~250x smaller relative to it -- the IPO equilibrium sat at h*=0.665 against a margin of
+# 0.04, the margin never bound, and the contrastive term was 0.5% of the loss. Round 1 was
+# therefore an SFT run wearing an IPO label. Before spending a 250-node-hour scale-up on a loss
+# nobody has tested, tune the SAME 5,680 pairs four ways and look at them side by side:
+#
+#   base       the untuned policy. The control, and the only row with no tuning at all.
+#   sft        alpha=0. ESM3's own ablation (A.4.6); it captured half their gain at 1.4B.
+#   ipo        alpha from the tolerance: alpha = nll_weight/(2*tol), so the margin binds.
+#   dpo        beta on the per-position scale, so beta*h is O(1) and logsigmoid has gradient.
+#   ipo_esm3   alpha=0.8, i.e. round 1 reproduced. Include it to show the scaling mattered.
+#
+# THE EVAL SET IS FRESH AND DISJOINT. Round 1 spent nearly every usable reference on training
+# prompts, so a holdout cannot be carved out of it after the fact -- this draws a NEW small
+# reference set with --exclude against the round's accessions, folds it, and builds eval prompts
+# from that. ~240 extra folds, which is noise against the 13k the variants themselves need. The
+# resulting prompts_eval.jsonl is a FILE: carry it forward and later rounds compare on identical
+# prompts (src.align_sample --manifest).
+#
+# COST. 4 variants x N_EVAL prompts x 16 completions, plus the eval reference set. At N_EVAL=200
+# that is ~13k folds, ~17 node-hours, ~1h on 16 nodes; tuning is ~10 min per variant on ALIGN_RANKS.
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./scripts/pbs_common.sh
+
+ROUND=${ROUND:-1}
+VARIANTS=${VARIANTS:-base:sft:ipo:dpo}
+PHASES=${PHASES:-TGFMC}          # Tune, Generate, Fold, tM, Compare
+STEPS=${STEPS:-500}
+EPOCHS=${EPOCHS:-2.0}
+N_EVAL=${N_EVAL:-200}
+N_GEN=${N_GEN:-16}
+GAMMA=${GAMMA:-10}
+EVAL_SEED=${EVAL_SEED:-9001}
+FOLD_TRIES=${FOLD_TRIES:-20}
+FOLD_STALL=${FOLD_STALL:-3}
+FOLD_BUDGET=${FOLD_BUDGET:-5400}
+
+RDIR=$(python -c "from config import CFG; CFG.align.round=${ROUND}; print(CFG.align.round_dir)")
+EVREF="${RDIR}/evalref"
+EVAL_MANIFEST="${RDIR}/prompts_eval.jsonl"
+PAIRS="${RDIR}/pairs.jsonl"
+[ -f "${PAIRS}" ] || { echo "no ${PAIRS} -- run scripts/align.pbs phases 0-4 first." >&2; exit 1; }
+
+N_PAIRS=$(wc -l < "${PAIRS}" | tr -d " ")
+# SIZE THE TUNER FROM THE DATA, NOT FROM THE ALLOCATION. Pairs consumed per step is
+# world_size * pairs_per_rank, so phase 5 on all 192 ranks burned 33.8 epochs in round 1 while the
+# drift monitor turned over at 8.4. This inverts the relation instead.
+ALIGN_RANKS=${ALIGN_RANKS:-$(python -c "from src.align import recommended_ranks; \
+print(min(${NRANKS}, recommended_ranks(${N_PAIRS}, ${STEPS}, ${EPOCHS}, ppn=${RANKS_PER_NODE})))")}
+ALIGN_PPN=$(( ALIGN_RANKS < RANKS_PER_NODE ? ALIGN_RANKS : RANKS_PER_NODE ))
+
+job_banner "PLD2 alignment loss test, round ${ROUND}" ROUND VARIANTS PHASES STEPS EPOCHS \
+           N_PAIRS ALIGN_RANKS N_EVAL N_GEN GAMMA RDIR CKPT
+
+has() { [[ "${PHASES}" == *"$1"* ]]; }
+declare -A PHASE_T                       # phase -> seconds, printed as a table at the end
+phase() { local n="$1" t0="$2"; PHASE_T[$n]=$(( SECONDS - t0 )); \
+          echo "[test] --- ${n} took ${PHASE_T[$n]}s ---"; }
+
+# The variant table. One place; everything else loops over it.
+variant_flags() {
+    case "$1" in
+        sft)      echo "--loss ipo --alpha 0" ;;
+        ipo)      echo "--loss ipo" ;;                       # alpha defaults to ipo_alpha
+        dpo)      echo "--loss dpo" ;;                       # alpha/beta default to the dpo pair
+        ipo_esm3) echo "--loss ipo --alpha 0.8" ;;           # round 1, reproduced
+        *)        echo "" ;;
+    esac
+}
+
+fold_loop() {                            # $1 = out jsonl, $2 = pdb dir, $3 = extra flags, rest FASTA
+    local out="$1" pdbd="$2" extra="$3"; shift 3
+    local t0=$SECONDS stalls=0 rpn=${RANKS_PER_NODE} attempt before after frc
+    _nf() { cat "${out%.jsonl}"*.jsonl 2>/dev/null | wc -l | tr -d " "; }
+    for attempt in $(seq 1 "${FOLD_TRIES}"); do
+        [ $(( SECONDS - t0 )) -ge "${FOLD_BUDGET}" ] && { echo "[test] fold budget spent"; break; }
+        before=$(_nf)
+        # shellcheck disable=SC2086
+        mpiexec -n "$(( NNODES * rpn ))" -ppn "${rpn}" --pmi=pmix --cpu-bind depth -d 8 \
+            python -m src.fold_fasta --device xpu --out "${out}" --pdb-dir "${pdbd}" ${extra} \
+            "$@" ${FOLD_ARGS:-}
+        frc=$?; after=$(_nf)
+        [ $frc -eq 0 ] && { echo "[test] folding done on attempt ${attempt} (${after} records)"; return 0; }
+        echo "[test] fold attempt ${attempt} exited ${frc} at ${rpn} rank(s)/node: ${before} -> ${after}"
+        if [ "${after}" -gt "${before}" ]; then stalls=0; else
+            stalls=$(( stalls + 1 ))
+            if [ "${stalls}" -ge "${FOLD_STALL}" ]; then
+                if [ "${rpn}" -gt 1 ]; then
+                    echo "[test] ${stalls} stalls; falling back to 1 rank/node."; rpn=1; stalls=0
+                else echo "[test] ${stalls} stalls at 1 rank/node; giving up."; return 1; fi
+            fi
+        fi
+    done
+    return 1
+}
+
+# --- the held-out evaluation set ---------------------------------------------------------------
+# Built once and reused by every variant, which is what makes src.align_compare's paired columns
+# meaningful: the same prompts on both sides, so prompt difficulty cancels instead of dominating.
+if [ ! -f "${EVAL_MANIFEST}" ]; then
+    t0=$SECONDS
+    echo "[test] building a held-out eval set: ${N_EVAL} prompts from fresh references"
+    python -m src.reference_set fasta --dir "${EVREF}" --n $(( N_EVAL * 12 / 10 )) \
+        --seed "${EVAL_SEED}" --exclude "${RDIR}/refs.meta.jsonl:${RDIR}/refs.jsonl" || exit 1
+    fold_loop "${EVREF}/reffolds.jsonl" "${EVREF}/refpdb" "" "${EVREF}/refs.fasta"
+    python -m src.reference_set join --dir "${EVREF}" || exit 1
+    python -m src.prompts --dir "${EVREF}" --n "${N_EVAL}" --n-eval 0 --prefix e \
+        --out "${EVAL_MANIFEST}" || exit 1
+    phase "eval-set" $t0
+else
+    echo "[test] reusing ${EVAL_MANIFEST} ($(wc -l < "${EVAL_MANIFEST}" | tr -d ' ') prompts)"
+fi
+
+CKPT_FLAG=""; [ -n "${CKPT:-}" ] && CKPT_FLAG="--ckpt ${CKPT}"
+IFS=':' read -ra VLIST <<< "${VARIANTS}"
+
+# --- T: tune each variant on the round's existing pairs -----------------------------------------
+if has T; then
+    for v in "${VLIST[@]}"; do
+        [ "$v" = "base" ] && { echo "[test] 'base' is the untuned control; nothing to tune."; continue; }
+        t0=$SECONDS
+        echo "[test] tuning '${v}' on ${N_PAIRS} pairs, ${ALIGN_RANKS} rank(s), ${STEPS} steps"
+        # shellcheck disable=SC2086
+        mpiexec -n "${ALIGN_RANKS}" -ppn "${ALIGN_PPN}" --pmi=pmix --cpu-bind depth -d 8 \
+            python -m src.align --device xpu --dir "${RDIR}" \
+            --out "${RDIR}/policy_${v}" --steps "${STEPS}" --epochs "${EPOCHS}" \
+            $(variant_flags "$v") ${CKPT_FLAG} ${ALIGN_ARGS:-}
+        rc=$?; [ $rc -ne 0 ] && echo "[test] variant '${v}' tuning exited ${rc}; continuing." >&2
+        phase "tune:${v}" $t0
+    done
+fi
+
+# --- G: generate from each policy on the SAME held-out prompts -----------------------------------
+if has G; then
+    for v in "${VLIST[@]}"; do
+        t0=$SECONDS
+        POL=""
+        if [ "$v" != "base" ]; then
+            POL="--ckpt $(python -c "from src.train import find_latest_ckpt; \
+print(find_latest_ckpt('${RDIR}/policy_${v}') or '')")"
+            [ "${POL}" = "--ckpt " ] && { echo "[test] no checkpoint for '${v}'; skipping." >&2; continue; }
+        else
+            POL="${CKPT_FLAG}"
+        fi
+        echo "[test] generating '${v}' over the eval prompts"
+        mkdir -p "${RDIR}/eval/${v}"
+        # shellcheck disable=SC2086
+        "${MPI_LAUNCH[@]}" python -m src.align_sample --device xpu \
+            --dir "${RDIR}/eval/${v}" --manifest "${EVAL_MANIFEST}" \
+            --n-gen "${N_GEN}" --gamma "${GAMMA}" ${POL} ${GEN_ARGS:-}
+        phase "gen:${v}" $t0
+    done
+fi
+
+# --- F / M: fold and TM, per variant ------------------------------------------------------------
+# Per variant rather than one pooled pass: record ids are derived from the prompt, so two variants
+# generating from the same prompt produce the SAME id and would collide in a shared results file.
+for v in "${VLIST[@]}"; do
+    EV="${RDIR}/eval/${v}"
+    [ -d "${EV}" ] || continue
+    if has F; then
+        t0=$SECONDS
+        shopt -s nullglob; FA=( "${EV}"/gen.rank*.fasta ); shopt -u nullglob
+        [ ${#FA[@]} -eq 0 ] && { echo "[test] no FASTAs for '${v}'." >&2; continue; }
+        echo "[test] folding '${v}' (${#FA[@]} FASTA(s))"
+        fold_loop "${EV}/folds.jsonl" "${EV}/pdb" "--pdb-shard" "${FA[@]}"
+        phase "fold:${v}" $t0
+    fi
+    if has M; then
+        t0=$SECONDS
+        echo "[test] TM for '${v}'"
+        # shellcheck disable=SC2086
+        "${MPI_LAUNCH[@]}" python -m src.tm_align --dir "${EV}" --pdb-dir "${EV}/pdb" \
+            --ref-pdb-dir "${EVREF}/refpdb" --manifest "${EVAL_MANIFEST}" \
+            ${PRUNE:+--prune} ${TM_ARGS:-}
+        phase "tm:${v}" $t0
+    fi
+done
+
+# --- C: the table -------------------------------------------------------------------------------
+if has C; then
+    echo "[test] comparing"
+    python -m src.align_compare --eval-root "${RDIR}/eval" --policy-root "${RDIR}" \
+        --k 8 --only "${VARIANTS}" ${CMP_ARGS:-}
+    rc=$?
+fi
+
+echo ""
+echo "[test] phase timings"
+for k in "${!PHASE_T[@]}"; do printf '  %-20s %6ss\n' "$k" "${PHASE_T[$k]}"; done | sort
+echo "[test] artefacts in ${RDIR}"
+echo "[job] exit ${rc:-0}"; exit ${rc:-0}    # exit $rc so the EXIT trap reports the true code

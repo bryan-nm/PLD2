@@ -444,6 +444,10 @@ class AlignCfg:
     # --- prompts (src/prompts.py) ---
     n_prompts: int = 1_000
     prompt_seed: int = 0
+    # References reserved for evaluation and never used to build a pair. Without this there is no
+    # set on which two checkpoints can be compared without one of them having trained on it, and
+    # the eval manifest is a FILE -- carry round 1's forward to compare rounds on identical prompts.
+    n_eval_prompts: int = 200
     # Mask rate = the fraction of residues the model must generate. 1.0 is the cold start and takes
     # the largest single share on purpose: it is the condition we deploy in, and the supervised half
     # of the loss would otherwise fill up with easy low-mask completions.
@@ -494,17 +498,43 @@ class AlignCfg:
     matched_plddt_tol: float = 0.05  # "same pLDDT" for that construction
 
     # --- the loss (src/align.py) ---
+    # ESM3's alpha=0.8 / beta=0.05 DO NOT TRANSFER, and round 1 is the evidence. They
+    # length-normalise only L_NLL and leave the contrastive term as a sequence-level SUM; we make
+    # both a per-position mean, so our contrastive term is ~L times smaller relative to the anchor.
+    # At L~250 that is a factor of 250 on the gradient and 62,500 on the loss -- measured, round 1
+    # ran with the contrastive term at 0.5% of the loss and h settled 3x past its target. The
+    # margin was never an attractor, because:
+    #
+    #     L = w_nll*(-lp_w) + alpha*(h - m)^2      dL/dlp_w = -w_nll + 2*alpha*(h - m) = 0
+    #     =>  h* = m + w_nll / (2 * alpha)
+    #
+    # At w_nll=1, alpha=0.8 that is h* = 0.665, sixteen times the margin. Choosing alpha from the
+    # tolerance you will accept instead of copying a number gives alpha = w_nll / (2 * tol).
+    # src/align.py prints h* at startup so this can never be a surprise again.
     loss: str = "ipo"                # "ipo" | "dpo"
-    alpha: float = 0.8               # weight on the contrastive term (ESM3's value)
-    beta: float = 0.05               # DPO temperature / IPO regularisation (ESM3's value)
+    ipo_tol: float = 0.02            # how far above the margin h may settle
+    ipo_alpha: float = 25.0          # = nll_weight / (2 * ipo_tol)
+    # DPO HAS NO EQUILIBRIUM -- that is Azar's point and the reason IPO is the default. Both terms
+    # push lp_w the same way; what stops DPO is the sigmoid SATURATING, which happens for h >> 1/beta.
+    # So beta sets the scale at which the term still has gradient, and it must match the scale of h.
+    # Ours is per-position and lands around 0.1, so beta ~ 10; ESM3's 0.05 against a sequence-level
+    # sum at L~250 is the same choice expressed in different units.
+    dpo_alpha: float = 0.8           # ESM3's value, which is right ONCE beta is on the right scale
+    beta: float = 10.0
     ipo_margin: float = 0.04         # IPO target margin, NATS PER POSITION
     nll_weight: float = 1.0          # the supervised anchor. ESM3 keeps it at 1 and leans on it.
-    steps: int = 1_000
+    steps: int = 500
     lr: float = 1e-5
-    warmup_steps: int = 150
+    warmup_steps: int = 50           # 150 was 15% of ESM3's single epoch; ours was five epochs
     grad_clip: float = 1.0
     optimizer: str = "rmsprop"       # ESM3 used RMSProp for every IRPO run
     pairs_per_rank: int = 1          # pairs per rank per optimizer step
+    # EPOCHS ARE A TUNER-SCALE PROBLEM, NOT A DATA PROBLEM. Pairs consumed per step is
+    # world_size * pairs_per_rank, so running phase 5 on the whole allocation is what burned 33.8
+    # epochs in round 1 -- not a shortage of pairs. align.recommended_ranks() inverts the relation
+    # and scripts/align.pbs sizes the tuner from it; the tuner's rank count is now independent of
+    # the job's, which it has to be at 256 nodes.
+    target_epochs: float = 2.0
     score_struct: bool = False       # score the 3Di track in the surrogate too, not just residues
     eval_every: int = 50
     drift_natural_n: int = 64        # held-out natural sequences for the drift monitor

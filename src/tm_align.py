@@ -140,6 +140,11 @@ def main():
     ap.add_argument("--threads", type=int, default=int(os.environ.get("OMP_NUM_THREADS", "8")))
     ap.add_argument("--chunk", type=int, default=32, help="prompts per foldseek invocation")
     ap.add_argument("--work", default=None, help="scratch dir (default: $TMPDIR)")
+    ap.add_argument("--prune", action="store_true",
+                    help="delete each chunk's GENERATED PDBs once its TM rows are fsynced. They are "
+                         "~98% of the bytes and inodes a round writes and nothing downstream reads "
+                         "them again -- a generated structure becomes one float and is finished. "
+                         "Reference PDBs are never touched: they are the targets.")
     a = ap.parse_args()
 
     env = init_distributed("cpu", no_dist=True)
@@ -185,7 +190,7 @@ def main():
 
     work_root = a.work or os.environ.get("TMPDIR", "/tmp")
     work = tempfile.mkdtemp(prefix=f"pld2tm{rank:03d}_", dir=work_root)
-    t0, n_rows, n_fail = time.perf_counter(), 0, 0
+    t0, n_rows, n_fail, n_pruned = time.perf_counter(), 0, 0, 0
     try:
         with open(out_path, "a") as fh:
             for start in range(0, len(todo), a.chunk):
@@ -222,12 +227,25 @@ def main():
                         n_rows += 1
                 fh.flush()
                 os.fsync(fh.fileno())
+                if a.prune:
+                    # STRICTLY AFTER THE FSYNC. These pids are now in the resume set, so a rerun
+                    # skips them and never looks for the files again; deleting before the durable
+                    # write would lose both the score and the structure it came from.
+                    for pid in chunk:
+                        for p in by_pid[pid].values():
+                            try:
+                                os.remove(p)
+                                n_pruned += 1
+                            except OSError:
+                                pass
                 print(f"[tm] rank {rank}: {min(start + a.chunk, len(todo))}/{len(todo)} prompts "
-                      f"({n_rows:,} rows, {time.perf_counter() - t0:.0f}s)", flush=True)
+                      f"({n_rows:,} rows, {time.perf_counter() - t0:.0f}s"
+                      + (f", {n_pruned:,} PDBs pruned" if a.prune else "") + ")", flush=True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     print(f"[tm] rank {rank}: wrote {n_rows:,} rows to {out_path}"
-          + (f" | {n_fail} prompt(s) in failed chunks" if n_fail else ""), flush=True)
+          + (f" | {n_fail} prompt(s) in failed chunks" if n_fail else "")
+          + (f" | pruned {n_pruned:,} generated PDBs" if a.prune else ""), flush=True)
 
 
 if __name__ == "__main__":

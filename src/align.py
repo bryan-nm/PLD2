@@ -125,6 +125,47 @@ class PairSet:
         return r, yw, yl, gen
 
 
+def _atomic_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(obj, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def recommended_ranks(n_pairs, steps, epochs=2.0, pairs_per_rank=1, ppn=12):
+    """How many ranks the tuner should use, rounded to whole nodes.
+
+    steps * ranks * pairs_per_rank = n_pairs * epochs. Round 1 ran phase 5 on the whole 192-rank
+    allocation and consumed 33.8 epochs of 5,680 pairs; the drift monitor turned over at 8.4. The
+    fix is not more data, it is a smaller tuner -- and at 256 nodes it stops being optional, because
+    3,072 ranks x 500 steps is 1.5M pair draws.
+    """
+    r = n_pairs * float(epochs) / max(int(steps) * max(int(pairs_per_rank), 1), 1)
+    return max(ppn, int(round(r / ppn)) * ppn)
+
+
+def loss_scale(acfg, kind, nll_weight=None):
+    """-> (label, h_value, note) describing where each loss stops pushing. Printed at startup.
+
+    IPO has an EQUILIBRIUM: its squared term's gradient opposes the anchor's, and they balance at
+        h* = m + w_nll / (2*alpha)
+    DPO has NONE. Both its term and the anchor push lp_w the same way, so nothing balances -- which
+    is exactly Azar's unboundedness argument and the reason IPO is the default here. What stops DPO
+    is the sigmoid saturating, once h is large against 1/beta.
+    """
+    w = acfg.nll_weight if nll_weight is None else nll_weight
+    if kind == "ipo":
+        a = acfg.alpha
+        if a <= 0:
+            return ("no contrastive term", float("nan"), "alpha=0: this is the SFT baseline")
+        return ("equilibrium h*", acfg.ipo_margin + w / (2.0 * a),
+                f"= margin {acfg.ipo_margin} + nll_weight {w} / (2*alpha {a})")
+    return ("saturates for h >>", 1.0 / max(acfg.beta, 1e-9),
+            "DPO has no equilibrium; the term simply fades once beta*h is large")
+
+
 def contrastive(h, acfg, kind):
     """h is the per-position log-ratio difference; -> (B,) loss."""
     if kind == "ipo":
@@ -187,10 +228,14 @@ def main():
     ap.add_argument("--ckpt", default=None, help="policy to tune (default: latest in CKPT_DIR)")
     ap.add_argument("--out", default=None, help="checkpoint dir (default: <round>/policy)")
     ap.add_argument("--loss", default=acfg.loss, choices=("ipo", "dpo"))
-    ap.add_argument("--alpha", type=float, default=acfg.alpha,
-                    help="weight on the contrastive term. 0 = the SFT baseline (ESM3's A.4.6).")
+    ap.add_argument("--alpha", type=float, default=None,
+                    help="weight on the contrastive term. 0 = the SFT baseline (ESM3's A.4.6). "
+                         "Default depends on the loss: the two need different scales because IPO's "
+                         "term is quadratic in h and DPO's is a saturating sigmoid.")
     ap.add_argument("--beta", type=float, default=acfg.beta)
     ap.add_argument("--margin", type=float, default=acfg.ipo_margin, help="IPO target, nats/position")
+    ap.add_argument("--epochs", type=float, default=acfg.target_epochs,
+                    help="only used to report how far the tuner's rank count is from ideal")
     ap.add_argument("--steps", type=int, default=acfg.steps)
     ap.add_argument("--lr", type=float, default=acfg.lr)
     ap.add_argument("--pairs-per-rank", type=int, default=acfg.pairs_per_rank)
@@ -202,6 +247,8 @@ def main():
                     help="tiny randomly-initialised model, no checkpoint: exercises every path")
     ap.add_argument("--no-ipex", action="store_true")
     a = ap.parse_args()
+    if a.alpha is None:
+        a.alpha = acfg.ipo_alpha if a.loss == "ipo" else acfg.dpo_alpha
     acfg.loss, acfg.alpha, acfg.beta, acfg.ipo_margin = a.loss, a.alpha, a.beta, a.margin
 
     env = init_distributed(a.device)
@@ -292,11 +339,31 @@ def main():
               + (f"margin={a.margin} nats/position " if a.loss == "ipo" else "")
               + f"| nll_weight={acfg.nll_weight} | {acfg.optimizer} lr={a.lr} "
               f"warmup={acfg.warmup_steps} clip={acfg.grad_clip}", flush=True)
+        # WHERE THIS LOSS STOPS PUSHING, stated before the run rather than discovered from the log.
+        # Round 1 used ESM3's alpha=0.8 against per-position log-likelihoods, which puts the IPO
+        # equilibrium at h*=0.665 -- sixteen times the margin -- so the margin never bound and the
+        # run was effectively SFT with a nudge. That is now impossible to ship unnoticed.
+        lbl, val, note = loss_scale(acfg, a.loss)
+        print(f"[align] {lbl} {val:.4g}   ({note})", flush=True)
+        if a.loss == "ipo" and a.alpha > 0 and val > 3 * max(a.margin, 1e-9):
+            print(f"[align] WARNING: h* is {val / max(a.margin, 1e-9):.0f}x the margin, so the "
+                  f"margin will NOT bind and this run is closer to SFT than to IPO. For a "
+                  f"tolerance of `tol` above the margin, use alpha = nll_weight/(2*tol) = "
+                  f"{acfg.nll_weight / (2 * acfg.ipo_tol):.0f}.", flush=True)
+
+        draws = a.steps * a.pairs_per_rank * env.world_size
+        eps = draws / max(len(data), 1)
+        want = recommended_ranks(len(data), a.steps, a.epochs, a.pairs_per_rank)
         print(f"[align] {a.steps} steps x {a.pairs_per_rank} pair(s)/rank x {env.world_size} ranks "
-              f"= {a.steps * a.pairs_per_rank * env.world_size:,} pair draws "
-              f"({a.steps * a.pairs_per_rank * env.world_size / max(len(data), 1):.1f} epochs) | "
+              f"= {draws:,} pair draws = {eps:.1f} epochs over {len(data):,} pairs | "
               f"params={count_params(model) / 1e6:.0f}M ipex={'ON' if applied_ipex else 'OFF'} "
               f"grad buffer {4 * (n_grad + 1) / 1e6:.0f}MB", flush=True)
+        if abs(eps - a.epochs) > 0.5 * a.epochs:
+            print(f"[align] {'WARNING: ' if eps > 5 else ''}for {a.epochs} epochs at {a.steps} "
+                  f"steps you want ~{want} ranks, not {env.world_size}. Pairs consumed per step is "
+                  f"world_size x pairs_per_rank, so the tuner's size sets the epoch count -- run "
+                  f"phase 5 on a SUBSET of the allocation (scripts/align.pbs: ALIGN_RANKS).",
+                  flush=True)
         print(f"[align] winner clears the absolute bar in {n_succ:,}/{len(data):,} pairs; "
               f"success_weight={acfg.success_weight}"
               f"{'  (OFF)' if acfg.success_weight == 1.0 else ''}", flush=True)
@@ -305,13 +372,24 @@ def main():
               flush=True)
 
     use_amp = dev.type in ("xpu", "cuda")
+    # THE BASELINE, measured before a single update. Every later reading of the drift monitor is
+    # only interpretable against this one, and taking it at step eval_every instead means the first
+    # point already contains 50 steps of movement.
+    nat = []
+    if env.is_main:
+        nat.append((0, natural_nll(model, shards, mcfg, dcfg.canvas, acfg.drift_natural_n, dev)))
+        print(f"[align] step 0 baseline: natural NLL {nat[0][1]:.4f} nats/position"
+              if nat[0][1] == nat[0][1] else
+              f"[align] natural NLL UNAVAILABLE -- no corpus at {a.shards}, drift monitor OFF. "
+              f"Do not run a real round like this.", flush=True)
+
     # Ranks partition ONE shuffled order, so every pair is seen by exactly one rank per epoch and
     # an optimizer step covers world_size * pairs_per_rank distinct pairs. `base` walks the order in
     # strides of that width; rank r takes the r-th slot within each stride.
     order = np.random.default_rng(a.seed).permutation(len(data))
     stride = max(1, env.world_size * a.pairs_per_rank)
     base, epoch = 0, 0
-    t0, acc, n_acc = time.perf_counter(), {}, 0
+    t0, acc, n_acc, last = time.perf_counter(), {}, 0, {}
     model.train()
 
     for step in range(a.steps):
@@ -368,6 +446,7 @@ def main():
 
         if env.is_main and (step % 10 == 0 or step == a.steps - 1):
             d = {k: v / max(n_acc, 1) for k, v in acc.items()}
+            last = dict(d)
             el = time.perf_counter() - t0
             print(f"step {step:>5} | loss {d['loss']:.4f} nll {d['nll']:.4f} "
                   f"| h {d['h']:+.4f}"
@@ -385,18 +464,48 @@ def main():
             nn_ = natural_nll(model, shards, mcfg, dcfg.canvas, acfg.drift_natural_n,
                               dev) if env.is_main else float("nan")
             if env.is_main:
+                nat.append((step, nn_))
+                best = min((v for _, v in nat if v == v), default=float("nan"))
                 print(f"[align] step {step}: natural NLL {nn_:.4f} nats/position "
-                      f"(the drift monitor -- rising means the policy is leaving the manifold, "
-                      f"whatever h is doing)" if nn_ == nn_ else
-                      f"[align] step {step}: natural NLL UNAVAILABLE -- no corpus at {a.shards}, "
-                      f"so the drift monitor is off. Do not run a real round like this.",
-                      flush=True)
+                      f"({nn_ - nat[0][1]:+.4f} vs baseline, best {best:.4f}) -- rising means the "
+                      f"policy is leaving the manifold, whatever h is doing" if nn_ == nn_ else
+                      f"[align] step {step}: natural NLL UNAVAILABLE", flush=True)
             save_checkpoint(model, opt, lr_sched, step, out_dir, env)
 
     if env.is_main:
         nn_ = natural_nll(model, shards, mcfg, dcfg.canvas, acfg.drift_natural_n, dev)
+        nat.append((a.steps, nn_))
+        vals = [(st, v) for st, v in nat if v == v]
+        best_step, best = min(vals, key=lambda t: t[1]) if vals else (0, float("nan"))
         print(f"[align] {'baseline' if a.steps == 0 else 'final'} natural NLL {nn_:.4f}"
               if nn_ == nn_ else "[align] natural NLL unavailable (no corpus)", flush=True)
+        if vals and a.steps:
+            # The drift monitor is the only number here with NO sampling noise: fixed sequences,
+            # fixed masks, so the only thing changing between readings is the policy. When its
+            # minimum is not the last step, that step is a checkpoint worth evaluating.
+            print(f"[align] drift monitor: baseline {nat[0][1]:.4f} -> min {best:.4f} at step "
+                  f"{best_step} -> final {nn_:.4f} ({nn_ - nat[0][1]:+.4f})", flush=True)
+            if best_step not in (a.steps, a.steps - 1) and best_step > 0:
+                print(f"[align] the minimum is not the last step. ckpt_{best_step:08d}.pt is the "
+                      f"drift-minimal checkpoint; it has no sampling noise in it, but it is a "
+                      f"candidate, not a verdict -- some departure from the natural manifold is "
+                      f"the point. The fold numbers settle it.", flush=True)
+        # One machine-readable record per policy, so src/align_compare.py can put the tuning
+        # metrics next to the generation metrics without anyone re-reading a log.
+        _atomic_json(os.path.join(out_dir, "metrics.json"), {
+            "loss": a.loss, "alpha": a.alpha, "beta": a.beta, "margin": a.margin,
+            "nll_weight": acfg.nll_weight, "optimizer": acfg.optimizer, "lr": a.lr,
+            "steps": a.steps, "warmup": acfg.warmup_steps, "ranks": env.world_size,
+            "pairs_per_rank": a.pairs_per_rank, "n_pairs": len(data), "epochs": eps,
+            "equilibrium": loss_scale(acfg, a.loss)[1],
+            "ckpt": ckpt, "ref_ckpt": ref_ckpt,
+            "nat_nll": [[st, v] for st, v in nat],
+            "nat_nll_baseline": nat[0][1], "nat_nll_final": nn_,
+            "nat_nll_min": best, "nat_nll_min_step": best_step,
+            "h_final": last.get("h"), "win_final": last.get("acc"),
+            "logpw_final": last.get("logpw"), "logpl_final": last.get("logpl"),
+            "nll_final": last.get("nll"),
+        })
     if a.steps == 0:
         # --steps 0 is the BASELINE measurement: the drift monitor on the untouched policy, which
         # is the only thing a later reading of it can be compared against. It must not write a

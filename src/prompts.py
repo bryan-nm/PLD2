@@ -86,8 +86,24 @@ def read_refs(path, min_plddt=0.0):
     return out, dropped
 
 
+def split_refs(refs, n_eval, seed=0):
+    """-> (train refs, eval refs), disjoint, deterministic in the seed.
+
+    The eval slice is reserved BEFORE any prompt is built and never enters a pair, so two
+    checkpoints can be compared without one of them having trained on the proteins. The split is a
+    permutation slice rather than a stride because the reference set arrives in the order
+    src/reference_set.py drew it, which is already shuffled but by a different seed.
+    """
+    if n_eval <= 0:
+        return list(refs), []
+    if n_eval >= len(refs):
+        raise SystemExit(f"n_eval={n_eval} but only {len(refs)} references")
+    idx = np.random.default_rng(seed ^ 0x5EED).permutation(len(refs))
+    return [refs[int(i)] for i in idx[n_eval:]], [refs[int(i)] for i in idx[:n_eval]]
+
+
 def build(n, refs, *, seed=0, canvas=512, bins=(0.5, 0.7, 0.85, 1.0),
-          weights=(1.0, 1.0, 1.0, 1.5), span_widths=(8, 32, 128), min_len=40):
+          weights=(1.0, 1.0, 1.0, 1.5), span_widths=(8, 32, 128), min_len=40, prefix="p"):
     """-> list of manifest rows. Deterministic in (seed, n, the reference set)."""
     if len(bins) != len(weights):
         raise SystemExit(f"{len(bins)} bins against {len(weights)} weights")
@@ -125,7 +141,7 @@ def build(n, refs, *, seed=0, canvas=512, bins=(0.5, 0.7, 0.85, 1.0),
             if masked.all() or not masked.any():     # nothing to condition on, or nothing to fill
                 skipped += 1
                 continue
-        rows.append({"pid": f"p{k:07d}", "rid": ref["rid"], "caption": int(ref["row"]),
+        rows.append({"pid": f"{prefix}{k:07d}", "rid": ref["rid"], "caption": int(ref["row"]),
                      "acc": ref["acc"], "L": L, "rate": rate, "bin": int(bin_idx[k]),
                      "span": width, "ref_plddt": round(float(ref.get("plddt", 0.0)), 4),
                      "seq": seq, "di": di, "masked": _hex(masked)})
@@ -214,17 +230,42 @@ def main():
     ap.add_argument("--min-len", type=int, default=40)
     ap.add_argument("--min-plddt", type=float, default=acfg.ref_min_plddt,
                     help="drop references ESMFold was not confident about; their 3Di is a guess")
+    ap.add_argument("--n-eval", type=int, default=acfg.n_eval_prompts,
+                    help="references reserved for evaluation, never used to build a pair")
+    ap.add_argument("--eval-out", default=None, help="default: <round>/prompts_eval.jsonl")
+    ap.add_argument("--prefix", default="p",
+                    help="pid prefix. Use 'e' when building an eval-only manifest so a manifest "
+                         "mix-up is visible rather than silent -- every id downstream derives "
+                         "from the pid, and an eval generation folded into a training round would "
+                         "otherwise join cleanly and corrupt the pairs.")
     a = ap.parse_args()
 
     refs, dropped = read_refs(a.refs or os.path.join(a.dir, "refs.jsonl"), a.min_plddt)
     print(f"[prompts] {len(refs):,} references usable"
           + (f" ({dropped:,} below pLDDT {a.min_plddt})" if dropped else ""), flush=True)
-    rows = build(a.n, refs, seed=a.seed, canvas=a.canvas, bins=acfg.mask_bins,
-                 weights=acfg.bin_weights, span_widths=acfg.span_widths, min_len=a.min_len)
+    train_refs, eval_refs = split_refs(refs, a.n_eval, a.seed)
+
+    rows = build(a.n, train_refs, seed=a.seed, canvas=a.canvas, bins=acfg.mask_bins,
+                 weights=acfg.bin_weights, span_widths=acfg.span_widths, min_len=a.min_len,
+                 prefix=a.prefix)
     out = a.out or os.path.join(a.dir, "prompts.jsonl")
     write_manifest(out, rows)
     summarize(rows)
     print(f"[prompts] wrote {out}", flush=True)
+
+    if eval_refs:
+        # Eval pids carry an 'e' so a manifest mix-up is visible instead of silent: every id in the
+        # pipeline is derived from the pid, so an eval generation folded into a training round would
+        # otherwise join cleanly and corrupt the pairs.
+        ev = build(min(a.n_eval, len(eval_refs)), eval_refs, seed=a.seed + 1, canvas=a.canvas,
+                   bins=acfg.mask_bins, weights=acfg.bin_weights,
+                   span_widths=acfg.span_widths, min_len=a.min_len, prefix="e")
+        ev_out = a.eval_out or os.path.join(a.dir, "prompts_eval.jsonl")
+        write_manifest(ev_out, ev)
+        print(f"\n[prompts] HELDOUT: {len(ev):,} eval prompts over "
+              f"{len({r['rid'] for r in ev}):,} references that no pair will ever contain.")
+        print(f"[prompts] wrote {ev_out}. This file is the comparison set -- carry it FORWARD to "
+              f"compare rounds on identical prompts (src.align_sample --manifest).", flush=True)
 
 
 if __name__ == "__main__":

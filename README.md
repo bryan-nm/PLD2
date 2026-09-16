@@ -349,6 +349,7 @@ src/
   tm_align.py         # foldseek TMalign: every generation vs its prompt's reference structure
   preference.py       # reward -> pairs, and the pass@k vs best-of-k table
   align.py            # IPO (default) / DPO preference tuning, with the drift monitors
+  align_compare.py    # several tuned policies on ONE held-out prompt set, paired
   tests_align.py      # prompt freezing, shared masks, the surrogate, IPO stops / DPO does not
 scripts/              # pbs_common.sh, train.pbs, fold.pbs, sweep.pbs, sample.pbs,
                       #   preprocess.pbs, conditional.pbs, align.pbs
@@ -386,6 +387,7 @@ qsub -v PHASES=0 scripts/align.pbs                  # reference set + prompts on
 qsub -v LOSS=dpo scripts/align.pbs                  # the same pairs under DPO
 qsub -v ALPHA=0 scripts/align.pbs                   # the SFT baseline (ESM3's A.4.6)
 qsub -v PHASES=4 scripts/align.pbs                  # re-pair only -- the pass@k table is free
+qsub -v ROUND=1 scripts/align_test.pbs              # base/sft/ipo/dpo on pairs that already exist
 python -m src.preference --report --dir <round>     # ...or read it without a queue slot
 
 # laptop smoke: tiny random model, every phase but ESMFold and foldseek
@@ -510,10 +512,40 @@ N=8 where pLDDT runs 0.007 to 0.040. `src.preference` prints all three columns s
 `src.align_sample` records the log-likelihood at generation time so the gap can be watched closing
 round over round. If it does not close, the tuning is not working.
 
+**alpha and beta do not transfer from ESM3, and round 1 is the evidence.** ESM3 length-normalises
+only `L_NLL` and leaves the contrastive term a sequence-level sum; we make both a per-position mean,
+so at L≈250 ours is ~250× smaller relative to the anchor. Setting `dL/dlp_w = 0` gives
+
+```
+L = w_nll*(-lp_w) + alpha*(h - m)^2        =>   h* = m + w_nll / (2*alpha)
+```
+
+At ESM3's `alpha=0.8` that is **h\* = 0.665 against a margin of 0.04** — the margin never binds, the
+contrastive term was 0.5% of the loss, and round 1 was an SFT run wearing an IPO label (observed h
+plateaued at 0.11–0.15 en route). So `alpha` is chosen from the tolerance you will accept,
+`alpha = nll_weight/(2*tol)`, and `src/align.py` prints h\* at startup and warns when it exceeds 3×
+the margin. **DPO has no equilibrium at all** — both terms push `lp_w` the same way, which is Azar's
+unboundedness point; what stops it is the sigmoid saturating, so `beta` must put `beta*h` at O(1),
+which on a per-position scale means ~10 rather than 0.05.
+
+**Epochs are a tuner-scale problem, not a data problem.** Pairs consumed per step is
+`world_size * pairs_per_rank`, so running phase 5 on the whole allocation is what burned 33.8 epochs
+of 5,680 pairs in round 1 while the drift monitor turned over at 8.4. `align.recommended_ranks()`
+inverts `steps * ranks * pairs_per_rank = n_pairs * epochs`, and both PBS scripts size the tuner
+from the pair count rather than from the job. At 256 nodes this stops being optional.
+
 **What to watch during tuning.** Not the margin. DPO's characteristic failure lowers `log pi(y_w)` while the
 margin rises, so the log line reports the winner's **absolute** log-likelihood, and every eval
 reports the surrogate NLL on held-out **natural** sequences. That second number is decisive: if it
 rises, the policy has left the data manifold whatever the preference metrics say.
+
+**Cost, measured rather than assumed.** ~17,200 folds per 1,000 prompts at n_gen=16 (16,000
+generations + the reference set), ~25 node-hours, ~88% of it ESMFold. So 10× is ~1 h on 256 nodes
+and ESM3's full 30,000-prompt scale is ~3 h. Generated PDBs are ~98% of the bytes and inodes a round
+writes and nothing reads them twice — `tm_align --prune` deletes each chunk once its TM rows are
+fsynced, and `fold_fasta --pdb-shard` puts each rank's structures in its own directory, which is the
+inode fix that matters past ~10k prompts. `align.pbs` prints structures/node-hour so the next
+scale-up is sized from a measurement.
 
 **It is iterative and the round number is load-bearing.** Round 2 generates from the policy round 1
 produced, on a fresh prompt set. Pairs from a policy that no longer exists are not merely stale,

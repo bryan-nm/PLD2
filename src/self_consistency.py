@@ -155,6 +155,12 @@ def parse_descriptor(tsv_path, index):
     is part of the result, not a diagnostic to drop. Spelled out because the old one-line docstring
     described only the mapping, and a caller duly wrote `di = parse_descriptor(...)`.
     """
+    # foldseek names a structure by its BASENAME, while a sharded index keys on
+    # "rankNNN/basename" (fold_fasta.pdb_subdir). Expose both so either layout resolves; setdefault
+    # so an exact key always wins over a basename that happens to collide.
+    index = dict(index)
+    for _k, _v in list(index.items()):
+        index.setdefault(os.path.basename(_k), _v)
     out, unmatched = {}, 0
     with open(tsv_path) as fh:
         for line in fh:

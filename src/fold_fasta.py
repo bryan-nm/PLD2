@@ -431,12 +431,30 @@ def _safe_name(sid: str) -> str:
     return "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(sid))[:180]
 
 
-def pdb_index_path(pdb_dir, rank):
-    return os.path.join(pdb_dir, f"index.rank{rank:03d}.jsonl")
+def pdb_subdir(pdb_dir, rank, shard):
+    """Where this rank writes its structures. Flat, or one directory per rank.
+
+    ONE DIRECTORY PER RANK IS AN INODE FIX, NOT A BYTES FIX. 1,000 prompts x 16 is ~17k files,
+    which Lustre handles; 30,000 prompts is ~500k in one directory, which it does not. Sharding by
+    rank scales itself -- at 256 nodes that is 3,072 directories of ~170 files -- and needs no
+    second knob. The index stores the path RELATIVE to pdb_dir, so every reader that does
+    os.path.join(pdb_dir, file + ".pdb") keeps working against both layouts.
+    """
+    return os.path.join(pdb_dir, f"rank{rank:03d}") if shard else pdb_dir
+
+
+def pdb_index_path(pdb_dir, rank, shard=False):
+    return (os.path.join(pdb_dir, f"rank{rank:03d}", "index.jsonl") if shard
+            else os.path.join(pdb_dir, f"index.rank{rank:03d}.jsonl"))
 
 
 def load_pdb_index(pdb_dir):
-    """{pdb basename: record id}, merged across every rank's append-only index."""
+    """{pdb path relative to pdb_dir: record id}, merged across every rank's append-only index.
+
+    Reads all three layouts -- the pre-crash-safe index.json, the flat index.rankNNN.jsonl, and the
+    sharded rankNNN/index.jsonl -- because a round folded before sharding existed must stay
+    readable, and a fold pass that fell back to 1 rank/node mid-flight can leave both.
+    """
     idx = {}
     legacy = os.path.join(pdb_dir, "index.json")
     if os.path.exists(legacy):                       # written by the pre-crash-safe version
@@ -444,7 +462,8 @@ def load_pdb_index(pdb_dir):
             idx.update(json.load(open(legacy)))
         except Exception:
             pass
-    for p in sorted(glob_.glob(os.path.join(pdb_dir, "index.rank*.jsonl"))):
+    for p in (sorted(glob_.glob(os.path.join(pdb_dir, "index.rank*.jsonl")))
+              + sorted(glob_.glob(os.path.join(pdb_dir, "rank*", "index.jsonl")))):
         with open(p) as fh:
             for line in fh:
                 try:
@@ -455,17 +474,19 @@ def load_pdb_index(pdb_dir):
     return idx
 
 
-def fold_all(todo, scorer, out_path, ocfg, t0, tag="", pdb_dir=None, rank=0):
+def fold_all(todo, scorer, out_path, ocfg, t0, tag="", pdb_dir=None, rank=0, pdb_shard=False):
     n_ok, n_pdb = 0, 0
     idx_fh = None
+    sub = pdb_subdir(pdb_dir, rank, pdb_shard) if pdb_dir else None
+    rel = (lambda b: os.path.join(f"rank{rank:03d}", b)) if pdb_shard else (lambda b: b)
     if pdb_dir:
-        os.makedirs(pdb_dir, exist_ok=True)
+        os.makedirs(sub, exist_ok=True)
         # APPEND-ONLY AND FSYNCED PER RECORD, exactly like the results JSONL and for exactly the
         # same reason: a GPU fault aborts the process outright, with no atexit and no buffer drain.
         # An index written once at the end is lost every time, which is how a crashed run left 200
         # structures on disk and nothing able to say which record each one belonged to. Per-rank
         # files because twelve ranks read-modify-writing one JSON would race and lose entries.
-        idx_fh = open(pdb_index_path(pdb_dir, rank), "a")
+        idx_fh = open(pdb_index_path(pdb_dir, rank, pdb_shard), "a")
     with open(out_path, "a") as fh:
         for i, (sid, seq) in enumerate(todo):
             if pdb_dir:
@@ -476,8 +497,8 @@ def fold_all(todo, scorer, out_path, ocfg, t0, tag="", pdb_dir=None, rank=0):
                 rows = structure_from(out, seq)
                 if rows:
                     base = _safe_name(sid)
-                    if write_pdb(os.path.join(pdb_dir, base + ".pdb"), seq, rows):
-                        idx_fh.write(json.dumps({"file": base, "id": sid}) + "\n")
+                    if write_pdb(os.path.join(sub, base + ".pdb"), seq, rows):
+                        idx_fh.write(json.dumps({"file": rel(base), "id": sid}) + "\n")
                         idx_fh.flush()
                         os.fsync(idx_fh.fileno())
                         n_pdb += 1
@@ -519,7 +540,7 @@ def fold_all(todo, scorer, out_path, ocfg, t0, tag="", pdb_dir=None, rank=0):
 
     if idx_fh is not None:
         idx_fh.close()
-        print(f"[fold]{tag} wrote {n_pdb} PDBs to {pdb_dir}", flush=True)
+        print(f"[fold]{tag} wrote {n_pdb} PDBs to {sub}", flush=True)
     return n_ok
 
 
@@ -546,6 +567,11 @@ def main():
     ap.add_argument("--pdb-dir", default=None,
                     help="also write one backbone PDB per folded sequence here, for "
                          "src.self_consistency")
+    ap.add_argument("--pdb-shard", action="store_true",
+                    help="write each rank's PDBs into <pdb-dir>/rankNNN/. An INODE fix: 30k prompts "
+                         "x 16 is ~500k files in one Lustre directory. Readers handle both layouts, "
+                         "so it is safe to turn on mid-campaign. Leave it OFF for any directory "
+                         "foldseek will read as a whole (the reference set).")
     ap.add_argument("--summarize", action="store_true", help="print the table and exit; no GPU")
     ap.add_argument("--no-ipex", action="store_true")
     args = ap.parse_args()
@@ -616,7 +642,7 @@ def main():
     while True:
         if todo:
             total += fold_all(todo, scorer, my_out, ocfg, t0, tag, pdb_dir=args.pdb_dir,
-                              rank=env.rank)
+                              rank=env.rank, pdb_shard=args.pdb_shard)
             last_progress = time.perf_counter()
             # Only rank 0 prints the table; every rank's records are in it, because summarize()
             # globs all the per-rank files. Twelve copies of the same table would bury the log.
