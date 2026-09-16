@@ -13,6 +13,9 @@
 #   qsub -v ROUND=1 scripts/align_test.pbs
 #   qsub -v ROUND=1,VARIANTS=base:sft:ipo scripts/align_test.pbs        # skip DPO
 #   qsub -v ROUND=1,VARIANTS=base:ipo:ipo_esm3 scripts/align_test.pbs   # does alpha actually matter
+#   qsub -v ROUND=1,VARIANTS=ipo_m18,PHASES=TGFM scripts/align_test.pbs         # add one variant...
+#   qsub -v ROUND=1,VARIANTS=base:sft:ipo:dpo:ipo_m18,PHASES=C scripts/align_test.pbs   # ...then
+#                                                                 re-read the table over all of them
 #   qsub -v ROUND=1,PHASES=C scripts/align_test.pbs                     # re-read the table only
 #
 # WHY THIS EXISTS. Round 1 used ESM3's alpha=0.8 against per-position log-likelihoods. We
@@ -27,6 +30,13 @@
 #   ipo        alpha from the tolerance: alpha = nll_weight/(2*tol), so the margin binds.
 #   dpo        beta on the per-position scale, so beta*h is O(1) and logsigmoid has gradient.
 #   ipo_esm3   alpha=0.8, i.e. round 1 reproduced. Include it to show the scaling mattered.
+#   ipo_mNN    IPO with the margin at 0.NN. The first comparison found IPO contrastively INERT at
+#              the default margin of 0.04: h settled at 0.085 against its equilibrium of 0.06, so
+#              the bound worked exactly as derived -- and bound at a setpoint far below where the
+#              signal is. DPO, which has no ceiling, ran to h=0.176 and won 160/200 paired. The
+#              margin was a number picked out of the air and never calibrated. Read the two losses
+#              as a pair: DPO is the unbounded probe that reveals the natural scale of h, IPO is
+#              the instrument once you know it. ipo_m18 puts the ceiling where DPO actually landed.
 #
 # THE EVAL SET IS FRESH AND DISJOINT. Round 1 spent nearly every usable reference on training
 # prompts, so a holdout cannot be carved out of it after the fact -- this draws a NEW small
@@ -82,6 +92,7 @@ variant_flags() {
         ipo)      echo "--loss ipo" ;;                       # alpha defaults to ipo_alpha
         dpo)      echo "--loss dpo" ;;                       # alpha/beta default to the dpo pair
         ipo_esm3) echo "--loss ipo --alpha 0.8" ;;           # round 1, reproduced
+        ipo_m*)   echo "--loss ipo --margin 0.${1#ipo_m}" ;; # ipo_m18 -> margin 0.18
         *)        echo "" ;;
     esac
 }

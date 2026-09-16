@@ -380,6 +380,45 @@ check("holdout is deterministic",
 check("holdout moves with the seed",
       [r["rid"] for r in split_refs(_refs, 10, seed=4)[1]] != [r["rid"] for r in _ev])
 
+
+# ------------------------------------------------- 11. degeneracy detectors and the per-bin split
+from src.align_compare import degeneracy, paired_delta, split_by_bin                 # noqa: E402
+
+_rg = random.Random(0)
+_rand = ["".join(_rg.choice("ACDEFGHIKLMNPQRSTVWY") for _ in range(250)) for _ in range(20)]
+_poly = ["A" * 250 for _ in range(20)]
+_ag = [("A" * 10 + "G" * 10) * 13 for _ in range(20)]
+_20mer = ["".join(_rg.choice("ACDEFGHIKLMNPQRSTVWY") for _ in range(20)) * 13 for _ in range(20)]
+_l_rand, _k_rand = degeneracy(_rand, (13,))
+_l_poly, _k_poly = degeneracy(_poly, (13,))
+_l_ag, _k_ag = degeneracy(_ag, (13,))
+_l_20, _k_20 = degeneracy(_20mer, (13,))
+check("LCR is ~0 on random sequence", _l_rand < 0.05, f"{_l_rand:.1%}")
+check("LCR is 1.0 on poly-A", _l_poly > 0.99, f"{_l_poly:.1%}")
+check("k13 is ~0 on random sequence", _k_rand[13] < 0.01, f"{_k_rand[13]:.1%}")
+check("k13 is 1.0 on poly-A", _k_poly[13] > 0.99)
+check("both fire on a 10+10 block repeat", _l_ag > 0.99 and _k_ag[13] > 0.99)
+# THE REASON BOTH COLUMNS EXIST: a repeated 20-mer is longer than the SEG window, so LCR cannot
+# see it at all, while k13 reads it at 100%. Either one alone would call this sequence clean.
+check("a repeated 20-mer is INVISIBLE to LCR", _l_20 < 0.05, f"{_l_20:.1%}")
+check("...and obvious to k13", _k_20[13] > 0.99, f"{_k_20[13]:.1%}")
+
+_pool = {f"p{i}": [{"rate": (0.5, 1.0)[i % 2], "plddt": 0.5, "tm": 0.4, "loglik": -1.0,
+                    "seq": "ACDE" * 10} for _ in range(4)] for i in range(10)}
+_sp = split_by_bin(_pool)
+check("per-bin split covers every prompt",
+      sum(len(v) for v in _sp.values()) == len(_pool) and set(_sp) == {0.5, 1.0})
+check("per-bin split assigns a prompt to exactly one bin",
+      not (set(_sp[0.5]) & set(_sp[1.0])))
+
+_A = {"_per_prompt": {"a": 1.0, "b": 2.0, "c": 3.0}}
+_B = {"_per_prompt": {"a": 0.5, "b": 2.5, "c": 1.0}}
+_d, _nb, _nw, _p = paired_delta(_A, _B)
+check("paired_delta counts better/worse", (_nb, _nw) == (2, 1), f"{(_nb, _nw)}")
+check("paired_delta mean is the mean difference", abs(_d - (0.5 - 0.5 + 2.0) / 3) < 1e-12)
+check("paired_delta only uses shared prompts",
+      paired_delta(_A, {"_per_prompt": {"a": 0.0}})[1:3] == (1, 0))
+
 print(f"\n{checks - len(fails)}/{checks} checks pass")
 if fails:
     print("FAILURES:")

@@ -349,7 +349,7 @@ src/
   tm_align.py         # foldseek TMalign: every generation vs its prompt's reference structure
   preference.py       # reward -> pairs, and the pass@k vs best-of-k table
   align.py            # IPO (default) / DPO preference tuning, with the drift monitors
-  align_compare.py    # several tuned policies on ONE held-out prompt set, paired
+  align_compare.py    # several tuned policies on ONE held-out prompt set: paired, per-bin, LCR/k13
   tests_align.py      # prompt freezing, shared masks, the surrogate, IPO stops / DPO does not
 scripts/              # pbs_common.sh, train.pbs, fold.pbs, sweep.pbs, sample.pbs,
                       #   preprocess.pbs, conditional.pbs, align.pbs
@@ -388,6 +388,8 @@ qsub -v LOSS=dpo scripts/align.pbs                  # the same pairs under DPO
 qsub -v ALPHA=0 scripts/align.pbs                   # the SFT baseline (ESM3's A.4.6)
 qsub -v PHASES=4 scripts/align.pbs                  # re-pair only -- the pass@k table is free
 qsub -v ROUND=1 scripts/align_test.pbs              # base/sft/ipo/dpo on pairs that already exist
+qsub -v ROUND=1,VARIANTS=ipo_m18,PHASES=TGFM scripts/align_test.pbs   # add one variant, then
+qsub -v ROUND=1,VARIANTS=base:dpo:ipo_m18,PHASES=C scripts/align_test.pbs   #   re-read the table
 python -m src.preference --report --dir <round>     # ...or read it without a queue slot
 
 # laptop smoke: tiny random model, every phase but ESMFold and foldseek
@@ -533,6 +535,22 @@ which on a per-position scale means ~10 rather than 0.05.
 of 5,680 pairs in round 1 while the drift monitor turned over at 8.4. `align.recommended_ranks()`
 inverts `steps * ranks * pairs_per_rank = n_pairs * epochs`, and both PBS scripts size the tuner
 from the pair count rather than from the job. At 256 nodes this stops being optional.
+
+**Measured, round 1's pairs, four ways, paired on 200 held-out prompts: DPO wins and IPO does
+nothing.** DPO 160/200 prompts better (sign p ≈ 0, success 28.6% → 33.2%); IPO 102/200 and SFT
+101/200, both coin flips. The diagnosis is in `h fin` against `h*`: IPO settled at 0.085 against its
+equilibrium of 0.06, so the α derivation is *validated* — and it bound at a setpoint far below where
+the signal is, since DPO ran to h = 0.176. The tell is `win%`, identical at 44% for IPO and SFT: at
+a margin of 0.04 IPO is contrastively inert. Read the two losses as a pair — **DPO is the unbounded
+probe that reveals the natural scale of h; IPO is the instrument once you know it** (`ipo_mNN` in
+`align_test.pbs` puts the ceiling where DPO landed). Note also that SFT captured *nothing* here,
+where ESM3 got about half its gain from it.
+
+**Three things the comparison table refuses to let you skip.** LCR and k13, because pLDDT is the
+gameable half of the reward and TM is not — a variant whose pLDDT moves several times as far as its
+TM gets a warning. The per-mask-rate-bin split, because a pooled row mixes 50%-masked completion
+(~29% success) with cold start, and only the rate-1.0 rows are the deployment condition. And the
+paired per-prompt sign test rather than a difference of means.
 
 **What to watch during tuning.** Not the margin. DPO's characteristic failure lowers `log pi(y_w)` while the
 margin rises, so the log line reports the winner's **absolute** log-likelihood, and every eval
