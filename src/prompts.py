@@ -241,9 +241,32 @@ def main():
     a = ap.parse_args()
 
     refs, dropped = read_refs(a.refs or os.path.join(a.dir, "refs.jsonl"), a.min_plddt)
-    print(f"[prompts] {len(refs):,} references usable"
-          + (f" ({dropped:,} below pLDDT {a.min_plddt})" if dropped else ""), flush=True)
+    total = len(refs) + dropped
+    print(f"[prompts] {len(refs):,} of {total:,} references usable"
+          + (f" ({dropped:,} below pLDDT {a.min_plddt} = "
+             f"{dropped / max(total, 1):.0%})" if dropped else ""), flush=True)
     train_refs, eval_refs = split_refs(refs, a.n_eval, a.seed)
+
+    # THE ACCOUNTING, BEFORE THE FAILURE. Every reference yields at most one prompt, so a shortfall
+    # is arithmetic and can be stated exactly rather than discovered as "only N usable prompts".
+    # This is the check that was missing when a 1,500-prompt round died after folding 1,800
+    # references: 267 were low-confidence and 200 went to the holdout, leaving 1,333.
+    if len(train_refs) < a.n:
+        from .reference_set import refs_needed
+        raise SystemExit(
+            f"cannot build {a.n:,} prompts.\n"
+            f"  {total:,} references folded\n"
+            f"- {dropped:,} below pLDDT {a.min_plddt} ({dropped / max(total, 1):.0%})\n"
+            f"- {len(eval_refs):,} reserved for the evaluation holdout (--n-eval)\n"
+            f"= {len(train_refs):,} available, {a.n - len(train_refs):,} short\n\n"
+            f"Every reference yields at most ONE prompt. Either:\n"
+            f"  --n {len(train_refs):,}                    build what this reference set supports\n"
+            f"  draw {refs_needed(a.n, a.n_eval):,} references  and re-run phase 0 -- raising the "
+            f"count with the SAME seed is incremental: the selection is a prefix of one "
+            f"seeded shuffle, so the {total:,} already folded are reused\n"
+            f"  --n-eval 0                     give up the held-out comparison set\n"
+            f"  --min-plddt 0                  keep the low-confidence references (their 3Di is "
+            f"whatever ESMFold guessed, in the scaffold AND in the TM target)")
 
     rows = build(a.n, train_refs, seed=a.seed, canvas=a.canvas, bins=acfg.mask_bins,
                  weights=acfg.bin_weights, span_widths=acfg.span_widths, min_len=a.min_len,

@@ -500,6 +500,33 @@ _allgated, _, _ng2 = build_pairs(
 check("a prompt with nothing promotable is dropped, not forced",
       _allgated == [] and _ng2 == 1)
 
+
+# ------------------------------------------------- 13. reference sizing
+# A 1,500-prompt round drew 1,800 references on a flat 1.2x multiplier and died in phase 0d, AFTER
+# folding every one of them: 267 were below ref_min_plddt and 200 went to the eval holdout, leaving
+# 1,333. A reference yields at most one prompt, so the requirement is arithmetic, not a guess.
+from src.reference_set import refs_needed, select                                 # noqa: E402
+
+check("refs_needed covers the holdout and the drop rate",
+      refs_needed(1500, n_eval=200, usable_frac=0.85, headroom=1.05) == 2100,
+      f"{refs_needed(1500, 200, 0.85, 1.05)}")
+check("refs_needed is enough for what broke",
+      refs_needed(1500, 200, 0.85, 1.05) * 0.85 - 200 >= 1500)
+check("the old 1.2x multiplier was NOT",
+      int(1500 * 1.2) * 0.85 - 200 < 1500)
+check("refs_needed grows with the holdout",
+      refs_needed(1000, 400, 0.85, 1.0) > refs_needed(1000, 100, 0.85, 1.0))
+
+# The recovery advice in the failure message is load-bearing -- raising the count must REUSE the
+# folds already paid for, or the suggestion costs a second full fold campaign.
+_rows = [{"acc": f"P{i}", "seq": "ACDEFGHIKLMNPQRSTVWY" * ((i % 20) + 3)} for i in range(3000)]
+_a = [r["acc"] for r in select(_rows, 900, seed=1, min_len=40, max_len=511)]
+_b = [r["acc"] for r in select(_rows, 1200, seed=1, min_len=40, max_len=511)]
+check("raising --n at the same seed extends the draw", _b[:len(_a)] == _a)
+check("...so only the new references cost anything", len(set(_b) - set(_a)) == 300)
+check("a different seed does NOT extend it",
+      [r["acc"] for r in select(_rows, 1200, seed=2, min_len=40, max_len=511)][:len(_a)] != _a)
+
 print(f"\n{checks - len(fails)}/{checks} checks pass")
 if fails:
     print("FAILURES:")

@@ -146,10 +146,15 @@ fold_loop() {                          # $1 = out jsonl, $2 = pdb dir, rest = FA
 # --- phase 0: the reference set, then the prompts ------------------------------------------------
 if has 0; then
     t0=$SECONDS
-    echo "[align] phase 0/5a: selecting captioned SwissProt proteins (split ${REF_SPLIT})"
-    N_REFS=$(python -c "print(int(${N_PROMPTS} * $(python -c 'from config import CFG; print(CFG.align.n_refs_factor)')))")
+    # SIZED, NOT MULTIPLIED. A reference yields at most one prompt, the eval holdout is carved out
+    # before any prompt is built, and ~15% of references fail ref_min_plddt -- so N_REFS has to
+    # cover all three. A flat 1.2x drew 1,800 for 1,500 prompts and the job died in phase 0d, after
+    # every one of them had been folded. --for-prompts makes reference_set re-check it up front.
+    N_REFS=${N_REFS:-$(python -c "from src.reference_set import refs_needed; print(refs_needed(${N_PROMPTS}))")}
+    echo "[align] phase 0/5a: ${N_REFS} captioned SwissProt proteins (split ${REF_SPLIT})"\
+         "for ${N_PROMPTS} prompts + the eval holdout"
     python -m src.reference_set fasta --dir "${RDIR}" --n "${N_REFS}" \
-        --split "${REF_SPLIT}" --seed "${PROMPT_SEED}" || exit 1
+        --for-prompts "${N_PROMPTS}" --split "${REF_SPLIT}" --seed "${PROMPT_SEED}" || exit 1
 
     echo "[align] phase 0/5b: folding ${N_REFS} references -- these ARE the ground truth"
     fold_loop "${REF_FOLDS}" "${REF_PDB_DIR}" "${RDIR}/refs.fasta"

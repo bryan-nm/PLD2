@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import random
 import sys
@@ -48,6 +49,26 @@ from .self_consistency import parse_descriptor, record_key, run_foldseek
 # config.py owns the path and the column names. Read with the csv module, never by splitting on
 # commas: the captions contain them.
 ID_COL, PROT_COL, TEXT_COL = SWISSPROT_COLS
+
+
+def refs_needed(n_prompts, n_eval=None, usable_frac=None, headroom=None):
+    """How many references to draw and fold so `n_prompts` prompts can actually be built.
+
+    Every reference yields at most one prompt (src.prompts.build walks a permutation and never
+    revisits), so the count has to cover three things a flat multiplier does not:
+
+        n_prompts + n_eval          the holdout is carved out BEFORE any prompt is built
+        / usable_frac               ref_min_plddt discards the low-confidence ones
+        * headroom                  because that drop rate is an estimate
+
+    Getting this wrong is expensive rather than merely annoying: the shortfall only surfaces in
+    phase 0d, after every reference has already been folded.
+    """
+    acfg = CFG.align
+    n_eval = acfg.n_eval_prompts if n_eval is None else n_eval
+    uf = acfg.ref_usable_frac if usable_frac is None else usable_frac
+    hd = acfg.ref_headroom if headroom is None else headroom
+    return int(math.ceil((int(n_prompts) + int(n_eval)) / max(uf, 1e-6) * hd))
 
 
 def load_rows(csv_path, cache_dir, split=None, splits_path=None):
@@ -136,6 +157,22 @@ def select(rows, n, seed, min_len, max_len, exclude=()):
 
 
 def cmd_fasta(a):
+    want = getattr(a, "for_prompts", None)
+    if want:
+        need = refs_needed(want)
+        acfg = CFG.align
+        if a.n < need:
+            raise SystemExit(
+                f"--n {a.n:,} cannot support {want:,} prompts.\n"
+                f"  {want:,} prompts + {acfg.n_eval_prompts:,} held out for evaluation "
+                f"= {want + acfg.n_eval_prompts:,} references consumed\n"
+                f"  / {acfg.ref_usable_frac:.0%} expected to clear ref_min_plddt="
+                f"{acfg.ref_min_plddt}\n"
+                f"  x {acfg.ref_headroom} headroom  ->  draw {need:,}\n"
+                f"Refusing now rather than after folding {a.n:,} structures. Raising --n with the "
+                f"SAME --seed is incremental: the selection is a prefix of one seeded shuffle, so "
+                f"the references you have already folded are reused and only the new ones cost "
+                f"anything.")
     rows = load_rows(a.csv, a.cache, a.split or None, a.splits)
     print(f"[refs] {len(rows):,} captioned proteins"
           + (f" in split '{a.split}'" if a.split else " (whole corpus)"), flush=True)
@@ -231,8 +268,12 @@ def main():
 
     f = sub.add_parser("fasta", help="select captioned proteins -> refs.fasta")
     f.add_argument("--dir", default=acfg.round_dir)
-    f.add_argument("--n", type=int, default=int(acfg.n_prompts * 1.2),
-                   help="draw more than n_prompts: folding and foldseek both lose some")
+    f.add_argument("--n", type=int, default=refs_needed(acfg.n_prompts),
+                   help="references to draw. The default covers the eval holdout and the "
+                        "ref_min_plddt drop; see refs_needed().")
+    f.add_argument("--for-prompts", type=int, default=None,
+                   help="warn NOW if --n is too small to build this many prompts later. The "
+                        "shortfall otherwise surfaces only after every reference has been folded.")
     f.add_argument("--csv", default=SWISSPROT_CSV)
     f.add_argument("--cache", default=FILIP_CACHE)
     f.add_argument("--split", default="test", help="'' for the whole corpus")

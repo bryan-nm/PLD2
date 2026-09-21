@@ -436,7 +436,13 @@ class AlignCfg:
     # Captioned SwissProt proteins, ESMFolded once. The scaffold's 3Di, the TM target and the
     # caption all come from that single fold, so no predictor change sits inside the measurement --
     # which is what carving prompts out of the AlphaFold-derived AFDB shards would have done.
-    n_refs_factor: float = 1.2       # draw this many x n_prompts: folding and foldseek lose some
+    # HOW MANY REFERENCES A ROUND NEEDS. A flat multiple of n_prompts is wrong, and it failed in
+    # production: every reference yields at most ONE prompt, n_eval of them are reserved for the
+    # holdout before any prompt is built, and ref_min_plddt discards a further ~15%. At
+    # n_prompts=1500 a factor of 1.2 drew 1800, of which 267 were low-confidence and 200 went to
+    # the holdout, leaving 1333 -- and the job died AFTER folding all 1800. See refs_needed().
+    ref_usable_frac: float = 0.85    # measured twice: 85% of references clear ref_min_plddt
+    ref_headroom: float = 1.05       # the drop rate is an estimate; do not size to the estimate
     ref_split: str = "test"          # rows the FILIP co-embedding never trained on
     ref_min_plddt: float = 0.70      # a reference ESMFold is unsure about is a bad prompt AND a bad
                                      # TM target: its 3Di is a guess in both roles
