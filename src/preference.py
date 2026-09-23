@@ -151,19 +151,30 @@ def selector_at_k(succ_sorted, k):
                and n - 1 - r >= k - 1) / tot
 
 
-def report(pool, acfg, max_k=None):
+def report(pool, acfg, max_k=None, coverage=0.25):
     pids = sorted(pool)
     ns = [len(pool[p]) for p in pids]
-    n_min = min(ns) if ns else 0
-    max_k = max_k or n_min
     all_s = [s for p in pids for s in pool[p]]
     if not all_s:
         print("[pref] nothing scored yet")
         return
+    # THE TABLE'S DEPTH IS A QUANTILE, NOT THE MINIMUM. A single prompt whose folds mostly failed
+    # used to collapse the whole thing to k=1 -- which is exactly what happened when folding got
+    # through 66% of 24,000 generations and one prompt came back with a single sample. Every row
+    # also carries the number of prompts that can support it, so a thinning tail is visible rather
+    # than silently changing what the row means.
+    n_min, n_max = min(ns), max(ns)
+    max_k = max_k or int(np.quantile(ns, coverage))
+    max_k = max(1, min(max_k, n_max))
 
     succ = [succeeded(s, acfg) for s in all_s]
     print(f"[pref] {len(pids):,} prompts, {len(all_s):,} scored generations "
-          f"({np.mean(ns):.1f} per prompt, min {n_min})")
+          f"({np.mean(ns):.1f} per prompt, min {n_min}, median {int(np.median(ns))}, max {n_max})")
+    if n_min < n_max:
+        short = sum(1 for v in ns if v < n_max)
+        print(f"[pref] {short:,} prompt(s) ({short / len(pids):.0%}) have fewer than {n_max} "
+              f"generations, so the best-of-n ceiling this round aims at is really best-of-"
+              f"{np.mean(ns):.1f}. That is folding coverage, not generation.")
     print(f"[pref] success = pLDDT > {acfg.plddt_success} AND {acfg.tm_field} > {acfg.tm_success}"
           f"  ->  per-draw rate {np.mean(succ):.3%}")
     print(f"[pref] reward = {acfg.reward_plddt}*pLDDT + {acfg.reward_tm}*TM "
@@ -192,13 +203,15 @@ def report(pool, acfg, max_k=None):
                 e = float(rng.standard_normal((200_000, k)).max(axis=1).mean())
                 print(f"[pref]     n={k:<3} {base + e * sig:.3f}")
 
-    print(f"\n{'k':>4} {'pass@k (oracle)':>16} {'best-of-k pLDDT':>17} "
+    row_last = None
+    print(f"\n{'k':>4} {'prompts':>8} {'pass@k (oracle)':>16} {'best-of-k pLDDT':>17} "
           f"{'best-of-k loglik':>17} {'best-of-k reward':>17}")
-    print("-" * 77)
+    print("-" * 86)
     for k in range(1, max_k + 1):
-        row = [k]
+        sup = [p for p in pids if len(pool[p]) >= k]
+        row = [k, len(sup)]
         row.append(float(np.mean([pass_at_k(len(pool[p]), sum(succeeded(s, acfg) for s in pool[p]), k)
-                                  for p in pids if len(pool[p]) >= k])))
+                                  for p in sup])))
         for key in ("plddt", "loglik", "_reward"):
             vals = []
             for p in pids:
@@ -209,15 +222,36 @@ def report(pool, acfg, max_k=None):
                                else (lambda s: s.get(key, 0.0)), reverse=True)
                 vals.append(selector_at_k([succeeded(s, acfg) for s in order], k))
             row.append(float(np.mean(vals)) if vals else float("nan"))
-        print(f"{row[0]:>4} {row[1]:>16.4f} {row[2]:>17.4f} {row[3]:>17.4f} {row[4]:>17.4f}")
-    print("\n[pref] THE COLUMN TO READ IS loglik. pLDDT selection already tracks the oracle -- "
-          "measured, at\n[pref] n=100 queries, identically at every k -- so there is no selection "
-          "loss left to recover and\n[pref] a better ranker buys nothing. The model's OWN "
-          "likelihood is the broken one: best-of-N by it\n[pref] runs 0.007 -> 0.000 where pLDDT "
-          "runs 0.007 -> 0.040. The generator makes good proteins\n[pref] and ranks them below the "
-          "bad ones. That gap is exactly what a preference loss repairs, so\n[pref] it should "
-          "narrow round over round; if it does not, the tuning is not doing its job.",
-          flush=True)
+        print(f"{row[0]:>4} {row[1]:>8,} {row[2]:>16.4f} {row[3]:>17.4f} {row[4]:>17.4f} "
+              f"{row[5]:>17.4f}")
+        row_last = (row[0], row[2], row[3], row[4])
+    if max_k < n_max:
+        print(f"[pref] stopped at k={max_k}: beyond it fewer than {1 - coverage:.0%} of prompts "
+              f"have the samples to support a row.")
+    # READ OFF THIS TABLE, not off a remembered one. The earlier note asserted "pLDDT selection
+    # already tracks the oracle", which was measured once and is not true in general -- on a pool
+    # with uneven fold coverage it can be far from true, and a log that states it anyway is worse
+    # than a log that says nothing.
+    if row_last:
+        k, oracle, sel_p, sel_l = row_last
+        sel_loss, gap = oracle - sel_p, sel_p - sel_l
+        print(f"\n[pref] at k={k}:  selection loss (oracle - pLDDT) {sel_loss:+.4f}   "
+              f"loglik gap (pLDDT - loglik) {gap:+.4f}")
+        if sel_loss > 0.02:
+            print(f"[pref]   pLDDT leaves {sel_loss:.4f} on the table against a perfect selector. "
+                  f"That is SELECTION\n[pref]   loss, and its fix is a better ranker, not a better "
+                  f"model.")
+        else:
+            print(f"[pref]   pLDDT is within {sel_loss:.4f} of the oracle, so there is no "
+                  f"selection loss left to\n[pref]   recover and a better ranker buys nothing.")
+        if gap > 0.02:
+            print(f"[pref]   The model's OWN likelihood is the weaker ranker by {gap:.4f}. That "
+                  f"gap is what a\n[pref]   preference loss repairs, so it should narrow round "
+                  f"over round; if it does not, the\n[pref]   tuning is not doing its job.")
+        else:
+            print(f"[pref]   The model's own likelihood ranks about as well as pLDDT here "
+                  f"({gap:+.4f}); the\n[pref]   likelihood pathology is a COLD-START phenomenon "
+                  f"and this pool is mostly not that.")
 
 
 # --------------------------------------------------------------------------------------

@@ -65,6 +65,11 @@ FOLD_BUDGET=${FOLD_BUDGET:-5400}
 
 RDIR=$(python -c "from config import CFG; CFG.align.round=${ROUND}; print(CFG.align.round_dir)")
 EVREF="${RDIR}/evalref"
+# BOTH, merged by src.tm_align. scripts/align.pbs holds its eval prompts out of the MAIN reference
+# set, so their structures sit in <round>/refpdb; this script builds its own set under evalref/ only
+# when no holdout exists. Testing for the MANIFEST and assuming the structures followed is what
+# scored four variants against an empty directory and returned 0 TM rows for all of them.
+REF_PDBS="${RDIR}/refpdb:${EVREF}/refpdb"
 EVAL_MANIFEST="${RDIR}/prompts_eval.jsonl"
 PAIRS="${RDIR}/pairs.jsonl"
 [ -f "${PAIRS}" ] || { echo "no ${PAIRS} -- run scripts/align.pbs phases 0-4 first." >&2; exit 1; }
@@ -101,6 +106,9 @@ fold_loop() {                            # $1 = out jsonl, $2 = pdb dir, $3 = ex
     local out="$1" pdbd="$2" extra="$3"; shift 3
     local t0=$SECONDS stalls=0 rpn=${RANKS_PER_NODE} attempt before after frc
     _nf() { cat "${out%.jsonl}"*.jsonl 2>/dev/null | wc -l | tr -d " "; }
+    # Both layouts: --pdb-shard writes <pdb_dir>/rankNNN/index.jsonl, flat writes index.rankNNN.jsonl
+    _np() { cat "${pdbd}"/index.rank*.jsonl "${pdbd}"/rank*/index.jsonl 2>/dev/null \
+            | wc -l | tr -d " "; }
     for attempt in $(seq 1 "${FOLD_TRIES}"); do
         [ $(( SECONDS - t0 )) -ge "${FOLD_BUDGET}" ] && { echo "[test] fold budget spent"; break; }
         before=$(_nf)
@@ -126,7 +134,16 @@ fold_loop() {                            # $1 = out jsonl, $2 = pdb dir, $3 = ex
 # --- the held-out evaluation set ---------------------------------------------------------------
 # Built once and reused by every variant, which is what makes src.align_compare's paired columns
 # meaningful: the same prompts on both sides, so prompt difficulty cancels instead of dominating.
-if [ ! -f "${EVAL_MANIFEST}" ]; then
+# Does the manifest, wherever it came from, actually resolve to folded references? That is the
+# question -- not whether the manifest file exists.
+eval_ready() {
+    [ -f "${EVAL_MANIFEST}" ] && python -m src.tm_align --dir "${RDIR}" --check \
+        --ref-pdb-dir "${REF_PDBS}" --manifest "${EVAL_MANIFEST}" >/dev/null 2>&1
+}
+
+if ! eval_ready; then
+    [ -f "${EVAL_MANIFEST}" ] && echo "[test] ${EVAL_MANIFEST} exists but its references have no"\
+        "structures in ${REF_PDBS}; building a dedicated eval reference set."
     t0=$SECONDS
     echo "[test] building a held-out eval set: ${N_EVAL} prompts from fresh references"
     python -m src.reference_set fasta --dir "${EVREF}" --n $(( N_EVAL * 12 / 10 )) \
@@ -139,6 +156,12 @@ if [ ! -f "${EVAL_MANIFEST}" ]; then
 else
     echo "[test] reusing ${EVAL_MANIFEST} ($(wc -l < "${EVAL_MANIFEST}" | tr -d ' ') prompts)"
 fi
+
+# PRE-FLIGHT, loudly, before a single generation. Four variants cost ~1.5 hours of generation and
+# folding; the join that feeds TM costs a second to check.
+echo "[test] checking the eval prompts resolve to reference structures"
+python -m src.tm_align --dir "${RDIR}" --check --ref-pdb-dir "${REF_PDBS}" \
+    --manifest "${EVAL_MANIFEST}" || exit 1
 
 CKPT_FLAG=""; [ -n "${CKPT:-}" ] && CKPT_FLAG="--ckpt ${CKPT}"
 IFS=':' read -ra VLIST <<< "${VARIANTS}"
@@ -200,7 +223,7 @@ for v in "${VLIST[@]}"; do
         echo "[test] TM for '${v}'"
         # shellcheck disable=SC2086
         "${MPI_LAUNCH[@]}" python -m src.tm_align --dir "${EV}" --pdb-dir "${EV}/pdb" \
-            --ref-pdb-dir "${EVREF}/refpdb" --manifest "${EVAL_MANIFEST}" \
+            --ref-pdb-dir "${REF_PDBS}" --manifest "${EVAL_MANIFEST}" \
             ${PRUNE:+--prune} ${TM_ARGS:-}
         phase "tm:${v}" $t0
     fi

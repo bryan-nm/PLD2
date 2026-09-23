@@ -104,7 +104,12 @@ fold_loop() {                          # $1 = out jsonl, $2 = pdb dir, rest = FA
     local out="$1" pdbd="$2"; shift 2
     local t0=$SECONDS stalls=0 rpn=${RANKS_PER_NODE} attempt before after frc
     _nf() { cat "${out%.jsonl}"*.jsonl 2>/dev/null | wc -l | tr -d " "; }
-    _np() { cat "${pdbd}"/index.rank*.jsonl 2>/dev/null | wc -l | tr -d " "; }
+    # BOTH LAYOUTS. --pdb-shard writes <pdb_dir>/rankNNN/index.jsonl; this counter only knew the
+    # flat index.rankNNN.jsonl, so every generation fold attempt reported "0 PDBs" while writing
+    # 15,858 of them. A progress counter that reads zero during a 20-attempt retry loop is worse
+    # than no counter.
+    _np() { cat "${pdbd}"/index.rank*.jsonl "${pdbd}"/rank*/index.jsonl 2>/dev/null \
+            | wc -l | tr -d " "; }
     for attempt in $(seq 1 "${FOLD_TRIES}"); do
         if [ $(( SECONDS - t0 )) -ge "${FOLD_BUDGET}" ]; then
             echo "[align] fold budget (${FOLD_BUDGET}s) spent after ${attempt} attempt(s)"; break

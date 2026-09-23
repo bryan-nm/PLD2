@@ -24,6 +24,10 @@ import itertools
 import math
 import random
 
+from config import CFG as _CFG
+
+CFG_ALIGN = _CFG.align
+
 import numpy as np
 import torch
 
@@ -526,6 +530,65 @@ check("raising --n at the same seed extends the draw", _b[:len(_a)] == _a)
 check("...so only the new references cost anything", len(set(_b) - set(_a)) == 300)
 check("a different seed does NOT extend it",
       [r["acc"] for r in select(_rows, 1200, seed=2, min_len=40, max_len=511)][:len(_a)] != _a)
+
+
+# ------------------------------------------------- 14. merged reference dirs, and pass@k depth
+# Both of these cost a whole job. align_test scored four variants against an EMPTY evalref/refpdb
+# because align.pbs had started writing the eval holdout out of the MAIN reference set, and every
+# TM row came back missing. And a single prompt whose folds mostly failed collapsed the pass@k
+# table to k=1, because its depth was min(samples per prompt).
+import tempfile as _tf                                                            # noqa: E402
+
+from src.tm_align import pdb_paths                                                # noqa: E402
+
+_d = _tf.mkdtemp(prefix="pld2ref_")
+_os.makedirs(_os.path.join(_d, "a", "rank000"))
+_os.makedirs(_os.path.join(_d, "b"))
+# one directory sharded (as --pdb-shard writes it), one flat: both layouts, merged
+open(_os.path.join(_d, "a", "rank000", "index.jsonl"), "w").write(
+    _json.dumps({"file": "rank000/refs_r1", "id": "refs|r1"}) + "\n")
+open(_os.path.join(_d, "a", "rank000", "refs_r1.pdb"), "w").write("ATOM\n")
+open(_os.path.join(_d, "b", "index.rank000.jsonl"), "w").write(
+    _json.dumps({"file": "refs_r2", "id": "refs|r2"}) + "\n")
+open(_os.path.join(_d, "b", "refs_r2.pdb"), "w").write("ATOM\n")
+
+_merged = pdb_paths(f"{_os.path.join(_d, 'a')}:{_os.path.join(_d, 'b')}", "test")
+check("reference lookup merges several directories", set(_merged) == {"r1", "r2"}, f"{set(_merged)}")
+check("...across the sharded and flat layouts alike",
+      _merged["r1"].endswith("rank000/refs_r1.pdb") and _merged["r2"].endswith("b/refs_r2.pdb"))
+check("a single directory still works", set(pdb_paths(_os.path.join(_d, "a"), "t")) == {"r1"})
+try:
+    pdb_paths(_os.path.join(_d, "b") + ":" + _os.path.join(_d, "nonexistent"), "t")
+    _ok = True
+except SystemExit:
+    _ok = False
+check("one empty directory in the list is not fatal", _ok)
+try:
+    pdb_paths(_os.path.join(_d, "nonexistent"), "t")
+    check("an empty lookup raises", False)
+except SystemExit as _e:
+    check("an empty lookup raises and names the directories searched", "nonexistent" in str(_e))
+
+# pass@k depth: one starved prompt must not collapse the table
+from src.preference import report as _report                                      # noqa: E402
+import io as _io, contextlib as _ctx                                              # noqa: E402
+
+_rr = random.Random(5)
+_pool = {}
+for _i in range(60):
+    _n = 1 if _i == 0 else 16                    # exactly the shape that broke: one prompt, 1 fold
+    _pool[f"p{_i}"] = [{"plddt": _rr.uniform(.2, .95), "tm": _rr.uniform(0, .9), "ptm": 0.5,
+                        "loglik": -_rr.uniform(1, 4), "deg": 0.01, "rate": 1.0,
+                        "seq": "ACDEFGHIKL" * 12} for _ in range(_n)]
+_buf = _io.StringIO()
+with _ctx.redirect_stdout(_buf):
+    _report(_pool, CFG_ALIGN)
+_out = _buf.getvalue()
+_ks = [int(l.split()[0]) for l in _out.splitlines()
+       if l.strip() and l.split()[0].isdigit()]
+check("one starved prompt does not collapse pass@k to k=1", max(_ks) > 1, f"max k = {max(_ks)}")
+check("the table reports how many prompts support each row", "prompts" in _out)
+check("...and says the coverage shortfall out loud", "folding coverage" in _out)
 
 print(f"\n{checks - len(fails)}/{checks} checks pass")
 if fails:

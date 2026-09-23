@@ -55,24 +55,37 @@ def pid_of(gid: str) -> str:
     return gid.rsplit("_", 1)[0]
 
 
-def pdb_paths(pdb_dir, what):
-    """-> {record key: pdb path} for one folding directory.
+def pdb_paths(pdb_dirs, what):
+    """-> {record key: pdb path}, merged across one or more folding directories.
+
+    SEVERAL DIRECTORIES, because the eval prompts' references can live in either of two places and
+    the caller should not have to know which. scripts/align.pbs holds out its eval prompts from the
+    MAIN reference set, so their structures are in <round>/refpdb; scripts/align_test.pbs builds its
+    own set in <round>/evalref/refpdb when no holdout exists. Passing both and merging removes the
+    branch -- and removes the failure it caused, where a manifest from one path was scored against
+    the other path's (empty) directory and every TM row came back missing.
 
     The index is the authority, not the filenames: fold_fasta._safe_name flattens '|' to '_', so
     'gen|p0000042_7' lands on disk as 'gen_p0000042_7.pdb' and reading the id back off the basename
-    would be guesswork. load_pdb_index maps file -> the id that was actually folded.
+    would be guesswork. load_pdb_index maps file -> the id that was actually folded, and reads the
+    flat and per-rank-sharded layouts alike.
     """
-    idx = load_pdb_index(pdb_dir)
-    if not idx:
+    dirs = [d for d in (pdb_dirs if isinstance(pdb_dirs, (list, tuple))
+                        else str(pdb_dirs).split(":")) if d]
+    out, seen = {}, []
+    for d in dirs:
+        idx = load_pdb_index(d)
+        seen.append(f"{d} ({len(idx):,})")
+        for fname, sid in idx.items():
+            path = os.path.join(d, fname + ".pdb")
+            if os.path.exists(path):       # indexed but cut short by an abort -> skip
+                out.setdefault(record_key(sid), path)
+    if not out:
         raise SystemExit(
-            f"no PDB index under {pdb_dir} ({what}). Fold with `--pdb-dir {pdb_dir}` first -- "
-            f"fold_fasta writes structures only when it is given one, and only if the ESMFold "
-            f"build exposes coordinates (its log says so on the first sequence).")
-    out = {}
-    for fname, sid in idx.items():
-        path = os.path.join(pdb_dir, fname + ".pdb")
-        if os.path.exists(path):           # indexed but cut short by an abort -> skip
-            out[record_key(sid)] = path
+            f"no structures found for {what} in: {', '.join(seen)}\n"
+            f"Fold with `--pdb-dir <one of those>` first -- fold_fasta writes structures only when "
+            f"it is given one, and only if the ESMFold build exposes coordinates (its log says so "
+            f"on the first sequence).")
     return out
 
 
@@ -133,7 +146,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default=None, help="round directory (default: config align.round_dir)")
     ap.add_argument("--pdb-dir", default=None, help="generations; default: <round>/pdb")
-    ap.add_argument("--ref-pdb-dir", default=None, help="references; default: <round>/refpdb")
+    ap.add_argument("--ref-pdb-dir", default=None,
+                    help="references; COLON-SEPARATED list, merged. Default: "
+                         "<round>/refpdb:<round>/evalref/refpdb -- eval prompts held out of the "
+                         "main reference set live in the first, a separately built eval set in "
+                         "the second, and the caller should not have to know which.")
+    ap.add_argument("--check-min", type=float, default=0.95,
+                    help="fraction of the manifest's references that must resolve for --check to "
+                         "pass. Not 1.0: folding is flaky enough that demanding every structure "
+                         "would block a run over a handful of prompts that can simply be skipped.")
+    ap.add_argument("--check", action="store_true",
+                    help="resolve prompts to reference structures, report, and exit. Run this "
+                         "BEFORE generating: the alternative is discovering the join is broken "
+                         "after four variants have been generated and folded.")
     ap.add_argument("--manifest", default=None, help="default: <round>/prompts.jsonl")
     ap.add_argument("--out", default=None, help="default: <round>/tm.rankNNN.jsonl")
     ap.add_argument("--foldseek", default=os.environ.get("PLD2_FOLDSEEK", "foldseek"))
@@ -151,15 +176,36 @@ def main():
     rank, world = env.rank, env.world_size
     rdir = a.dir or acfg.round_dir
     pdb_dir = a.pdb_dir or os.path.join(rdir, "pdb")
-    ref_dir = a.ref_pdb_dir or os.path.join(rdir, "refpdb")
+    ref_dir = a.ref_pdb_dir or (os.path.join(rdir, "refpdb") + ":"
+                                + os.path.join(rdir, "evalref", "refpdb"))
     out_path = a.out or os.path.join(rdir, f"tm.rank{rank:03d}.jsonl")
 
     # pid -> rid. A prompt names its reference; the reference names the PDB. Going through the
     # manifest rather than parsing ids keeps that one mapping in one place.
     ref_of = {r["pid"]: r["rid"] for r in read_manifest(a.manifest
                                                        or os.path.join(rdir, "prompts.jsonl"))}
-    gen = pdb_paths(pdb_dir, "generations")
     ref = pdb_paths(ref_dir, "references")
+    if a.check:
+        want = sorted(set(ref_of.values()))
+        have = [r for r in want if r in ref]
+        print(f"[tm] {len(ref):,} reference structure(s) across {ref_dir}")
+        frac = len(have) / max(len(want), 1)
+        print(f"[tm] {len(have):,}/{len(want):,} of the manifest's references resolve "
+              f"({frac:.1%}, need {a.check_min:.0%})")
+        if frac < a.check_min:
+            miss = [r for r in want if r not in ref][:5]
+            raise SystemExit(
+                f"[tm] {len(want) - len(have):,} reference(s) have no structure, e.g. {miss}.\n"
+                f"Nothing downstream can be scored against them, so every TM row for those "
+                f"prompts would be missing. Fold the reference set that "
+                f"{a.manifest or 'the manifest'} was built from, or point --ref-pdb-dir at it "
+                f"(it takes a COLON-SEPARATED list and merges).")
+        if len(have) < len(want):
+            print(f"[tm] {len(want) - len(have):,} reference(s) missing; those prompts will be "
+                  f"skipped.", flush=True)
+        print("[tm] check passed", flush=True)
+        return
+    gen = pdb_paths(pdb_dir, "generations")
     by_pid = {}
     for gid, p in gen.items():
         by_pid.setdefault(pid_of(gid), {})[gid] = p
