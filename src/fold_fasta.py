@@ -142,7 +142,7 @@ def mark_done(base, rank):
     os.replace(tmp, done_path(base, rank))
 
 
-def wait_for_ranks(base, world, timeout=3600, poll=5.0):
+def wait_for_ranks(base, world, timeout=None, poll=5.0):
     """Block until every rank has finished folding. -> True if all reported.
 
     Rank 0 used to summarise the moment IT finished its own share, while other ranks were still
@@ -151,6 +151,11 @@ def wait_for_ranks(base, world, timeout=3600, poll=5.0):
     the ranks agree through the filesystem instead. Sentinels carry the job id, so a previous run's
     files cannot satisfy this.
     """
+    # Tracks the per-rank supervisor's budget when there is one (scripts/fold_rank.sh): a rank
+    # that relaunches after a GPU fault can legitimately outlast a fixed hour, and rank 0 timing
+    # out early only means the summary table it prints is partial -- the records are all on disk.
+    if timeout is None:
+        timeout = float(os.environ.get("RANK_BUDGET", 3600)) + 600
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < timeout:
         n = 0

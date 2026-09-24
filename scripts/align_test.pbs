@@ -59,7 +59,15 @@ N_EVAL=${N_EVAL:-200}
 N_GEN=${N_GEN:-16}
 GAMMA=${GAMMA:-10}
 EVAL_SEED=${EVAL_SEED:-9001}
-FOLD_TRIES=${FOLD_TRIES:-20}
+# THE OUTER LOOP IS NOW A BACKSTOP, not the retry mechanism. scripts/fold_rank.sh retries inside
+# each rank, so a whole relaunch is only needed if mpiexec itself fails. RANK_* are exported so the
+# supervisor sees them; RANK_BUDGET is the per-rank wall clock, and wants to be comfortably under
+# this job's remaining walltime.
+FOLD_TRIES=${FOLD_TRIES:-5}
+export RANK_TRIES=${RANK_TRIES:-40}
+export RANK_BUDGET=${RANK_BUDGET:-7200}
+export RANK_MIN_RUN=${RANK_MIN_RUN:-30}
+export RANK_HARD=${RANK_HARD:-3}
 FOLD_STALL=${FOLD_STALL:-3}
 FOLD_BUDGET=${FOLD_BUDGET:-5400}
 
@@ -112,8 +120,13 @@ fold_loop() {                            # $1 = out jsonl, $2 = pdb dir, $3 = ex
     for attempt in $(seq 1 "${FOLD_TRIES}"); do
         [ $(( SECONDS - t0 )) -ge "${FOLD_BUDGET}" ] && { echo "[test] fold budget spent"; break; }
         before=$(_nf)
+        # EACH RANK RUNS A SUPERVISOR, NOT PYTHON. mpiexec watches only its direct child, so
+        # making that child a shell means a GPU fault kills the python grandchild and its own rank
+        # relaunches it -- instead of mpiexec SIGTERMing the other 191 and this loop reloading
+        # ESMFold on all of them. See scripts/fold_rank.sh for the measurement that forced this.
         # shellcheck disable=SC2086
         mpiexec -n "$(( NNODES * rpn ))" -ppn "${rpn}" --pmi=pmix --cpu-bind depth -d 8 \
+            "${PBS_O_WORKDIR}/scripts/fold_rank.sh" \
             python -m src.fold_fasta --device xpu --out "${out}" --pdb-dir "${pdbd}" ${extra} \
             "$@" ${FOLD_ARGS:-}
         frc=$?; after=$(_nf)

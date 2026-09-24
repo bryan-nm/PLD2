@@ -30,6 +30,13 @@
 # movement away from a model that is no longer the one being moved. ROUND picks the directory and
 # PROMPT_SEED picks the prompts, so neither is shared by accident.
 #
+# THE RETRY UNIT IS THE RANK, NOT THE JOB (scripts/fold_rank.sh). Each rank runs a supervisor shell
+# that relaunches its own fold process; mpiexec only ever watches that shell, so one rank's GPU
+# fault no longer SIGTERMs the other 191. The job-level loop below is a backstop. This is the fix
+# for the measured wall: a 24,000-generation fold pass reached 66% coverage in twenty job-level
+# attempts, every one ending in exit 143, while still making progress on each -- one fault used to
+# cost 192 ESMFold reloads, and now costs one.
+#
 # ESMFOLD CRASHES; THE FOLD PASSES ARE BUILT AROUND THAT, NOT IN SPITE OF IT. Folding on Aurora
 # aborts with "Segmentation fault from GPU ... NotPresent" at a rate that survived four hypotheses
 # and four refutations (see src/fold_fasta.py). So nothing here tries to prevent it. Every scored
@@ -73,7 +80,15 @@ PRUNE=${PRUNE:-1}             # delete generated PDBs once their TM rows are dur
 PROMPT_SEED=${PROMPT_SEED:-$ROUND}
 REF_SPLIT=${REF_SPLIT:-test}
 PHASES=${PHASES:-012345}
-FOLD_TRIES=${FOLD_TRIES:-20}
+# THE OUTER LOOP IS NOW A BACKSTOP, not the retry mechanism. scripts/fold_rank.sh retries inside
+# each rank, so a whole relaunch is only needed if mpiexec itself fails. RANK_* are exported so the
+# supervisor sees them; RANK_BUDGET is the per-rank wall clock, and wants to be comfortably under
+# this job's remaining walltime.
+FOLD_TRIES=${FOLD_TRIES:-5}
+export RANK_TRIES=${RANK_TRIES:-40}
+export RANK_BUDGET=${RANK_BUDGET:-7200}
+export RANK_MIN_RUN=${RANK_MIN_RUN:-30}
+export RANK_HARD=${RANK_HARD:-3}
 FOLD_STALL=${FOLD_STALL:-3}   # consecutive no-progress passes tolerated before escalating
 FOLD_BUDGET=${FOLD_BUDGET:-10800}
 
@@ -100,8 +115,8 @@ phase() { local n="$1" t0="$2"; PHASE_T[$n]=$(( SECONDS - t0 )); \
 # COUNT RECORDS, NOT FILES. An earlier version counted FASTA groups in the summary table, which is
 # constant from the moment the files exist -- so every attempt read as "no progress" and the loop
 # gave up after the first fault having folded hundreds of sequences.
-fold_loop() {                          # $1 = out jsonl, $2 = pdb dir, rest = FASTA paths
-    local out="$1" pdbd="$2"; shift 2
+fold_loop() {                 # $1 = out jsonl, $2 = pdb dir, $3 = extra flags, rest = FASTAs
+    local out="$1" pdbd="$2" extra="$3"; shift 3
     local t0=$SECONDS stalls=0 rpn=${RANKS_PER_NODE} attempt before after frc
     _nf() { cat "${out%.jsonl}"*.jsonl 2>/dev/null | wc -l | tr -d " "; }
     # BOTH LAYOUTS. --pdb-shard writes <pdb_dir>/rankNNN/index.jsonl; this counter only knew the
@@ -115,9 +130,14 @@ fold_loop() {                          # $1 = out jsonl, $2 = pdb dir, rest = FA
             echo "[align] fold budget (${FOLD_BUDGET}s) spent after ${attempt} attempt(s)"; break
         fi
         before=$(_nf)
+        # EACH RANK RUNS A SUPERVISOR, NOT PYTHON. mpiexec watches only its direct child, so
+        # making that child a shell means a GPU fault kills the python grandchild and its own rank
+        # relaunches it -- instead of mpiexec SIGTERMing the other 191 and this loop reloading
+        # ESMFold on all of them. See scripts/fold_rank.sh for the measurement that forced this.
         # shellcheck disable=SC2086
         mpiexec -n "$(( NNODES * rpn ))" -ppn "${rpn}" --pmi=pmix --cpu-bind depth -d 8 \
-            python -m src.fold_fasta --device xpu --out "${out}" --pdb-dir "${pdbd}" \
+            "${PBS_O_WORKDIR}/scripts/fold_rank.sh" \
+            python -m src.fold_fasta --device xpu --out "${out}" --pdb-dir "${pdbd}" ${extra} \
             "$@" ${FOLD_ARGS:-}
         frc=$?
         after=$(_nf)
@@ -162,7 +182,7 @@ if has 0; then
         --for-prompts "${N_PROMPTS}" --split "${REF_SPLIT}" --seed "${PROMPT_SEED}" || exit 1
 
     echo "[align] phase 0/5b: folding ${N_REFS} references -- these ARE the ground truth"
-    fold_loop "${REF_FOLDS}" "${REF_PDB_DIR}" "${RDIR}/refs.fasta"
+    fold_loop "${REF_FOLDS}" "${REF_PDB_DIR}" "" "${RDIR}/refs.fasta"
 
     echo "[align] phase 0/5c: foldseek 3Di off the reference structures"
     python -m src.reference_set join --dir "${RDIR}" || exit 1
