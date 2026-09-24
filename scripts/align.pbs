@@ -80,17 +80,25 @@ PRUNE=${PRUNE:-1}             # delete generated PDBs once their TM rows are dur
 PROMPT_SEED=${PROMPT_SEED:-$ROUND}
 REF_SPLIT=${REF_SPLIT:-test}
 PHASES=${PHASES:-012345}
-# THE OUTER LOOP IS NOW A BACKSTOP, not the retry mechanism. scripts/fold_rank.sh retries inside
-# each rank, so a whole relaunch is only needed if mpiexec itself fails. RANK_* are exported so the
-# supervisor sees them; RANK_BUDGET is the per-rank wall clock, and wants to be comfortably under
-# this job's remaining walltime.
-FOLD_TRIES=${FOLD_TRIES:-5}
-export RANK_TRIES=${RANK_TRIES:-40}
-export RANK_BUDGET=${RANK_BUDGET:-7200}
+# TWO LAYERS, EACH BOUNDED, AND THE ARITHMETIC HAS TO FIT THE WALLTIME. scripts/fold_rank.sh
+# retries a few times inside a rank for a transient fault; anything worse surrenders so mpiexec
+# tears the launch down, which is the only thing that returns every tile to a clean state, and the
+# outer loop restarts fresh. The first version of the supervisor retried 40 times over two hours
+# per rank instead, and a 6-hour job that should have taken 1.6 spent 5.25 hours in the fold phase
+# with 165 of 192 ranks already finished.
+#
+# FOLD_BUDGET is checked BETWEEN attempts, so one attempt can overshoot it by RANK_BUDGET:
+#     worst case per fold phase = FOLD_BUDGET + RANK_BUDGET = 5400 + 1800 = 2h
+# There are two fold phases, so budget ~4h of the walltime for folding and leave the rest for
+# generation (~0.6h at 1k prompts) and tuning (~0.2h). Raise FOLD_BUDGET only alongside walltime.
+FOLD_TRIES=${FOLD_TRIES:-12}
+export RANK_TRIES=${RANK_TRIES:-3}
+export RANK_BUDGET=${RANK_BUDGET:-1800}
+export RANK_ATTEMPT=${RANK_ATTEMPT:-1200}
 export RANK_MIN_RUN=${RANK_MIN_RUN:-30}
 export RANK_HARD=${RANK_HARD:-3}
 FOLD_STALL=${FOLD_STALL:-3}   # consecutive no-progress passes tolerated before escalating
-FOLD_BUDGET=${FOLD_BUDGET:-10800}
+FOLD_BUDGET=${FOLD_BUDGET:-5400}
 
 RDIR=$(python -c "from config import CFG; CFG.align.round=${ROUND}; print(CFG.align.round_dir)")
 PDB_DIR="${RDIR}/pdb"; REF_PDB_DIR="${RDIR}/refpdb"

@@ -351,6 +351,7 @@ src/
   align.py            # IPO (default) / DPO preference tuning, with the drift monitors
   align_compare.py    # several tuned policies on ONE held-out prompt set: paired, per-bin, LCR/k13
   tests_align.py      # prompt freezing, shared masks, the surrogate, IPO stops / DPO does not
+  tests_fold_rank.sh  # the fold supervisor: transient fault, hang, surrender, signal
 scripts/              # pbs_common.sh, train.pbs, fold.pbs, sweep.pbs, sample.pbs,
                       #   preprocess.pbs, conditional.pbs, align.pbs, align_test.pbs
                       #   fold_rank.sh -- per-rank ESMFold supervisor (see below)
@@ -583,7 +584,7 @@ so both exist and the docstrings say which is which. Both call sites split the *
 which cannot change mid-pass, and filter by the done set afterwards — partitioning a directory
 listing that `--prune` is actively shrinking would hand a late-starting rank different work.
 
-**The retry unit is the rank, not the job** (`scripts/fold_rank.sh`). ESMFold aborts often enough
+**The retry unit is the rank, not the job — but bounded** (`scripts/fold_rank.sh`). ESMFold aborts often enough
 that the pipeline is built around it, but the retry used to wrap the whole `mpiexec` — so one rank's
 fault SIGTERMed the other 191 and the job-level loop reloaded ESMFold on all of them. Measured: a
 24,000-generation fold pass reached **66% coverage in twenty attempts**, every one ending in exit
@@ -591,7 +592,13 @@ fault SIGTERMed the other 191 and the job-level loop reloaded ESMFold on all of 
 now a supervisor shell; the fault kills the python grandchild and its own rank relaunches it. One
 fault costs one model reload instead of 192. The loop is bounded — a failure faster than
 `RANK_MIN_RUN` cannot be a GPU fault (loading the backbone alone takes longer), so bad arguments
-abort immediately rather than spinning.
+abort immediately rather than spinning. **And it surrenders early.** The first version retried 40
+times over two hours per rank, and a 6-hour job that should have taken 1.6 spent 5.25 hours folding
+with 165 of 192 ranks already finished — the other 27 had aborted (SIGABRT), relaunched, and
+neither completed nor gave up. The job-level teardown is not merely a crude retry: it is the only
+thing that returns every tile to a clean state, so a rank that cannot recover locally has to let it
+happen. A few quick in-rank retries, then surrender to the outer loop. Every attempt also runs under
+a bash watchdog, because the first version bounded a child that *dies* and not one that *hangs*.
 
 **Cost, measured rather than assumed.** ~17,200 folds per 1,000 prompts at n_gen=16 (16,000
 generations + the reference set), ~25 node-hours, ~88% of it ESMFold. So 10× is ~1 h on 256 nodes
