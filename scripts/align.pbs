@@ -1,11 +1,11 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
 #PBS -N pld2_align
-#PBS -l walltime=01:00:00
+#PBS -l walltime=06:00:00
 #PBS -l select=16
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fs
-#PBS -q debug-scaling
+#PBS -q capacity
 #PBS -j oe
 
 # One round of preference tuning, end to end:
