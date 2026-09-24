@@ -574,6 +574,15 @@ margin rises, so the log line reports the winner's **absolute** log-likelihood, 
 reports the surrogate NLL on held-out **natural** sequences. That second number is decisive: if it
 rises, the policy has left the data manifold whatever the preference metrics say.
 
+**Work is split by a balanced stride, not by hashing** (`fold_fasta.partition`). Hashing ids into
+`world` buckets is a balls-in-bins draw and a phase ends when its *slowest* rank does — measured at
+192 ranks over 1,500 prompts, the busiest rank drew 16 against a mean of 7.8, so generation cost
+**2.0×** what it had to. `partition()` sorts by a stable hash and strides, giving every rank ±1 of
+the mean. `owns()` is still right where the list shrinks underneath the ranks (`fold_fasta --watch`),
+so both exist and the docstrings say which is which. Both call sites split the **prompt manifest**,
+which cannot change mid-pass, and filter by the done set afterwards — partitioning a directory
+listing that `--prune` is actively shrinking would hand a late-starting rank different work.
+
 **The retry unit is the rank, not the job** (`scripts/fold_rank.sh`). ESMFold aborts often enough
 that the pipeline is built around it, but the retry used to wrap the whole `mpiexec` — so one rank's
 fault SIGTERMed the other 191 and the job-level loop reloaded ESMFold on all of them. Measured: a

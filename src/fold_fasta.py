@@ -264,6 +264,30 @@ def owns(sid: str, rank: int, world: int) -> bool:
     return world <= 1 or zlib.crc32(sid.encode()) % world == rank
 
 
+def partition(items, rank: int, world: int):
+    """Balanced, deterministic split of a FIXED list: each rank gets floor or ceil of n/world.
+
+    THE COUNTERPART TO owns(), FOR THE CASE owns() IS WRONG FOR. Hashing an id into one of `world`
+    buckets is a balls-in-bins draw, so the busiest bucket holds about mean + 3*sqrt(mean) -- and
+    since a phase ends when its slowest rank ends, that IS the phase time. Measured on a
+    1,500-prompt generation pass at 192 ranks: rank 0 drew 16 prompts against a mean of 7.8, so the
+    phase cost twice what a balanced split would have.
+
+    owns() is still right where the list shrinks underneath the ranks (fold_fasta --watch): there a
+    positional stride maps to different items on every poll, which both duplicates work and leaves
+    items owned by nobody. Use this one only over an IMMUTABLE list -- a prompt manifest, not a
+    directory listing -- so every rank computes the identical order no matter when it starts.
+
+    Sorted by a stable hash rather than the caller's order, so ownership cannot correlate with
+    anything structured in the input (length, mask rate, build order). zlib.crc32 for the same
+    reason owns() uses it: Python randomises str hashing per process.
+    """
+    if world <= 1:
+        return list(items)
+    order = sorted(items, key=lambda s: (zlib.crc32(str(s).encode()), str(s)))
+    return order[rank::world]
+
+
 def collect(paths, out_path, lo, hi, limit=0, pdb_dir=None):
     """-> (todo, n_already, n_out_of_range, n_superseded) for the given FASTA paths.
 

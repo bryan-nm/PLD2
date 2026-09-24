@@ -30,6 +30,7 @@ opening it at once is a few tens of megabytes rather than a few hundred.
 """
 from __future__ import annotations
 import argparse
+import glob as glob_
 import json
 import os
 import sys
@@ -39,7 +40,7 @@ import torch
 
 from config import CFG, CKPT_DIR, FILIP_CACHE, FILIP_CKPT
 from .dist import init_distributed
-from .fold_fasta import owns
+from .fold_fasta import partition
 from .model import LoopedDiffusionLM
 from .objective import surrogate_logp, surrogate_mask
 from .prompts import _unhex, materialize, read_manifest
@@ -52,18 +53,24 @@ except Exception:
     ipex = None
 
 
-def done_pids(path):
-    """pids already generated in this rank's JSONL. Tolerates a truncated final line -- a GPU fault
-    aborts the process mid-write and leaves one."""
+def done_pids(rdir):
+    """pids already generated, across EVERY rank's JSONL. Tolerates a truncated final line -- a GPU
+    fault aborts the process mid-write and leaves one.
+
+    Every rank's file, not just this one, so that changing the rank count on a rerun costs nothing.
+    Ownership is a positional stride now (fold_fasta.partition), which redistributes when `world`
+    changes; reading the done set globally means a redistributed prompt is still recognised as
+    finished. The partition remains the sole authority on ASSIGNMENT, so this can only cause a rank
+    to skip work that is genuinely complete -- never to miss work.
+    """
     out = set()
-    if not os.path.exists(path):
-        return out
-    with open(path) as fh:
-        for line in fh:
-            try:
-                out.add(json.loads(line)["pid"])
-            except Exception:
-                continue
+    for path in sorted(glob_.glob(os.path.join(rdir, "gen.rank*.jsonl"))):
+        with open(path) as fh:
+            for line in fh:
+                try:
+                    out.add(json.loads(line)["pid"])
+                except Exception:
+                    continue
     return out
 
 
@@ -113,16 +120,23 @@ def main():
     manifest = a.manifest or os.path.join(rdir, "prompts.jsonl")
 
     rows = read_manifest(manifest)
-    mine = [r for r in rows if owns(r["pid"], rank, world)]
+    # PARTITION THE MANIFEST, WHICH IS IMMUTABLE, then filter by what is already done -- never the
+    # other way round. Partitioning the REMAINING work would make ownership depend on a set that
+    # changes while ranks are starting, and two ranks a few seconds apart would split different
+    # lists: some prompts done twice, some by nobody.
+    by_pid = {r["pid"]: r for r in rows}
     out_jsonl = os.path.join(rdir, f"gen.rank{rank:03d}.jsonl")
-    already = done_pids(out_jsonl)
-    todo = [r for r in mine if r["pid"] not in already]
+    already = done_pids(rdir)
+    mine = partition(list(by_pid), rank, world)
+    todo = [by_pid[p] for p in mine if p not in already]
     if a.limit:
         todo = todo[:a.limit]
     if rank == 0:
-        print(f"[gen] {len(rows):,} prompts, {len(mine):,} on rank 0, {len(already):,} already "
-              f"done, {len(todo):,} to do | n_gen={a.n_gen} steps={a.steps} T={a.temperature}",
-              flush=True)
+        bal = (f" (balanced: {len(rows) // world} or {len(rows) // world + 1} each)"
+               if world > 1 else "")
+        print(f"[gen] {len(rows):,} prompts, {len(mine):,} on rank 0{bal}, "
+              f"{len(already):,} already done, {len(todo):,} to do | n_gen={a.n_gen} "
+              f"steps={a.steps} T={a.temperature}", flush=True)
     if not todo:
         print(f"[gen] rank {rank}: nothing to do", flush=True)
         return

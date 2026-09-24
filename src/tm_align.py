@@ -43,7 +43,7 @@ import time
 
 from config import CFG
 from .dist import init_distributed
-from .fold_fasta import load_pdb_index, owns
+from .fold_fasta import load_pdb_index, partition
 from .prompts import read_manifest
 from .self_consistency import record_key
 
@@ -211,7 +211,11 @@ def main():
         by_pid.setdefault(pid_of(gid), {})[gid] = p
     # A prompt whose reference has no structure has nothing to score against; report it rather than
     # dropping it silently, because it means the reference fold pass is incomplete.
-    mine = sorted(pid for pid in by_pid if owns(pid, rank, world))
+    # PARTITION THE MANIFEST, NOT THE DIRECTORY LISTING. by_pid is built from the PDB index, which
+    # --prune actively shrinks WHILE this pass runs: a rank that started late would see fewer
+    # structures, split a different list, and silently leave prompts unscored. The manifest cannot
+    # change under us, so every rank computes the identical partition whenever it starts.
+    mine = [p for p in partition(sorted(ref_of), rank, world) if p in by_pid]
     missing = [pid for pid in mine if ref_of.get(pid) not in ref]
     mine = [pid for pid in mine if ref_of.get(pid) in ref]
 
@@ -226,8 +230,8 @@ def main():
     todo = [p for p in mine if p not in done]
     if rank == 0:
         print(f"[tm] {len(gen):,} generated structures in {pdb_dir}, {len(ref):,} references in "
-              f"{ref_dir}\n[tm] rank 0 owns {len(mine):,} prompts, {len(done):,} done, "
-              f"{len(todo):,} to do"
+              f"{ref_dir}\n[tm] rank 0 owns {len(mine):,} of {len(ref_of):,} prompts (balanced), "
+              f"{len(done):,} done, {len(todo):,} to do"
               + (f" | {len(missing)} prompt(s) have no folded reference yet" if missing else ""),
               flush=True)
     if not todo:

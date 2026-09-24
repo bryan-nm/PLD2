@@ -590,6 +590,41 @@ check("one starved prompt does not collapse pass@k to k=1", max(_ks) > 1, f"max 
 check("the table reports how many prompts support each row", "prompts" in _out)
 check("...and says the coverage shortfall out loud", "folding coverage" in _out)
 
+
+# ------------------------------------------------- 15. balanced work assignment
+# Hashing ids into `world` buckets is a balls-in-bins draw, and a phase ends when its SLOWEST rank
+# does. Measured on a 1,500-prompt generation pass at 192 ranks: rank 0 drew 16 against a mean of
+# 7.8, so the phase cost twice what it had to. owns() is still right where the list shrinks
+# underneath the ranks (--watch); partition() is for an immutable one.
+from src.fold_fasta import owns as _owns, partition as _part                      # noqa: E402
+
+_ids = [f"p{i:07d}" for i in range(1500)]
+_W = 192
+_parts = [_part(_ids, r, _W) for r in range(_W)]
+_flat = [x for pp in _parts for x in pp]
+check("partition is disjoint and complete", len(_flat) == len(set(_flat)) == len(_ids))
+check("partition is deterministic", all(_part(_ids, r, _W) == _parts[r] for r in (0, 7, 191)))
+_sz = [len(pp) for pp in _parts]
+check("partition is balanced to +-1", max(_sz) - min(_sz) <= 1, f"{min(_sz)}-{max(_sz)}")
+_hz = [sum(_owns(i, r, _W) for i in _ids) for r in range(_W)]
+check("...where hashing was not", max(_hz) >= 2 * max(_sz), f"hash max {max(_hz)} vs {max(_sz)}")
+check("world<=1 keeps everything", _part(_ids, 0, 1) == _ids and len(_part(_ids, 0, 0)) == len(_ids))
+check("partition ignores the caller's order",
+      _part(_ids, 3, _W) == _part(list(reversed(_ids)), 3, _W))
+
+# The hazard both call sites are shaped around: partitioning a list that CHANGES gives a late rank
+# different work. align_sample splits the prompt manifest and tm_align splits the same manifest --
+# never a directory listing, which --prune shrinks while the pass is running.
+check("partitioning a mutable list really does break",
+      set(_part(_ids[:1200], 7, _W)) != set(_parts[7]))
+
+# resume at a different rank count: with a globally-read done set, nothing is redone or missed
+_done = set(_parts[3] + _parts[9])
+_todo = [p for r in range(96) for p in _part(_ids, r, 96) if p not in _done]
+check("a resume at a new world size loses nothing",
+      len(set(_todo)) == len(_todo) == len(_ids) - len(_done),
+      f"{len(_todo)} todo, {len(_done)} done")
+
 print(f"\n{checks - len(fails)}/{checks} checks pass")
 if fails:
     print("FAILURES:")
