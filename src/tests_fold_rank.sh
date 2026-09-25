@@ -55,6 +55,38 @@ ok "signal leaves no orphan" "$left" 0
 kill -0 $sup 2>/dev/null && { fail=$((fail+1)); echo "  FAIL supervisor survived its TERM"; } \
                          || pass=$((pass+1))
 
+# --- progress-based stall detection ------------------------------------------------------------
+# The distinction that matters at scale: a rank running for a long time WHILE WRITING is fine; one
+# that stops writing is stuck. The wall-clock watchdog could not tell them apart, and at 10x
+# prompts would have killed every working rank at 48% done.
+cat > "$T/worker" <<'X'
+#!/bin/bash
+# appends a record every 2s for $2 rounds, like fold_fasta fsyncing one per sequence
+for i in $(seq 1 "$2"); do echo "record $i" >> "$1"; sleep 2; done
+X
+cat > "$T/staller" <<'X'
+#!/bin/bash
+echo "record 1" >> "$1"          # one record, then wedge -- the observed failure mode
+exec -a PLD2_TEST_HANG sleep 400
+X
+chmod +x "$T/worker" "$T/staller"
+
+# a rank that keeps writing is NOT killed, even well past any fixed timeout
+t0=$SECONDS
+PALS_RANKID=7 RANK_PROGRESS="$T/prog.rank%r.jsonl" RANK_STALL=10 RANK_TRIES=1     bash $S "$T/worker" "$T/prog.rank007.jsonl" 10 >/dev/null 2>&1
+rc=$?; el=$(( SECONDS - t0 ))
+ok "a working rank survives past the stall window" $rc 0
+[ "$el" -ge 18 ] && pass=$((pass+1)) || { fail=$((fail+1)); echo "  FAIL worker only ran ${el}s"; }
+
+# a rank that stops writing IS killed, and reports 125 internally -> surrender
+t0=$SECONDS
+PALS_RANKID=8 RANK_PROGRESS="$T/prog.rank%r.jsonl" RANK_STALL=10 RANK_TRIES=1 RANK_BUDGET=300     bash $S "$T/staller" "$T/prog.rank008.jsonl" >/dev/null 2>&1
+rc=$?; el=$(( SECONDS - t0 ))
+ok "a stalled rank is killed" $rc 1
+[ "$el" -lt 60 ] && pass=$((pass+1)) || { fail=$((fail+1)); echo "  FAIL stall test took ${el}s"; }
+left=$(pgrep -f PLD2_TEST_HANG 2>/dev/null | wc -l | tr -d ' ')
+ok "the stalled child is gone" "$left" 0
+
 # usage
 bash $S >/dev/null 2>&1; ok "no args is a usage error" $? 2
 

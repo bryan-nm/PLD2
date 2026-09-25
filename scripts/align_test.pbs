@@ -65,8 +65,12 @@ EVAL_SEED=${EVAL_SEED:-9001}
 # this job's remaining walltime.
 FOLD_TRIES=${FOLD_TRIES:-12}
 export RANK_TRIES=${RANK_TRIES:-3}
-export RANK_BUDGET=${RANK_BUDGET:-1800}
-export RANK_ATTEMPT=${RANK_ATTEMPT:-1200}
+# RANK_BUDGET has to exceed the work a rank is actually given, or it kills ranks that are fine:
+# at 10x prompts a rank holds ~833 structures, ~2500s of legitimate folding. Stall detection is
+# what catches a hang now, so this is only a ceiling -- size it from the workload, not from habit.
+export RANK_BUDGET=${RANK_BUDGET:-5400}
+export RANK_STALL=${RANK_STALL:-900}
+export RANK_ATTEMPT=${RANK_ATTEMPT:-0}
 export RANK_MIN_RUN=${RANK_MIN_RUN:-30}
 export RANK_HARD=${RANK_HARD:-3}
 FOLD_STALL=${FOLD_STALL:-3}
@@ -121,6 +125,10 @@ fold_loop() {                            # $1 = out jsonl, $2 = pdb dir, $3 = ex
     for attempt in $(seq 1 "${FOLD_TRIES}"); do
         [ $(( SECONDS - t0 )) -ge "${FOLD_BUDGET}" ] && { echo "[test] fold budget spent"; break; }
         before=$(_nf)
+        # Tell the supervisor which file THIS rank appends to, so it can tell "hung" from
+        # "still working" by whether records are landing rather than by elapsed time -- the
+        # distinction that a ten-fold larger per-rank workload turns from cosmetic into decisive.
+        export RANK_PROGRESS="${out%.jsonl}.rank%r.jsonl"
         # EACH RANK RUNS A SUPERVISOR, NOT PYTHON. mpiexec watches only its direct child, so
         # making that child a shell means a GPU fault kills the python grandchild and its own rank
         # relaunches it -- instead of mpiexec SIGTERMing the other 191 and this loop reloading

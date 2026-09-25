@@ -598,7 +598,19 @@ with 165 of 192 ranks already finished — the other 27 had aborted (SIGABRT), r
 neither completed nor gave up. The job-level teardown is not merely a crude retry: it is the only
 thing that returns every tile to a clean state, so a rank that cannot recover locally has to let it
 happen. A few quick in-rank retries, then surrender to the outer loop. Every attempt also runs under
-a bash watchdog, because the first version bounded a child that *dies* and not one that *hangs*.
+a bash watchdog **on progress, not elapsed time** — a rank that keeps appending records is working
+however long it takes, and one that stops is stuck. The first watchdog used a fixed 1200s cap, which
+is fine when a rank holds ~80 structures and catastrophic when it holds 833: at 10x prompts it would
+have killed every *working* rank at 48% done.
+
+**Disk.** Generated PDBs are ~98% of what a round writes and nothing reads them twice — a generated
+structure becomes one TM float and is finished — so `tm_align --prune` deletes each chunk once its
+rows are fsynced (on by default in `align.pbs`; reference PDBs are never touched, they are the
+targets). What remains is dominated by the tuned-policy checkpoints: **weights only, newest plus
+best**, since a preference-tuning run takes eleven minutes and restarts from its base checkpoint
+rather than resuming. `best.pt` is the drift-minimal policy, written the moment the minimum moves —
+the rolling rotation used to delete the very checkpoint the run then recommended. A 1k round lands
+around 11GB, most of it those two files.
 
 **Cost, measured rather than assumed.** ~17,200 folds per 1,000 prompts at n_gen=16 (16,000
 generations + the reference set), ~25 node-hours, ~88% of it ESMFold. So 10× is ~1 h on 256 nodes

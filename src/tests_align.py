@@ -20,6 +20,7 @@ Six things, each of which has a specific way of being silently wrong:
   6. PAIRING. Winners beat losers on the reward; matched pairs are matched on pLDDT and split on TM;
      pass_at_k and selector_at_k agree with brute force.
 """
+import glob as _glob
 import itertools
 import math
 import random
@@ -612,6 +613,25 @@ check("world<=1 keeps everything", _part(_ids, 0, 1) == _ids and len(_part(_ids,
 check("partition ignores the caller's order",
       _part(_ids, 3, _W) == _part(list(reversed(_ids)), 3, _W))
 
+# fold_fasta hands it (id, sequence) pairs. It has to key on the ID: keying on the whole tuple
+# would make the split depend on sequence text, so a rerun after regeneration -- which reuses ids
+# for new content -- would reshuffle ownership for no reason.
+_pairs = [(f"gen|p{i:05d}", "ACDE" * 10) for i in range(1000)]
+_same = [(f"gen|p{i:05d}", "WWWW" * 10) for i in range(1000)]
+_pp = [_part(_pairs, r, 12) for r in range(12)]
+_pflat = [x for q in _pp for x in q]
+check("partition handles (id, seq) pairs",
+      len(_pflat) == len(set(_pflat)) == 1000 and max(map(len, _pp)) - min(map(len, _pp)) <= 1)
+check("...keyed on the id, not the sequence",
+      [x[0] for x in _part(_pairs, 3, 12)] == [x[0] for x in _part(_same, 3, 12)])
+
+# and the fold phase's own imbalance, which is milder than the prompt phase's but not nothing
+_seq = [f"gen|p{i // 16:07d}_{i % 16}" for i in range(16000)]
+_fh = max(sum(_owns(i, r, 192) for i in _seq) for r in range(192))
+_fp = max(len(_part(_seq, r, 192)) for r in range(192))
+check("balancing the fold split is worth >15%", (_fh - _fp) / _fh > 0.15,
+      f"hash max {_fh} vs stride max {_fp}")
+
 # The hazard both call sites are shaped around: partitioning a list that CHANGES gives a late rank
 # different work. align_sample splits the prompt manifest and tm_align splits the same manifest --
 # never a directory listing, which --prune shrinks while the pass is running.
@@ -624,6 +644,59 @@ _todo = [p for r in range(96) for p in _part(_ids, r, 96) if p not in _done]
 check("a resume at a new world size loses nothing",
       len(set(_todo)) == len(_todo) == len(_ids) - len(_done),
       f"{len(_todo)} todo, {len(_done)} done")
+
+
+# ------------------------------------------------- 16. checkpoint retention
+# A round left 31GB on disk after pruning every generated PDB: three align checkpoints at 10.8GB
+# each (5.4GB weights + 5.4GB RMSProp state). Worse, the rolling keep_last=3 had already deleted
+# the checkpoint the run then RECOMMENDED -- "ckpt_00000100.pt is the drift-minimal checkpoint",
+# printed about a file removed several saves earlier.
+import shutil as _sh                                                              # noqa: E402
+
+from src.align import _keep_best                                                  # noqa: E402
+from src.train import save_checkpoint as _save                                     # noqa: E402
+
+
+class _Env:
+    is_main = True
+
+
+_ck = _tf.mkdtemp(prefix="pld2ck_")
+_m = LoopedDiffusionLM(Config(vocab_size=23, eos_token_id=20, pad_token_id=21, mask_token_id=22,
+                              d_model=32, n_heads=2, d_ff=64, n_upstream=1, n_middle=1,
+                              n_downstream=1, n_recurrence=1, grad_checkpoint=False))
+_o = torch.optim.RMSprop(_m.parameters(), lr=1e-5)
+# RMSProp allocates square_avg only for parameters that carry a gradient, so a bare step() leaves
+# the state empty and the two files come out the same size -- the test would pass for the wrong
+# reason on a real model and fail here. Run a real backward first.
+_m(torch.randint(0, 20, (2, 16))).sum().backward()
+_o.step()
+_ls = torch.optim.lr_scheduler.LambdaLR(_o, lambda s: 1.0)
+
+_save(_m, _o, _ls, 1, _ck, _Env, keep_last=1, save_optimizer=True)
+_with = _os.path.getsize(_os.path.join(_ck, "ckpt_00000001.pt"))
+_save(_m, _o, _ls, 2, _ck, _Env, keep_last=1, save_optimizer=False)
+_without = _os.path.getsize(_os.path.join(_ck, "ckpt_00000002.pt"))
+check("dropping optimizer state shrinks the checkpoint", _without < _with * 0.7,
+      f"{_without} vs {_with} bytes")
+check("...and the weights are still there",
+      set(torch.load(_os.path.join(_ck, "ckpt_00000002.pt"), map_location="cpu",
+                     weights_only=False)) == {"model", "sched", "step"})
+check("keep_last=1 leaves exactly one rolling checkpoint",
+      len(_glob.glob(_os.path.join(_ck, "ckpt_*.pt"))) == 1)
+
+# best.pt must survive that rotation -- it is the whole point
+_keep_best(_m, _ls, 2, 2.36, _ck, _Env)
+for _st in (3, 4, 5):
+    _save(_m, _o, _ls, _st, _ck, _Env, keep_last=1, save_optimizer=False)
+check("best.pt survives the rolling rotation", _os.path.exists(_os.path.join(_ck, "best.pt")))
+_bj = _json.load(open(_os.path.join(_ck, "best.json")))
+check("best.json records which step and why",
+      _bj["step"] == 2 and abs(_bj["natural_nll"] - 2.36) < 1e-9 and "why" in _bj)
+check("best.pt carries weights, not optimizer state",
+      "opt" not in torch.load(_os.path.join(_ck, "best.pt"), map_location="cpu",
+                              weights_only=False))
+_sh.rmtree(_ck, ignore_errors=True)
 
 print(f"\n{checks - len(fails)}/{checks} checks pass")
 if fails:

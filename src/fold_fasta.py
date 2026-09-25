@@ -264,6 +264,11 @@ def owns(sid: str, rank: int, world: int) -> bool:
     return world <= 1 or zlib.crc32(sid.encode()) % world == rank
 
 
+def _pkey(x):
+    """Sort key for partition(): the id when handed (id, sequence) pairs, else the item itself."""
+    return str(x[0]) if isinstance(x, (tuple, list)) and x else str(x)
+
+
 def partition(items, rank: int, world: int):
     """Balanced, deterministic split of a FIXED list: each rank gets floor or ceil of n/world.
 
@@ -284,7 +289,7 @@ def partition(items, rank: int, world: int):
     """
     if world <= 1:
         return list(items)
-    order = sorted(items, key=lambda s: (zlib.crc32(str(s).encode()), str(s)))
+    order = sorted(items, key=lambda x: (zlib.crc32(_pkey(x).encode()), _pkey(x)))
     return order[rank::world]
 
 
@@ -638,7 +643,16 @@ def main():
     paths = current_paths()
     todo_all, n_done, n_skip, n_super = collect(paths, args.out, lo, hi, args.limit,
                                                 pdb_dir=args.pdb_dir)
-    todo = [x for x in todo_all if owns(x[0], rank, world)]      # no coordination needed
+    # BALANCED WHEN THE LIST IS FIXED, HASHED WHEN IT IS NOT. Without --watch this is a one-shot
+    # pass over a list that cannot change, so a stride splits it evenly and the phase ends when the
+    # mean rank ends rather than the unluckiest: measured, hashing leaves the busiest rank 30% over
+    # the mean at 16k sequences on 192 ranks and 17% at 160k on 768. In --watch mode the list
+    # shrinks between polls and only owns() is safe -- see the note on both functions.
+    #
+    # Safe to switch between runs because done_pairs() reads EVERY rank's results, not just this
+    # rank's: a sequence reassigned by a change of rank count is still recognised as scored.
+    todo = ([x for x in todo_all if owns(x[0], rank, world)] if args.watch
+            else partition(todo_all, rank, world))
     if rank == 0:
         print(f"[fold] {len(paths)} file(s) | {n_done} already scored | {len(todo_all)} to do "
               f"| {n_skip} outside [{lo},{hi}] | watch={args.watch} | {world} rank(s)", flush=True)

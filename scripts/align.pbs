@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
 #PBS -N pld2_align
-#PBS -l walltime=06:00:00
+#PBS -l walltime=03:00:00
 #PBS -l select=16
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fs
@@ -47,18 +47,30 @@
 # one rank per node, the configuration with direct evidence behind it -- 12 ranks with a process
 # group died 3 for 3, 1 rank with none folded 100 sequences cleanly.
 #
-# SCALING TO HUNDREDS OF NODES. Nothing here is O(world). Prompts are partitioned by a stable crc32
-# of the pid rather than a stride over a list, every phase writes per-rank files and never shares
-# one, no phase but the tuner creates a process group, and per-rank work is constant as nodes are
-# added. To run it large: raise N_PROMPTS with select= in proportion (a node does ~60 prompts/hour
-# end to end at n_gen=16) and leave everything else alone.
+# SCALING TO HUNDREDS OF NODES. Nothing here is O(world). Every phase writes per-rank files and
+# never shares one, no phase but the tuner creates a process group, work is split by a balanced
+# stride over an immutable list (fold_fasta.partition) so the slowest rank is within one item of
+# the mean, and the tuner sizes itself from the pair count rather than the allocation. Measured end
+# to end at 1k prompts on 16 nodes: ~40 prompts per node-hour at n_gen=16, ~1550 structures per
+# node-hour for the fold phases. To run it large, raise N_PROMPTS and select= together -- 10k
+# prompts is ~3.5h on 64 nodes, ~12h on 16 -- and leave the rest alone.
 #
-# Two things do NOT scale as written, both fine at 1k prompts and both needing attention past ~10k:
-#   * the PDB directory -- 1k x 16 is ~17k small files in one Lustre directory, 100k would be 1.6M.
-#     Shard PDB_DIR by a prefix of the pid.
-#   * the prompt manifest -- ~1KB a row, read whole by every rank (1MB at 1k, 100MB at 100k).
-# The single-process phases (reference selection, prompts, pair construction) are seconds at 1k and
-# minutes at 100k, which is not yet the problem.
+# WHAT USED TO BE HERE AND IS NOW FIXED, kept because each was found the expensive way:
+#   * ownership by crc32 hash. A balls-in-bins draw, and a phase ends when its SLOWEST rank does:
+#     the busiest held 2.05x the mean at 1.5k prompts on 192 ranks. Now a stride. owns() survives
+#     only for fold_fasta --watch, where the list shrinks between polls.
+#   * the PDB directory. ~17k files at 1k prompts, 1.6M at 100k. --pdb-shard gives each rank its
+#     own subdirectory, which scales itself: 3,072 ranks is ~170 files each.
+#   * a fixed watchdog on the fold supervisor. 1200s is right at ~80 structures a rank and kills
+#     every WORKING rank at 10x, where a rank holds 833. It now watches for a stalled output file.
+#
+# WHAT STILL DOES NOT SCALE, all fine at 10k and wanting attention past ~50k:
+#   * the prompt manifest -- ~1KB a row, read whole by every rank (10MB at 10k, 100MB at 100k).
+#   * the single-process phases (reference selection, prompts, pair construction) -- seconds at 1k,
+#     minutes at 100k.
+#   * startup. Every rank loads the 5.4GB checkpoint independently: ~560s at 192 ranks, and 768
+#     ranks is 4x the concurrent reads of one file. UNMEASURED above 192 -- if 1-generate comes in
+#     far over estimate, this is where it went, and staging to node-local storage is the answer.
 cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./scripts/pbs_common.sh
 
@@ -93,8 +105,12 @@ PHASES=${PHASES:-012345}
 # generation (~0.6h at 1k prompts) and tuning (~0.2h). Raise FOLD_BUDGET only alongside walltime.
 FOLD_TRIES=${FOLD_TRIES:-12}
 export RANK_TRIES=${RANK_TRIES:-3}
-export RANK_BUDGET=${RANK_BUDGET:-1800}
-export RANK_ATTEMPT=${RANK_ATTEMPT:-1200}
+# RANK_BUDGET has to exceed the work a rank is actually given, or it kills ranks that are fine:
+# at 10x prompts a rank holds ~833 structures, ~2500s of legitimate folding. Stall detection is
+# what catches a hang now, so this is only a ceiling -- size it from the workload, not from habit.
+export RANK_BUDGET=${RANK_BUDGET:-5400}
+export RANK_STALL=${RANK_STALL:-900}
+export RANK_ATTEMPT=${RANK_ATTEMPT:-0}
 export RANK_MIN_RUN=${RANK_MIN_RUN:-30}
 export RANK_HARD=${RANK_HARD:-3}
 FOLD_STALL=${FOLD_STALL:-3}   # consecutive no-progress passes tolerated before escalating
@@ -138,6 +154,10 @@ fold_loop() {                 # $1 = out jsonl, $2 = pdb dir, $3 = extra flags, 
             echo "[align] fold budget (${FOLD_BUDGET}s) spent after ${attempt} attempt(s)"; break
         fi
         before=$(_nf)
+        # Tell the supervisor which file THIS rank appends to, so it can tell "hung" from
+        # "still working" by whether records are landing rather than by elapsed time -- the
+        # distinction that a ten-fold larger per-rank workload turns from cosmetic into decisive.
+        export RANK_PROGRESS="${out%.jsonl}.rank%r.jsonl"
         # EACH RANK RUNS A SUPERVISOR, NOT PYTHON. mpiexec watches only its direct child, so
         # making that child a shell means a GPU fault kills the python grandchild and its own rank
         # relaunches it -- instead of mpiexec SIGTERMing the other 191 and this loop reloading
@@ -221,16 +241,23 @@ if has 2; then
         echo "[align] no gen.rank*.fasta in ${RDIR} -- generation wrote nothing." >&2; exit 1
     fi
     t0=$SECONDS
-    echo "[align] phase 2/5: folding ${#GEN_FASTA[@]} generation FASTA(s)"
+    FOLD_BEFORE=$(cat "${FOLDS%.jsonl}"*.jsonl 2>/dev/null | wc -l | tr -d " ")
+    echo "[align] phase 2/5: folding ${#GEN_FASTA[@]} generation FASTA(s)"\
+         "(${FOLD_BEFORE} already on disk)"
     # --pdb-shard here and NOT on the reference pass: this directory is the one that reaches ~500k
     # files at 30x, while the reference directory is read whole by foldseek and must stay flat.
     fold_loop "${FOLDS}" "${PDB_DIR}" "--pdb-shard" "${GEN_FASTA[@]}"
     phase "2-fold" $t0
     N_FOLDED=$(cat "${FOLDS%.jsonl}"*.jsonl 2>/dev/null | wc -l | tr -d " ")
-    if [ "${PHASE_T[2-fold]:-0}" -gt 0 ]; then
-        echo "[align] FOLD RATE: ${N_FOLDED} structures in ${PHASE_T[2-fold]}s on ${NNODES} nodes"\
-             "= $(python -c "print(f'{${N_FOLDED}*3600/${PHASE_T[2-fold]}/${NNODES}:.0f}')")"\
-             "structures/node-hour. Scale everything from this, not from an estimate."
+    # NEW records, not total. On a resume the total is mostly work a previous job paid for, and
+    # dividing it by this phase's wall clock reported 1389 structures/node-hour for a phase that
+    # actually folded 1044 -- a 15x overstatement, in the one number the scale-up is sized from.
+    N_NEW=$(( N_FOLDED - FOLD_BEFORE ))
+    if [ "${PHASE_T[2-fold]:-0}" -gt 0 ] && [ "${N_NEW}" -gt 0 ]; then
+        echo "[align] FOLD RATE: ${N_NEW} NEW structures in ${PHASE_T[2-fold]}s on ${NNODES} nodes"\
+             "= $(python -c "print(f'{${N_NEW}*3600/${PHASE_T[2-fold]}/${NNODES}:.0f}')")"\
+             "structures/node-hour (${N_FOLDED} on disk in total, ${FOLD_BEFORE} before this"\
+             "phase). Scale from the NEW figure, and only when it started near zero."
     fi
     echo "[align] fold summary:"
     python -m src.fold_fasta --summarize --out "${FOLDS}" || true

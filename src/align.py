@@ -125,6 +125,25 @@ class PairSet:
         return r, yw, yl, gen
 
 
+def _keep_best(model, lr_sched, step, nat, out_dir, env):
+    """Copy the current weights to policy/best.pt, with a one-line pointer beside it.
+
+    A separate name so the ckpt_*.pt rotation cannot reach it. Weights only -- the same reasoning
+    as the rolling saves, and nothing resumes from this file; it is a candidate to EVALUATE.
+    """
+    if not env.is_main:
+        return
+    from .train import _atomic_save
+    os.makedirs(out_dir, exist_ok=True)
+    _atomic_save({"model": model.state_dict(), "sched": lr_sched.state_dict(), "step": step},
+                 os.path.join(out_dir, "best.pt"))
+    _atomic_json(os.path.join(out_dir, "best.json"),
+                 {"step": step, "natural_nll": nat,
+                  "why": "lowest held-out natural NLL; the drift monitor has no sampling noise, "
+                         "so this is the least-drifted policy of the run. A candidate to "
+                         "evaluate, not a verdict."})
+
+
 def _atomic_json(path, obj):
     tmp = path + ".tmp"
     with open(tmp, "w") as fh:
@@ -466,11 +485,20 @@ def main():
             if env.is_main:
                 nat.append((step, nn_))
                 best = min((v for _, v in nat if v == v), default=float("nan"))
+                # KEEP THE DRIFT-MINIMAL CHECKPOINT, because the rolling rotation deletes it.
+                # A 500-step run saves ten times and keep_last discards all but the newest few, so
+                # the end-of-run message named ckpt_00000100.pt as the one to evaluate after
+                # already removing it. best.pt is written the moment the minimum moves.
+                if nn_ == nn_ and nn_ <= best:
+                    _keep_best(model, lr_sched, step, nn_, out_dir, env)
                 print(f"[align] step {step}: natural NLL {nn_:.4f} nats/position "
                       f"({nn_ - nat[0][1]:+.4f} vs baseline, best {best:.4f}) -- rising means the "
                       f"policy is leaving the manifold, whatever h is doing" if nn_ == nn_ else
                       f"[align] step {step}: natural NLL UNAVAILABLE", flush=True)
-            save_checkpoint(model, opt, lr_sched, step, out_dir, env)
+            # keep_last=1 and no optimizer state: these runs are minutes long and restart from
+            # the base checkpoint, so the only files worth their 5.4GB are the newest and the best.
+            save_checkpoint(model, opt, lr_sched, step, out_dir, env,
+                            keep_last=1, save_optimizer=False)
 
     if env.is_main:
         nn_ = natural_nll(model, shards, mcfg, dcfg.canvas, acfg.drift_natural_n, dev)
@@ -486,10 +514,10 @@ def main():
             print(f"[align] drift monitor: baseline {nat[0][1]:.4f} -> min {best:.4f} at step "
                   f"{best_step} -> final {nn_:.4f} ({nn_ - nat[0][1]:+.4f})", flush=True)
             if best_step not in (a.steps, a.steps - 1) and best_step > 0:
-                print(f"[align] the minimum is not the last step. ckpt_{best_step:08d}.pt is the "
-                      f"drift-minimal checkpoint; it has no sampling noise in it, but it is a "
-                      f"candidate, not a verdict -- some departure from the natural manifold is "
-                      f"the point. The fold numbers settle it.", flush=True)
+                print(f"[align] the minimum is not the last step: it is at {best_step}, saved as "
+                      f"{os.path.join(out_dir, 'best.pt')}. The drift monitor has no sampling "
+                      f"noise, so that is the least-drifted policy of the run -- a candidate to "
+                      f"evaluate, not a verdict. The fold numbers settle it.", flush=True)
         # One machine-readable record per policy, so src/align_compare.py can put the tuning
         # metrics next to the generation metrics without anyone re-reading a log.
         _atomic_json(os.path.join(out_dir, "metrics.json"), {
@@ -516,8 +544,13 @@ def main():
         barrier()
         cleanup()
         return
-    save_checkpoint(model, opt, lr_sched, a.steps - 1, out_dir, env)
+    save_checkpoint(model, opt, lr_sched, a.steps - 1, out_dir, env,
+                    keep_last=1, save_optimizer=False)
     if env.is_main:
+        import glob as _g
+        gb = sum(os.path.getsize(f) for f in _g.glob(os.path.join(out_dir, "*.pt"))) / 1e9
+        print(f"[align] {out_dir} holds {gb:.1f}GB of checkpoints (weights only, newest + best).",
+              flush=True)
         print(f"[align] done. Tuned policy in {out_dir}. Evaluate it the way the base model was "
               f"evaluated -- and generate the NEXT round's pairs from it, on a fresh prompt set: "
               f"pairs drawn from a policy that no longer exists are not merely stale, they are "

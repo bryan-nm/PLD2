@@ -120,13 +120,22 @@ def _atomic_save(obj, path):
     os.replace(tmp, path)
 
 
-def save_checkpoint(model, opt, lr_sched, step, ckpt_dir, env, keep_last=3):
+def save_checkpoint(model, opt, lr_sched, step, ckpt_dir, env, keep_last=3,
+                    save_optimizer=True):
+    """save_optimizer=False writes the weights alone, halving the file.
+
+    Optimizer state exists to resume a run mid-flight, which is worth 5.4GB for a training job that
+    takes days and nothing at all for a preference-tuning run that takes eleven minutes and would
+    be restarted from its base checkpoint anyway. src/align.py turns it off; src/train.py does not.
+    """
     if not env.is_main:
         return
     os.makedirs(ckpt_dir, exist_ok=True)
     path = os.path.join(ckpt_dir, f"ckpt_{step:08d}.pt")
-    _atomic_save({"model": model.state_dict(), "opt": opt.state_dict(),
-                  "sched": lr_sched.state_dict(), "step": step}, path)
+    blob = {"model": model.state_dict(), "sched": lr_sched.state_dict(), "step": step}
+    if save_optimizer:
+        blob["opt"] = opt.state_dict()
+    _atomic_save(blob, path)
     tmp = os.path.join(ckpt_dir, "latest.txt.tmp")   # update the pointer only after a full write
     with open(tmp, "w") as f:
         f.write(os.path.basename(path))
