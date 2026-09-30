@@ -39,7 +39,7 @@ import random
 import subprocess
 import sys
 
-from config import CFG, AFDB_SHARDS, SAMPLES_DIR
+from config import AFDB_SHARDS, CFG, FOLDSEEK, SAMPLES_DIR
 from .data import DI, ProteinShards
 from .blosum import AA
 
@@ -272,7 +272,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--samples-dir", default=SAMPLES_DIR)
     ap.add_argument("--pdb-dir", default=os.path.join(SAMPLES_DIR, "pdb"))
-    ap.add_argument("--foldseek", default=os.environ.get("PLD2_FOLDSEEK", "foldseek"))
+    ap.add_argument("--foldseek", default=FOLDSEEK)
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--tsv", default=None, help="reuse an existing descriptor TSV instead of "
                                                 "re-running foldseek")

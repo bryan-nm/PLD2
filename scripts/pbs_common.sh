@@ -124,7 +124,9 @@ fi
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 
 # Add Foldseek path
-export PATH=/flare/NLDesignProtein/bryan/tools/foldseek/bin:$PATH
+# config.py owns this path (FOLDSEEK_DIR) like every other; exported here only so the binary is
+# on PATH for anything that shells out by bare name. Override with PLD2_FOLDSEEK_DIR.
+export PATH="${PLD2_FOLDSEEK_DIR:-/flare/NLDesignProtein/bryan/tools/foldseek/bin}:$PATH"
 
 MPI_LAUNCH=(mpiexec -n "${NRANKS}" -ppn "${RANKS_PER_NODE}" --pmi=pmix --cpu-bind depth -d 8)
 

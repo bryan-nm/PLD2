@@ -105,9 +105,27 @@ def main():
         row(FAIL, "config", f"{type(e).__name__}: {e}")
 
     print("\nexternal tools")
+    # RUN IT, do not just find it. `which foldseek` on a login node reports MISSING purely because
+    # scripts/pbs_common.sh only puts it on PATH inside a job -- a warning that is always there and
+    # therefore tells you nothing. config.FOLDSEEK resolves the same way a job will, and executing
+    # it is the only check that covers what an image update could actually break: a static binary
+    # that no longer runs against the new system libraries.
+    import subprocess
     from shutil import which
-    row(OK if which("foldseek") else WARN, "foldseek on PATH",
-        which("foldseek") or "MISSING: phases 0c and 3 need it")
+
+    def _foldseek():
+        import config as _c
+        exe = _c.FOLDSEEK
+        if not (os.access(exe, os.X_OK) or which(exe)):
+            raise FileNotFoundError(f"not executable and not on PATH: {exe} "
+                                    f"(set PLD2_FOLDSEEK or PLD2_FOLDSEEK_DIR)")
+        r = subprocess.run([exe, "version"], capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise RuntimeError(f"{exe} version exited {r.returncode}: "
+                               f"{(r.stderr or r.stdout).strip()[:120]}")
+        return f"{(r.stdout or r.stderr).strip().splitlines()[0][:40]}  at {exe}"
+
+    check("foldseek runs", _foldseek, required=False)
 
     print("\nfolding (phase 0b, 2) -- the half a broken esm takes down")
     check("esm", lambda: importlib.import_module("esm").__version__, required=False)

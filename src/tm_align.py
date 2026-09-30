@@ -41,7 +41,7 @@ import sys
 import tempfile
 import time
 
-from config import CFG
+from config import CFG, FOLDSEEK
 from .dist import init_distributed
 from .fold_fasta import load_pdb_index, partition
 from .prompts import read_manifest
@@ -161,7 +161,7 @@ def main():
                          "after four variants have been generated and folded.")
     ap.add_argument("--manifest", default=None, help="default: <round>/prompts.jsonl")
     ap.add_argument("--out", default=None, help="default: <round>/tm.rankNNN.jsonl")
-    ap.add_argument("--foldseek", default=os.environ.get("PLD2_FOLDSEEK", "foldseek"))
+    ap.add_argument("--foldseek", default=FOLDSEEK)
     ap.add_argument("--threads", type=int, default=int(os.environ.get("OMP_NUM_THREADS", "8")))
     ap.add_argument("--chunk", type=int, default=32, help="prompts per foldseek invocation")
     ap.add_argument("--work", default=None, help="scratch dir (default: $TMPDIR)")

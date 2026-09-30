@@ -42,6 +42,27 @@ AFDB_SHARDS = os.environ.get("PLD2_AFDB_SHARDS", f"{DATASETS_DIR}/afdb_3di_shard
 
 BLOSUM_MAT = os.environ.get("PLD2_BLOSUM", f"{MODELS_DIR}/blosum62-special-MSA.mat")
 
+# --- foldseek ---------------------------------------------------------------------------------
+# THIS FILE OWNS EVERY PATH, and this one was the exception: a hardcoded PATH export in
+# scripts/pbs_common.sh, invisible to anything not running inside a PBS job. Resolution order is
+# the override, then the known install, then whatever is on PATH -- so a workstation with foldseek
+# installed normally still works, and `python config.py` reports which one a run will use.
+FOLDSEEK_DIR = os.environ.get("PLD2_FOLDSEEK_DIR", "/flare/NLDesignProtein/bryan/tools/foldseek/bin")
+
+
+def _resolve_foldseek() -> str:
+    import shutil
+    override = os.environ.get("PLD2_FOLDSEEK")
+    if override:
+        return override
+    known = os.path.join(FOLDSEEK_DIR, "foldseek")
+    if os.access(known, os.X_OK):
+        return known
+    return shutil.which("foldseek") or "foldseek"
+
+
+FOLDSEEK = _resolve_foldseek()
+
 # Foldseek's 3Di substitution matrix, shipped in the foldseek distribution as data/mat3di.out. It is
 # to the structure track what BLOSUM is to the sequence track, and it ships with the same binary
 # that produced the training labels -- so the corruption process and the tokeniser agree on what
@@ -629,6 +650,8 @@ if __name__ == "__main__":
     # The alignment inputs, checked here because every job script banners this output: a path that
     # is only resolved inside phase 0 fails minutes in, after the queue slot is already spent.
     print("SWISSPROT_CSV  :", SWISSPROT_CSV, " exists:", os.path.exists(SWISSPROT_CSV))
+    print("FOLDSEEK       :", FOLDSEEK, " runnable:",
+          os.access(FOLDSEEK, os.X_OK) or bool(__import__("shutil").which(FOLDSEEK)))
     print("FILIP_CACHE    :", FILIP_CACHE, " exists:", os.path.isdir(FILIP_CACHE))
     print("FILIP_CKPT     :", FILIP_CKPT, " exists:", os.path.exists(FILIP_CKPT))
     print(f"model          : d_model={m.d_model} d_ff={m.d_ff} heads={m.n_heads} "

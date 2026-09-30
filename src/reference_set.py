@@ -42,7 +42,7 @@ import os
 import random
 import sys
 
-from config import CFG, FILIP_CACHE, SWISSPROT_COLS, SWISSPROT_CSV
+from config import CFG, FILIP_CACHE, FOLDSEEK, SWISSPROT_COLS, SWISSPROT_CSV
 from .fold_fasta import load_pdb_index, read_records
 from .self_consistency import parse_descriptor, record_key, run_foldseek
 
@@ -290,7 +290,7 @@ def main():
     j.add_argument("--dir", default=acfg.round_dir)
     j.add_argument("--pdb-dir", default=None)
     j.add_argument("--folds", default=None)
-    j.add_argument("--foldseek", default=os.environ.get("PLD2_FOLDSEEK", "foldseek"))
+    j.add_argument("--foldseek", default=FOLDSEEK)
     j.add_argument("--threads", type=int, default=0)
     j.add_argument("--refresh", action="store_true", help="re-run foldseek even if the TSV exists")
     j.set_defaults(fn=cmd_join)
