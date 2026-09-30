@@ -350,6 +350,8 @@ src/
   preference.py       # reward -> pairs, and the pass@k vs best-of-k table
   align.py            # IPO (default) / DPO preference tuning, with the drift monitors
   align_compare.py    # several tuned policies on ONE held-out prompt set: paired, per-bin, LCR/k13
+  round_summary.py    # one row per round, so a chain of them reads as a curve
+  env_check.py        # does this environment still run the pipeline? (after an image change)
   tests_align.py      # prompt freezing, shared masks, the surrogate, IPO stops / DPO does not
   tests_fold_rank.sh  # the fold supervisor: transient fault, hang, surrender, signal
 scripts/              # pbs_common.sh, train.pbs, fold.pbs, sweep.pbs, sample.pbs,
@@ -619,6 +621,15 @@ writes and nothing reads them twice — `tm_align --prune` deletes each chunk on
 fsynced, and `fold_fasta --pdb-shard` puts each rank's structures in its own directory, which is the
 inode fix that matters past ~10k prompts. `align.pbs` prints structures/node-hour so the next
 scale-up is sized from a measurement.
+
+**Chaining rounds** (`ROUNDS=N`). Each round generates from the policy the previous one produced,
+excludes every earlier round's proteins, and chains on the **final** checkpoint — never `best.pt`,
+whose minimum has sat at step 0 in every round so far, which would leave the chain standing still.
+The loop resumes (a round with a policy checkpoint is skipped, and its checkpoint still chains
+forward), refuses to start a round it cannot finish inside `WALL_SECONDS`, and stops rather than
+chaining a policy that failed to update. `src.round_summary` prints the cross-round curve: reward
+and its increment, within-prompt sigma (the headroom the *next* round has), the degeneracy gate
+fraction, and drift — and says so when the last increment falls under a quarter of the largest.
 
 **It is iterative and the round number is load-bearing.** Round 2 generates from the policy round 1
 produced, on a fresh prompt set. Pairs from a policy that no longer exists are not merely stale,

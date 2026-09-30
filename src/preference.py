@@ -459,6 +459,36 @@ def main():
               + ("   <- cold start" if sel[0]["rate"] >= 1.0 else ""))
     print(f"[pref] wrote {out}", flush=True)
 
+    # A MACHINE-READABLE ROW PER ROUND, so a chain of them can be read as a curve instead of by
+    # grepping ten logs. These are the numbers that say whether iterating is still paying:
+    # reward is what the tuning moves, sigma is the headroom it has left to move into, and the
+    # degeneracy figures say whether it is buying that movement honestly.
+    allg = [x for p_ in pool.values() for x in p_]
+    ns = [len(v) for v in pool.values()]
+    rep = {
+        "prompts": len(pool), "generations": len(allg),
+        "per_prompt": float(np.mean(ns)), "min_per_prompt": int(min(ns)),
+        "success_rate": float(np.mean([succeeded(x, acfg) for x in allg])),
+        "plddt": float(np.mean([x["plddt"] for x in allg])),
+        "tm": float(np.mean([x["tm"] for x in allg])),
+        "reward": float(np.mean([score(x, acfg) for x in allg])),
+        "within_prompt_sigma": float(np.mean(
+            [np.std([score(x, acfg) for x in pool[p_]]) for p_ in pool if len(pool[p_]) > 1])),
+        "above_deg_gate": float(np.mean([x["deg"] > acfg.deg_max_winner for x in allg])),
+        "pairs": len(pairs), "prompts_with_pairs": n_prompts_with,
+        "prompts_gated_out": n_gated,
+        "winner_success_frac": n_succ_w / max(len(pairs), 1),
+        "reward_deg": acfg.reward_deg, "deg_max_winner": acfg.deg_max_winner,
+    }
+    rp = os.path.join(rdir, "report.json")
+    tmp = rp + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(rep, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, rp)
+    print(f"[pref] wrote {rp}", flush=True)
+
 
 if __name__ == "__main__":
     main()

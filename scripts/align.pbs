@@ -75,6 +75,23 @@ cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./scripts/pbs_common.sh
 
 ROUND=${ROUND:-1}
+# ITERATE IN ONE JOB. ROUNDS=1 is exactly the old single-round behaviour. Above that, each round
+# generates from the policy the previous one produced -- which is the whole point of IRPO, and what
+# the round-1 -> round-2 numbers say is working: reward 1.075 -> 1.152 on fresh prompts, per-draw
+# success 32.5% -> 37.3%, with the model growing LESS degenerate on its own (23.3% -> 16.1% of
+# generations above the gate).
+#
+# ALWAYS THE FINAL CHECKPOINT, NEVER best.pt. The drift monitor has put its minimum at step 0 in
+# both rounds so far, so "best" would mean "the policy we started with" and the chain would stand
+# still. best.pt remains written when it beats the baseline and remains the right thing to EVALUATE
+# when you want the least-drifted policy; it is not the right thing to iterate from when the
+# question is how far this pushes before it plateaus. CHAIN_CKPT names the file explicitly.
+ROUNDS=${ROUNDS:-1}
+CHAIN_CKPT=${CHAIN_CKPT:-ckpt_%08d.pt}     # %08d <- STEPS-1; set a literal name to pin one
+# Must match -l walltime. The loop refuses to start a round it cannot finish, because a round
+# killed mid-fold leaves a partial pair set that the next round would silently train on.
+WALL_SECONDS=${WALL_SECONDS:-0}
+ROUND_ESTIMATE=${ROUND_ESTIMATE:-12000}    # measured 11,213s; leave headroom for a slow fold
 N_PROMPTS=${N_PROMPTS:-1000}
 N_GEN=${N_GEN:-16}
 GAMMA=${GAMMA:-10}            # caption guidance during generation. Measured: the best-of-N gain
@@ -116,16 +133,22 @@ export RANK_HARD=${RANK_HARD:-3}
 FOLD_STALL=${FOLD_STALL:-3}   # consecutive no-progress passes tolerated before escalating
 FOLD_BUDGET=${FOLD_BUDGET:-5400}
 
-RDIR=$(python -c "from config import CFG; CFG.align.round=${ROUND}; print(CFG.align.round_dir)")
-# An empty RDIR turns every path below into a filesystem-root path: the first time config.py failed
-# this way the job went on to run `mkdir /pdb` and `mkdir /refpdb`, and only permissions stopped it.
-require RDIR "${RDIR}" abs
-PDB_DIR="${RDIR}/pdb"; REF_PDB_DIR="${RDIR}/refpdb"
-FOLDS="${RDIR}/folds.jsonl"; REF_FOLDS="${RDIR}/reffolds.jsonl"
-mkdir -p "${RDIR}" "${PDB_DIR}" "${REF_PDB_DIR}"
+# Recomputed per round: every path below is derived from it.
+set_round_paths() {
+    RDIR=$(python -c "from config import CFG; CFG.align.round=$1; print(CFG.align.round_dir)")
+    # An empty RDIR turns every path below into a filesystem-root path: the first time config.py
+    # failed this way the job ran `mkdir /pdb` and `mkdir /refpdb`, and only permissions stopped it.
+    require RDIR "${RDIR}" abs
+    PDB_DIR="${RDIR}/pdb"; REF_PDB_DIR="${RDIR}/refpdb"
+    FOLDS="${RDIR}/folds.jsonl"; REF_FOLDS="${RDIR}/reffolds.jsonl"
+    POLICY_DIR="${RDIR}/policy"
+    mkdir -p "${RDIR}" "${PDB_DIR}" "${REF_PDB_DIR}"
+}
+set_round_paths "${ROUND}"
 
-job_banner "PLD2 preference tuning, round ${ROUND}" ROUND N_PROMPTS N_GEN GAMMA LOSS ALPHA STEPS \
-           EPOCHS PROMPT_SEED REF_SPLIT PHASES PRUNE RDIR CKPT
+job_banner "PLD2 preference tuning, round ${ROUND}$([ "${ROUNDS}" -gt 1 ] && echo "..$((ROUND+ROUNDS-1))")" \
+           ROUND ROUNDS N_PROMPTS N_GEN GAMMA LOSS ALPHA STEPS \
+           EPOCHS PROMPT_SEED REF_SPLIT PHASES PRUNE WALL_SECONDS RDIR CKPT
 
 CKPT_FLAG=""; [ -n "${CKPT:-}" ] && CKPT_FLAG="--ckpt ${CKPT}"
 has() { [[ "${PHASES}" == *"$1"* ]]; }
@@ -199,6 +222,42 @@ fold_loop() {                 # $1 = out jsonl, $2 = pdb dir, $3 = extra flags, 
     return 1
 }
 
+# ================================================================================================
+# THE ROUND LOOP. Everything below runs once per round; ROUNDS=1 is the original single-round path.
+# ================================================================================================
+LAST_ROUND=$(( ROUND + ROUNDS - 1 ))
+CHAIN_LOG="${RDIR%/*}/chain.log"
+for (( r = ROUND; r <= LAST_ROUND; r++ )); do
+  set_round_paths "${r}"
+  PROMPT_SEED_R=$(( PROMPT_SEED + r - ROUND ))
+  FINAL_CKPT="${POLICY_DIR}/$(printf "${CHAIN_CKPT}" $(( STEPS - 1 )))"
+
+  # RESUME. A finished round is one whose policy checkpoint exists; re-submitting after a walltime
+  # kill picks up where it stopped instead of redoing folds that are already on disk.
+  if [ -f "${FINAL_CKPT}" ] && [ "${ROUNDS}" -gt 1 ]; then
+      echo "[chain] round ${r}: already has ${FINAL_CKPT}; skipping."
+      CKPT="${FINAL_CKPT}"; CKPT_FLAG="--ckpt ${CKPT}"
+      continue
+  fi
+
+  # WALLTIME GUARD. A round killed mid-fold leaves a partial pair set, and the next round would
+  # train on it without complaint. Refuse to start one we cannot finish.
+  if [ "${WALL_SECONDS}" -gt 0 ] && \
+     [ $(( WALL_SECONDS - SECONDS )) -lt "${ROUND_ESTIMATE}" ]; then
+      echo "[chain] $(( WALL_SECONDS - SECONDS ))s of walltime left, a round needs"\
+           "~${ROUND_ESTIMATE}s. Stopping cleanly"\
+           "$([ "${r}" -eq "${ROUND}" ] && echo "before round ${r}" || echo "after round $(( r - 1 ))")."
+      echo "[chain] resubmit the SAME command: finished rounds are detected and skipped."
+      break
+  fi
+
+  echo ""
+  echo "================================================================"
+  echo "[chain] ROUND ${r} of ${LAST_ROUND}   seed ${PROMPT_SEED_R}   from ${CKPT:-<base>}"
+  echo "[chain] elapsed ${SECONDS}s$([ "${WALL_SECONDS}" -gt 0 ] && echo ", $(( WALL_SECONDS - SECONDS ))s left")"
+  echo "================================================================"
+  ROUND_T0=$SECONDS
+
 # --- phase 0: the reference set, then the prompts ------------------------------------------------
 if has 0; then
     t0=$SECONDS
@@ -209,8 +268,18 @@ if has 0; then
     N_REFS=${N_REFS:-$(python -c "from src.reference_set import refs_needed; print(refs_needed(${N_PROMPTS}))")}
     echo "[align] phase 0/5a: ${N_REFS} captioned SwissProt proteins (split ${REF_SPLIT})"\
          "for ${N_PROMPTS} prompts + the eval holdout"
+    # EXCLUDE EVERY EARLIER ROUND'S PROTEINS. Different seeds give different shuffles, but they
+    # overlap by chance -- ~80 of 1,483 between any two draws from a ~28k split, and it compounds
+    # over ten rounds. A round that re-scaffolds proteins an earlier round already trained on is
+    # not the fresh prompt set on-policy data is supposed to be.
+    EXCL=""
+    for (( q = ROUND; q < r; q++ )); do
+        QDIR=$(python -c "from config import CFG; CFG.align.round=$q; print(CFG.align.round_dir)")
+        [ -f "${QDIR}/refs.meta.jsonl" ] && EXCL="${EXCL}${EXCL:+:}${QDIR}/refs.meta.jsonl"
+    done
     python -m src.reference_set fasta --dir "${RDIR}" --n "${N_REFS}" \
-        --for-prompts "${N_PROMPTS}" --split "${REF_SPLIT}" --seed "${PROMPT_SEED}" || exit 1
+        --for-prompts "${N_PROMPTS}" --split "${REF_SPLIT}" --seed "${PROMPT_SEED_R}" \
+        ${EXCL:+--exclude "${EXCL}"} || exit 1
 
     echo "[align] phase 0/5b: folding ${N_REFS} references -- these ARE the ground truth"
     fold_loop "${REF_FOLDS}" "${REF_PDB_DIR}" "" "${RDIR}/refs.fasta"
@@ -218,9 +287,9 @@ if has 0; then
     echo "[align] phase 0/5c: foldseek 3Di off the reference structures"
     python -m src.reference_set join --dir "${RDIR}" || exit 1
 
-    echo "[align] phase 0/5d: ${N_PROMPTS} partial-scaffold prompts (seed ${PROMPT_SEED})"
-    python -m src.prompts --dir "${RDIR}" --n "${N_PROMPTS}" --seed "${PROMPT_SEED}" || exit 1
-    phase "0-references+prompts" $t0
+    echo "[align] phase 0/5d: ${N_PROMPTS} partial-scaffold prompts (seed ${PROMPT_SEED_R})"
+    python -m src.prompts --dir "${RDIR}" --n "${N_PROMPTS}" --seed "${PROMPT_SEED_R}" || exit 1
+    phase "r${r}-0-refs+prompts" $t0
 fi
 
 # --- phase 1: generate ---------------------------------------------------------------------------
@@ -232,7 +301,7 @@ if has 1; then
         --n-gen "${N_GEN}" --gamma "${GAMMA}" ${CKPT_FLAG} ${GEN_ARGS:-}
     rc=$?
     [ $rc -ne 0 ] && echo "[align] generation exited ${rc}; folding what it did write." >&2
-    phase "1-generate" $t0
+    phase "r${r}-1-generate" $t0
 fi
 
 # --- phase 2: fold the generations ---------------------------------------------------------------
@@ -250,15 +319,15 @@ if has 2; then
     # --pdb-shard here and NOT on the reference pass: this directory is the one that reaches ~500k
     # files at 30x, while the reference directory is read whole by foldseek and must stay flat.
     fold_loop "${FOLDS}" "${PDB_DIR}" "--pdb-shard" "${GEN_FASTA[@]}"
-    phase "2-fold" $t0
+    phase "r${r}-2-fold" $t0
     N_FOLDED=$(cat "${FOLDS%.jsonl}"*.jsonl 2>/dev/null | wc -l | tr -d " ")
     # NEW records, not total. On a resume the total is mostly work a previous job paid for, and
     # dividing it by this phase's wall clock reported 1389 structures/node-hour for a phase that
     # actually folded 1044 -- a 15x overstatement, in the one number the scale-up is sized from.
     N_NEW=$(( N_FOLDED - FOLD_BEFORE ))
-    if [ "${PHASE_T[2-fold]:-0}" -gt 0 ] && [ "${N_NEW}" -gt 0 ]; then
-        echo "[align] FOLD RATE: ${N_NEW} NEW structures in ${PHASE_T[2-fold]}s on ${NNODES} nodes"\
-             "= $(python -c "print(f'{${N_NEW}*3600/${PHASE_T[2-fold]}/${NNODES}:.0f}')")"\
+    if [ "${PHASE_T[r${r}-2-fold]:-0}" -gt 0 ] && [ "${N_NEW}" -gt 0 ]; then
+        echo "[align] FOLD RATE: ${N_NEW} NEW structures in ${PHASE_T[r${r}-2-fold]}s on ${NNODES} nodes"\
+             "= $(python -c "print(f'{${N_NEW}*3600/${PHASE_T[r${r}-2-fold]}/${NNODES}:.0f}')")"\
              "structures/node-hour (${N_FOLDED} on disk in total, ${FOLD_BEFORE} before this"\
              "phase). Scale from the NEW figure, and only when it started near zero."
     fi
@@ -277,7 +346,7 @@ if has 3; then
         --ref-pdb-dir "${REF_PDB_DIR}" $([ "${PRUNE}" = "1" ] && echo --prune) ${TM_ARGS:-}
     trc=$?
     [ $trc -ne 0 ] && echo "[align] TM pass exited ${trc}; pairing what it did write." >&2
-    phase "3-tm" $t0
+    phase "r${r}-3-tm" $t0
 fi
 
 # --- phase 4: pairs, and the pass@k table --------------------------------------------------------
@@ -288,7 +357,7 @@ if has 4; then
     t0=$SECONDS
     echo "[align] phase 4/5: preference pairs"
     python -m src.preference --dir "${RDIR}" --folds "${FOLDS%.jsonl}*.jsonl" ${PREF_ARGS:-} || exit 1
-    phase "4-pairs" $t0
+    phase "r${r}-4-pairs" $t0
 fi
 
 # --- phase 5: tune -------------------------------------------------------------------------------
@@ -316,11 +385,31 @@ print(min(${NRANKS}, recommended_ranks(${N_PAIRS}, ${STEPS}, ${EPOCHS}, ppn=${RA
         --steps "${STEPS}" --epochs "${EPOCHS}" ${ALPHA:+--alpha ${ALPHA}} \
         ${CKPT_FLAG} ${ALIGN_ARGS:-}
     rc=$?
-    phase "5-tune" $t0
+    phase "r${r}-5-tune" $t0
 fi
+
+  # CHAIN. The next round generates from what this one produced -- the final checkpoint, by
+  # deliberate choice (see CHAIN_CKPT above). Verified present, because silently carrying the old
+  # policy forward would make every later round a no-op that still costs three hours.
+  if has 5; then
+      if [ ! -f "${FINAL_CKPT}" ]; then
+          echo "[chain] round ${r} produced no ${FINAL_CKPT}; stopping rather than chaining a" >&2
+          echo "[chain] policy that did not update." >&2
+          rc=1; break
+      fi
+      CKPT="${FINAL_CKPT}"; CKPT_FLAG="--ckpt ${CKPT}"
+  fi
+  printf '%s\troundtime=%ss\tckpt=%s\n' "round ${r}" "$(( SECONDS - ROUND_T0 ))" "${CKPT:-<base>}" \
+      | tee -a "${CHAIN_LOG}"
+done
+# ================================================================================================
 
 echo ""
 echo "[align] phase timings"
 for k in "${!PHASE_T[@]}"; do printf '  %-24s %6ss\n' "$k" "${PHASE_T[$k]}"; done | sort
-echo "[align] round ${ROUND} artefacts in ${RDIR}"
+if [ "${ROUNDS}" -gt 1 ]; then
+    echo ""
+    python -m src.round_summary --dir "$(dirname "${RDIR}")" || true
+fi
+echo "[align] artefacts in $(dirname "${RDIR}")"
 echo "[job] exit $rc"; exit $rc     # exit $rc so the EXIT trap reports the true code
