@@ -117,6 +117,9 @@ FOLD_STALL=${FOLD_STALL:-3}   # consecutive no-progress passes tolerated before 
 FOLD_BUDGET=${FOLD_BUDGET:-5400}
 
 RDIR=$(python -c "from config import CFG; CFG.align.round=${ROUND}; print(CFG.align.round_dir)")
+# An empty RDIR turns every path below into a filesystem-root path: the first time config.py failed
+# this way the job went on to run `mkdir /pdb` and `mkdir /refpdb`, and only permissions stopped it.
+require RDIR "${RDIR}" abs
 PDB_DIR="${RDIR}/pdb"; REF_PDB_DIR="${RDIR}/refpdb"
 FOLDS="${RDIR}/folds.jsonl"; REF_FOLDS="${RDIR}/reffolds.jsonl"
 mkdir -p "${RDIR}" "${PDB_DIR}" "${REF_PDB_DIR}"
@@ -294,9 +297,16 @@ if has 5; then
     # SIZE THE TUNER FROM THE DATA, NOT THE ALLOCATION. Pairs consumed per step is
     # world_size * pairs_per_rank, so running this on all ${NRANKS} ranks is what burned 33.8 epochs
     # in round 1 while the drift monitor turned over at 8.4.
+    if [ ! -s "${RDIR}/pairs.jsonl" ]; then
+        echo "FATAL: no pairs at ${RDIR}/pairs.jsonl. Phase 5 tunes on phase 4's output; run" >&2
+        echo "       PHASES=4 first, or PHASES=01234 if the round has no generations yet." >&2
+        exit 1
+    fi
     N_PAIRS=$(wc -l < "${RDIR}/pairs.jsonl" | tr -d " ")
+    require N_PAIRS "${N_PAIRS}" int
     ALIGN_RANKS=${ALIGN_RANKS:-$(python -c "from src.align import recommended_ranks; \
 print(min(${NRANKS}, recommended_ranks(${N_PAIRS}, ${STEPS}, ${EPOCHS}, ppn=${RANKS_PER_NODE})))")}
+    require ALIGN_RANKS "${ALIGN_RANKS}" int
     ALIGN_PPN=$(( ALIGN_RANKS < RANKS_PER_NODE ? ALIGN_RANKS : RANKS_PER_NODE ))
     echo "[align] phase 5/5: ${LOSS} for ${STEPS} steps on ${ALIGN_RANKS}/${NRANKS} ranks"\
          "(${N_PAIRS} pairs, target ${EPOCHS} epochs)"

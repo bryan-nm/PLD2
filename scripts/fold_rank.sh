@@ -77,6 +77,12 @@ _progress_path() {
 }
 _progress_size() {
     local f; f=$(_progress_path) || return 1
+    # TEST FIRST, because `wc -c < "$f" 2>/dev/null` does not suppress this. The input redirection
+    # is performed by the SHELL before wc is exec'd, so its "No such file or directory" goes to the
+    # shell's own stderr and the command's 2>/dev/null never applies. The `|| echo 0` fallback made
+    # the behaviour correct and the log unreadable: 13,730 of those lines in one run, every rank
+    # polling every 5s for the ~90s before ESMFold finishes loading and writes its first record.
+    [ -r "${f}" ] || { echo 0; return 0; }
     wc -c < "${f}" 2>/dev/null || echo 0
 }
 

@@ -13,7 +13,81 @@ fi
 
 module load frameworks                                     # torch + IPEX + oneCCL on Aurora
 # Create once: python -m venv --system-site-packages, then pip install -e deps. Edit to your env.
-source /flare/NLDesignProtein/bryan/envs/ProLoopDiff-env/bin/activate
+PLD2_VENV=${PLD2_VENV:-/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env}
+# shellcheck disable=SC1091
+source "${PLD2_VENV}/bin/activate"
+
+# --- the environment must work BEFORE anything else runs -------------------------------------
+# An Aurora image update swaps the frameworks module, and a venv built with --system-site-packages
+# against the previous one inherits a Python whose torch no longer resolves its MKL runtime. The
+# failure is not subtle -- but without this check it surfaced as a config.py traceback that the
+# banner PRINTED AND IGNORED, after which every derived path was the empty string and the job went
+# on to mkdir '/pdb' at the filesystem root. Fail here, with the facts needed to fix it.
+env_preflight() {
+    if python -c "import torch" >/dev/null 2>&1; then
+        # Record what this job is actually running against. An image update changes all of it
+        # silently, and a log that does not say so cannot be compared with last week's.
+        python - <<'PYEOF'
+import os, sys
+import torch
+ipex = None
+try:
+    import intel_extension_for_pytorch as ipex
+except Exception:
+    pass
+cfg = os.path.join(sys.prefix, "pyvenv.cfg")
+home = ""
+if os.path.exists(cfg):
+    home = next((l.split("=", 1)[1].strip() for l in open(cfg) if l.startswith("home")), "")
+print(f"[env] python {sys.version.split()[0]} | torch {torch.__version__} | "
+      f"ipex {getattr(ipex, '__version__', 'ABSENT (fine: every ipex.optimize here is guarded)')}")
+print(f"[env] base {sys.base_prefix}")
+if home and not os.path.realpath(home).startswith(os.path.realpath(sys.base_prefix)):
+    print(f"[env] WARNING: venv was built against {home}, which is NOT the interpreter now in "
+          f"use. That is how an Aurora image update breaks a run. Rebuild the venv if anything "
+          f"below misbehaves; `python -m src.env_check` says what still imports.")
+PYEOF
+        return 0
+    fi
+    {
+        echo "FATAL: this environment cannot import torch, so nothing downstream can run."
+        echo "  python      : $(command -v python)"
+        echo "  version     : $(python -V 2>&1)"
+        echo "  VIRTUAL_ENV : ${VIRTUAL_ENV:-<none>}"
+        echo "  venv built against:"
+        sed 's/^/      /' "${PLD2_VENV}/pyvenv.cfg" 2>/dev/null || echo "      <no pyvenv.cfg>"
+        echo "  the import fails with:"
+        python -c "import torch" 2>&1 | tail -4 | sed 's/^/      /'
+        echo
+        echo "  MOST LIKELY: the frameworks module changed under the venv. Compare the version"
+        echo "  above with the module's own interpreter, and if the minor version moved, rebuild:"
+        echo "      module load frameworks"
+        echo "      python -m venv --system-site-packages <NEW_ENV>"
+        echo "      source <NEW_ENV>/bin/activate"
+        echo "      pip install 'transformers>=4.57' biopython biotite cloudpathlib"
+        echo "      pip install --no-deps esm"
+        echo "  then re-run with PLD2_VENV=<NEW_ENV>. Keep the old env until the new one works."
+        echo '  python -m src.env_check --deep  reports exactly which phases survive.' 
+    } >&2
+    exit 1
+}
+env_preflight
+
+# --- guards for values a job DERIVES, so an empty one cannot reach a command ------------------
+# require NAME VALUE [abs|int]
+require() {
+    local name="$1" val="$2" kind="${3:-}"
+    if [ -z "${val}" ]; then
+        echo "FATAL: ${name} is empty. Something that computes it failed; refusing to run with a" >&2
+        echo "       blank path or count -- that is how 'mkdir /pdb' happens." >&2
+        exit 1
+    fi
+    case "${kind}" in
+        abs) case "${val}" in /?*) ;; *) echo "FATAL: ${name}='${val}' is not an absolute path." >&2; exit 1 ;; esac ;;
+        int) case "${val}" in ''|*[!0-9]*) echo "FATAL: ${name}='${val}' is not a number." >&2; exit 1 ;; esac
+             [ "${val}" -gt 0 ] || { echo "FATAL: ${name}=${val} must be positive." >&2; exit 1; } ;;
+    esac
+}
 
 # --- topology: 12 tiles/node, one rank per tile ---
 RANKS_PER_NODE=${RANKS_PER_NODE:-12}
@@ -66,7 +140,14 @@ job_banner() {
         printf '    %-24s = %s\n' "$e" "${!e}"
     done
     echo "  config.py resolves to:"
-    python config.py 2>&1 | sed 's/^/    /'
+    local cfg_out cfg_rc
+    cfg_out=$(python config.py 2>&1); cfg_rc=$?
+    echo "${cfg_out}" | sed 's/^/    /'
+    if [ "${cfg_rc}" -ne 0 ]; then
+        echo "FATAL: config.py exited ${cfg_rc}. Every path this job uses comes from it, so there" >&2
+        echo "       is nothing safe to do next. The traceback is above." >&2
+        exit 1
+    fi
     local v
     for v in "$@"; do printf '    %-24s = %s\n' "$v" "${!v}"; done
     echo "================================================================"

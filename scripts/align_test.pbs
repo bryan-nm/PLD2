@@ -77,6 +77,7 @@ FOLD_STALL=${FOLD_STALL:-3}
 FOLD_BUDGET=${FOLD_BUDGET:-5400}
 
 RDIR=$(python -c "from config import CFG; CFG.align.round=${ROUND}; print(CFG.align.round_dir)")
+require RDIR "${RDIR}" abs
 EVREF="${RDIR}/evalref"
 # BOTH, merged by src.tm_align. scripts/align.pbs holds its eval prompts out of the MAIN reference
 # set, so their structures sit in <round>/refpdb; this script builds its own set under evalref/ only
@@ -88,11 +89,13 @@ PAIRS="${RDIR}/pairs.jsonl"
 [ -f "${PAIRS}" ] || { echo "no ${PAIRS} -- run scripts/align.pbs phases 0-4 first." >&2; exit 1; }
 
 N_PAIRS=$(wc -l < "${PAIRS}" | tr -d " ")
+require N_PAIRS "${N_PAIRS}" int
 # SIZE THE TUNER FROM THE DATA, NOT FROM THE ALLOCATION. Pairs consumed per step is
 # world_size * pairs_per_rank, so phase 5 on all 192 ranks burned 33.8 epochs in round 1 while the
 # drift monitor turned over at 8.4. This inverts the relation instead.
 ALIGN_RANKS=${ALIGN_RANKS:-$(python -c "from src.align import recommended_ranks; \
 print(min(${NRANKS}, recommended_ranks(${N_PAIRS}, ${STEPS}, ${EPOCHS}, ppn=${RANKS_PER_NODE})))")}
+require ALIGN_RANKS "${ALIGN_RANKS}" int
 ALIGN_PPN=$(( ALIGN_RANKS < RANKS_PER_NODE ? ALIGN_RANKS : RANKS_PER_NODE ))
 
 job_banner "PLD2 alignment loss test, round ${ROUND}" ROUND VARIANTS PHASES STEPS EPOCHS \
