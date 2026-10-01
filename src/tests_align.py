@@ -803,6 +803,44 @@ finally:
     if _saved is not None:
         _sys.modules[_ish.MODULE] = _saved
 
+# ------------------------------------------------- 18. the fold benchmark's own metric
+# A benchmark that measures the wrong thing is worse than none. quartile_drift() is meant to
+# detect allocator degradation across a batch, and the first version read 2.6x on a workload with
+# no degradation at all -- it was picking up the length difference between the quartiles, because
+# cost goes as ~L^2. These pin the ordering that makes it a real measurement.
+from src.fold_bench import balanced_order as _bo, quartile_drift as _qd
+
+def _qmeans(ordered):
+    q = max(2, len(ordered) // 4)
+    return [sum(map(len, ordered[i * q:(i + 1) * q])) / q for i in range(4)]
+
+
+_pool = [("A" * n) for n in range(40, 352, 7)]            # a realistic spread, 45 sequences
+_ord = _bo(_pool)
+check("balanced_order keeps every sequence exactly once",
+      sorted(map(len, _ord)) == sorted(map(len, _pool)))
+# Exact when the count divides by four: the four buckets are then equal and the quartile windows
+# line up with them. 44 of the 45 above, so the quartiles are within a couple of percent.
+_means = _qmeans(_bo(_pool[:44]))
+check("...and matches the quartile length profiles within 3% on a multiple of 4",
+      max(_means) / min(_means) < 1.03, f"quartile means {[round(m) for m in _means]}")
+# A ragged count leaves the quartile windows slightly out of step with the buckets, so the
+# guarantee is weaker -- still far better than the spread of the set, which is what matters.
+_ragged = _qmeans(_ord)
+check("...and stays within 8% on a ragged count",
+      max(_ragged) / min(_ragged) < 1.08, f"quartile means {[round(m) for m in _ragged]}")
+# Plain round-robin is what fails this: it hands the last bucket the longest of every four.
+_rrm = _qmeans([s for i in range(4) for s in sorted(_pool[:44], key=len)[i::4]])
+check("...where plain round-robin does not, which is why snaking is there",
+      max(_rrm) / min(_rrm) > max(_means) / min(_means),
+      f"round-robin {[round(m) for m in _rrm]} vs snaked {[round(m) for m in _means]}")
+
+check("drift reports nan for a variant that only has one averaged number",
+      _qd([2.0] * 20) != _qd([2.0] * 20))                 # nan != nan
+check("drift is ~1 on a flat series", abs(_qd([2.0 + (i % 3) * 0.01 for i in range(40)]) - 1) < 0.02)
+check("drift exceeds 1 when the series degrades", _qd([1.0 + i * 0.1 for i in range(40)]) > 1.5)
+check("drift needs enough samples to mean anything", _qd([1.0, 2.0, 3.0]) != _qd([1.0, 2.0, 3.0]))
+
 check("fold_fasta scopes the shim to the esmfold_scorer import",
       (lambda src: 0 < src.index("ipex_shim.only_for_import")
        < src.index("from esmfold_scorer import"))(open("src/fold_fasta.py").read()))

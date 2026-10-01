@@ -1,0 +1,72 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N pld2_fold_bench
+#PBS -l walltime=01:00:00
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q debug
+#PBS -j oe
+
+# Price every difference between EsmFold's own speed test and PLD2's fold path, in ONE job.
+#
+#   qsub scripts/fold_bench.pbs                          # 1 tile: comparable to the README
+#   qsub -v RANKS_PER_NODE=12 scripts/fold_bench.pbs     # same, under production contention
+#   qsub -v BENCH_N=48 scripts/fold_bench.pbs            # more sequences per variant
+#
+# WHY. EsmFold's README measures 1.10 s/seq at 20 steps / 1 loop on one tile. PLD2's round-2 log
+# reports 1693 structures/node-hour, which reads as 25 s/seq. The logs already show that most of
+# that gap is NOT the folding -- steady state is 2.26 s/seq from the progress lines, and the phase
+# is dominated by a tail of ranks that die or hang while the supervisor waits out its budget. What
+# is left to explain is the remaining ~2x, and WHY ranks die. See src/fold_bench.py for the full
+# accounting and for what each variant isolates.
+#
+# THE ONE TO WATCH is the 'drift' column, not the mean: StructureScorer.score() honours
+# empty_cache_every and _infer() does not, and fold_all() uses _infer() whenever --pdb-dir is set,
+# which align.pbs always does. So fold_empty_cache_every=1 has been inert in every production fold
+# we have run, and the EsmFold README says that is how a long batch fragments HBM into a GPU page
+# fault. If '_infer +cache' flattens drift that the bare row shows, that is the rank deaths.
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+RANKS_PER_NODE=${RANKS_PER_NODE:-1}      # 1 tile by default: no contention, like the README
+source ./scripts/pbs_common.sh
+
+BENCH_N=${BENCH_N:-24}
+# config.py owns ALIGN_DIR, but it is not a shell variable here; this mirrors its default.
+BENCH_DIR=${BENCH_DIR:-../runs/pld2/align/bench}
+ESM_FASTA=${ESM_FASTA:-${ESMFOLD_REPO}/test_sequences.fasta}
+# Our own length regime, for pricing suspect D. Any round's refs.fasta will do; skipped if absent.
+PLD2_FASTA=${PLD2_FASTA:-$(ls -1 ../runs/pld2/align/round*/refs.fasta 2>/dev/null | tail -1)}
+
+mkdir -p "${BENCH_DIR}"
+job_banner "PLD2 vs EsmFold fold benchmark" BENCH_N RANKS_PER_NODE ESM_FASTA PLD2_FASTA BENCH_DIR
+
+pass() {                                  # $1 = label, rest = extra flags
+    local label="$1"; shift
+    echo; echo "================================================================"
+    echo "  pass: ${label}"
+    echo "================================================================"
+    # shellcheck disable=SC2086
+    "${MPI_LAUNCH[@]}" python -m src.fold_bench -n "${BENCH_N}" \
+        --json "${BENCH_DIR}/${label}.json" "$@"
+    echo "[bench] pass '${label}' exited $?"
+}
+
+# 1. The README's own sequences, our settings. A like-for-like number against 1.10 s/seq.
+pass esmfold-seqs --fasta "${ESM_FASTA}"
+
+# 2. Our sequences. Same code, same tile -- the only change is the length distribution, so the
+#    ratio against pass 1 IS the price of folding 258 aa instead of 180.
+if [ -n "${PLD2_FASTA}" ] && [ -f "${PLD2_FASTA}" ]; then
+    pass pld2-seqs --fasta "${PLD2_FASTA}"
+else
+    echo "[bench] no PLD2 refs.fasta found; skipping the length pass."\
+         "Pass PLD2_FASTA=<path> to price sequence length." >&2
+fi
+
+# 3. Without the linalg CPU round-trip. report() has only ever named `det`, so this should be a
+#    wash -- run it to confirm the guard costs nothing rather than assuming it.
+pass no-linalg-guard --fasta "${ESM_FASTA}" --no-linalg-guard
+
+echo
+echo "[bench] JSON in ${BENCH_DIR}. Compare 'score(list) README path' across passes for the"
+echo "        length effect, and 'drift' within a pass for the allocator."
