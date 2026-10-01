@@ -53,6 +53,7 @@ import argparse
 import glob as glob_
 import json
 import zlib
+import contextlib
 import os
 import re
 import sys
@@ -668,12 +669,15 @@ def main():
             summarize(args.out, ocfg)
         return
 
-    if dev.type == "xpu" and not args.no_ipex:
-        # EsmFold's resolve_device() still REQUIRES ipex to believe an XPU exists, and
-        # Aurora's 2026.1 image dropped it. Without this, every rank raises "XPU requested
-        # but intel_extension_for_pytorch is not installed" the moment the scorer is built.
-        ipex_shim.install(verbose=(rank == 0))
-    from esmfold_scorer import StructureScorer
+    # An EsmFold old enough to REQUIRE ipex before it will admit an XPU exists reads that flag
+    # when esmfold_scorer.device is imported, and Aurora's 2026.1 image dropped ipex -- so every
+    # rank raised "XPU requested but intel_extension_for_pytorch is not installed". The stub is
+    # held for this import ONLY: esm imports transformers afterwards, which introspects every
+    # optional backend and crashed on a module that was not really installed.
+    shim = (ipex_shim.only_for_import(verbose=(rank == 0))
+            if dev.type == "xpu" and not args.no_ipex else contextlib.nullcontext())
+    with shim:
+        from esmfold_scorer import StructureScorer
     t0 = time.perf_counter()
     scorer = StructureScorer(args.esmfold_weights, device=dev.type,
                              num_sampling_steps=ocfg.fold_steps, num_loops=ocfg.fold_loops,

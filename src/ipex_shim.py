@@ -19,6 +19,8 @@ different failures, and papering over "this node has no GPU" would turn a loud c
 that folds on CPU at a hundredth of the speed, which is far worse than not folding at all.
 """
 
+import contextlib
+import importlib.machinery
 import sys
 import types
 
@@ -35,7 +37,17 @@ def _optimize(model, optimizer=None, **_kw):
 
 def _stub() -> types.ModuleType:
     m = types.ModuleType(MODULE)
-    m.__version__ = f"0.0.0+pld2-shim (torch {torch.__version__})"
+    # A NON-NONE __spec__ IS LOAD-BEARING. types.ModuleType leaves it None, and
+    # importlib.util.find_spec() raises ValueError on an imported module with no spec rather than
+    # reporting absence. transformers probes every optional backend that way at import time
+    # (utils/import_utils.py: _is_package_available -> find_spec), so a spec-less stub takes down
+    # the first `import transformers` underneath esm -- which is how job 8884342 died.
+    #
+    # Deliberately NO fake dist-info to go with it: transformers' next step is
+    # importlib.metadata.version(), whose PackageNotFoundError makes it conclude ipex is absent.
+    # That IS the truth, and it is the answer that keeps it off the ipex code paths.
+    m.__spec__ = importlib.machinery.ModuleSpec(MODULE, loader=None)
+    m.__version__ = f"0.0.0+pld2.shim.torch.{torch.__version__}"
     m.__file__ = __file__
     m.optimize = _optimize
     m.xpu = torch.xpu
@@ -77,6 +89,36 @@ def install(verbose: bool = False) -> bool:
               f"owns the XPU backend; registered a stub forwarding to torch.xpu so EsmFold's "
               f"device check does not mistake the missing package for a missing GPU.", flush=True)
     return True
+
+
+def uninstall() -> bool:
+    """Take OUR stub back out of sys.modules. Never touches a real ipex. -> whether it removed one."""
+    m = sys.modules.get(MODULE)
+    if m is not None and getattr(m, "pld2_stub", False):
+        del sys.modules[MODULE]
+        return True
+    return False
+
+
+@contextlib.contextmanager
+def only_for_import(verbose: bool = False):
+    """Hold the stub just long enough for one import, then remove it.
+
+    THE STUB'S BLAST RADIUS IS THE PROBLEM, not its contents. EsmFold reads its ipex flag once, at
+    module-import time, so the stub only has to exist while esmfold_scorer is being imported.
+    Leaving it in sys.modules afterwards is what killed job 8884342: esm goes on to import
+    transformers, which probes every optional backend with importlib.util.find_spec, and found
+    ours. Scoping it to the import means nothing downstream can trip over a module that is not
+    really there -- and we cannot enumerate everything downstream, which is the whole point.
+
+    -> whether a stub was installed for the duration.
+    """
+    installed = install(verbose=verbose)
+    try:
+        yield installed
+    finally:
+        if installed:
+            uninstall()
 
 
 def status() -> str:

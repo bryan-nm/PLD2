@@ -705,6 +705,7 @@ _sh.rmtree(_ck, ignore_errors=True)
 # that no XPU exists. 1,872 tracebacks, zero structures. These checks pin the two halves of the
 # fix: the stub satisfies the import, and it is installed ONLY when a GPU is genuinely there.
 import sys as _sys
+import types as _types
 
 from src import ipex_shim as _ish
 
@@ -730,6 +731,24 @@ try:
           _stub.xpu is torch.xpu)
     check("ipex.__version__ exists for callers that gate on it", bool(_stub.__version__))
 
+    # THE REGRESSION THAT COST JOB 8884342. transformers probes every optional backend with
+    # importlib.util.find_spec at import time, and find_spec RAISES ValueError on an imported
+    # module whose __spec__ is None -- which is what types.ModuleType gives you. The stub took
+    # down the first `import transformers` underneath esm, four frames below anything of ours.
+    import importlib.metadata as _im
+    import importlib.util as _iu
+    _spec = _iu.find_spec(_ish.MODULE)
+    check("find_spec on the stub returns a spec instead of raising",
+          _spec is not None and _spec.name == _ish.MODULE)
+    # And it must stay un-metadata'd: that is what makes transformers decide ipex is ABSENT and
+    # keep off its ipex code paths, which is both true and what we want.
+    try:
+        _im.version(_ish.MODULE)
+        _nometa = False
+    except _im.PackageNotFoundError:
+        _nometa = True
+    check("the stub carries no dist metadata, so consumers read it as absent", _nometa)
+
     # optimize()'s two return shapes: both appear in the wild, and getting the arity wrong turns
     # a model into a tuple several frames away from here.
     _mm = torch.nn.Linear(2, 2)
@@ -750,15 +769,43 @@ try:
 
     check("install() is idempotent once the stub is in place", _ish.install() is False)
     check("...and status() now reports the stub", "stub installed" in _ish.status())
+    check("uninstall() removes our stub", _ish.uninstall() is True
+          and _ish.MODULE not in _sys.modules)
+
+    # THE SCOPE IS THE FIX. A stub left in sys.modules is a module that is not really installed,
+    # and every library that introspects packages is a potential casualty -- transformers was the
+    # first. only_for_import() narrows the window to the one import that needs it.
+    with _ish.only_for_import() as _held:
+        check("only_for_import installs for the duration", _held is True
+              and _sys.modules.get(_ish.MODULE) is not None)
+    check("...and removes it on exit, so nothing downstream sees it",
+          _ish.MODULE not in _sys.modules)
+
+    # It must also clean up when the import it is wrapping raises, or one bad fold rank poisons
+    # every later import in that process.
+    try:
+        with _ish.only_for_import():
+            raise RuntimeError("the wrapped import failed")
+    except RuntimeError:
+        pass
+    check("...even when the wrapped import raises", _ish.MODULE not in _sys.modules)
+
+    # And it must never remove a REAL ipex that happened to be installed.
+    _sys.modules[_ish.MODULE] = _types.ModuleType(_ish.MODULE)      # no pld2_stub marker
+    with _ish.only_for_import() as _held2:
+        pass
+    check("a real ipex is left alone by install/uninstall",
+          _held2 is False and _ish.MODULE in _sys.modules)
+    del _sys.modules[_ish.MODULE]
 finally:
     _ish.have_xpu = _real_have_xpu
     _sys.modules.pop(_ish.MODULE, None)
     if _saved is not None:
         _sys.modules[_ish.MODULE] = _saved
 
-check("fold_fasta installs the shim before importing esmfold_scorer",
-      (lambda src: 0 < src.index("ipex_shim.install") < src.index("from esmfold_scorer import"))(
-          open("src/fold_fasta.py").read()))
+check("fold_fasta scopes the shim to the esmfold_scorer import",
+      (lambda src: 0 < src.index("ipex_shim.only_for_import")
+       < src.index("from esmfold_scorer import"))(open("src/fold_fasta.py").read()))
 
 print(f"\n{checks - len(fails)}/{checks} checks pass")
 if fails:
