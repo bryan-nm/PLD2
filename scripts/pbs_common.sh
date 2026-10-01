@@ -39,8 +39,9 @@ cfg = os.path.join(sys.prefix, "pyvenv.cfg")
 home = ""
 if os.path.exists(cfg):
     home = next((l.split("=", 1)[1].strip() for l in open(cfg) if l.startswith("home")), "")
-print(f"[env] python {sys.version.split()[0]} | torch {torch.__version__} | "
-      f"ipex {getattr(ipex, '__version__', 'ABSENT (fine: every ipex.optimize here is guarded)')}")
+ipexv = getattr(ipex, "__version__", "ABSENT -- src/ipex_shim.py stands in for it so that "
+                                     "EsmFold does not read a missing package as a missing GPU")
+print(f"[env] python {sys.version.split()[0]} | torch {torch.__version__} | ipex {ipexv}")
 print(f"[env] base {sys.base_prefix}")
 if home and not os.path.realpath(home).startswith(os.path.realpath(sys.base_prefix)):
     print(f"[env] WARNING: venv was built against {home}, which is NOT the interpreter now in "

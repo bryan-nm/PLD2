@@ -698,6 +698,68 @@ check("best.pt carries weights, not optimizer state",
                               weights_only=False))
 _sh.rmtree(_ck, ignore_errors=True)
 
+
+# ------------------------------------------------- 17. the ipex shim
+# Round 3 (job 8882115) lost a 16-node allocation two minutes in: Aurora's 2026.1 image dropped
+# intel_extension_for_pytorch, and EsmFold's resolve_device() reads a failed ipex import as proof
+# that no XPU exists. 1,872 tracebacks, zero structures. These checks pin the two halves of the
+# fix: the stub satisfies the import, and it is installed ONLY when a GPU is genuinely there.
+import sys as _sys
+
+from src import ipex_shim as _ish
+
+_saved = _sys.modules.pop(_ish.MODULE, None)
+_real_have_xpu = _ish.have_xpu
+try:
+    _ish.have_xpu = lambda: False
+    check("no XPU visible -> no shim (a missing GPU must stay a loud failure)",
+          _ish.needed() is False and _ish.install() is False
+          and _ish.MODULE not in _sys.modules)
+    check("...and status() says so", "no XPU visible" in _ish.status())
+
+    _ish.have_xpu = lambda: True
+    check("XPU visible and ipex absent -> shim is needed", _ish.needed() is True)
+    check("...status() warns before the job starts, not after",
+          "WILL be installed" in _ish.status())
+    check("install() registers it under the real module name", _ish.install() is True
+          and _ish.MODULE in _sys.modules)
+    _stub = __import__(_ish.MODULE)
+    check("the stub is what a third-party `import intel_extension_for_pytorch` gets",
+          getattr(_stub, "pld2_stub", False) is True)
+    check("ipex.xpu IS torch.xpu, so ipex.xpu.is_available() answers correctly",
+          _stub.xpu is torch.xpu)
+    check("ipex.__version__ exists for callers that gate on it", bool(_stub.__version__))
+
+    # optimize()'s two return shapes: both appear in the wild, and getting the arity wrong turns
+    # a model into a tuple several frames away from here.
+    _mm = torch.nn.Linear(2, 2)
+    _oo = torch.optim.SGD(_mm.parameters(), lr=0.1)
+    check("ipex.optimize(model) -> model", _stub.optimize(_mm) is _mm)
+    check("ipex.optimize(model, optimizer=opt) -> (model, opt)",
+          _stub.optimize(_mm, optimizer=_oo) == (_mm, _oo))
+    check("ipex.optimize tolerates the dtype kwarg", _stub.optimize(_mm, dtype=torch.bfloat16)
+          is _mm)
+
+    # Anything we did NOT think about must fail loudly rather than return a plausible None.
+    try:
+        _stub.quantization
+        _raised = False
+    except AttributeError:
+        _raised = True
+    check("an unstubbed ipex attribute raises AttributeError", _raised)
+
+    check("install() is idempotent once the stub is in place", _ish.install() is False)
+    check("...and status() now reports the stub", "stub installed" in _ish.status())
+finally:
+    _ish.have_xpu = _real_have_xpu
+    _sys.modules.pop(_ish.MODULE, None)
+    if _saved is not None:
+        _sys.modules[_ish.MODULE] = _saved
+
+check("fold_fasta installs the shim before importing esmfold_scorer",
+      (lambda src: 0 < src.index("ipex_shim.install") < src.index("from esmfold_scorer import"))(
+          open("src/fold_fasta.py").read()))
+
 print(f"\n{checks - len(fails)}/{checks} checks pass")
 if fails:
     print("FAILURES:")

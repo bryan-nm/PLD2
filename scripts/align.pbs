@@ -1,7 +1,9 @@
 #!/bin/bash -l
 #PBS -A NLDesignProtein
 #PBS -N pld2_align
-#PBS -l walltime=03:00:00
+#PBS -l walltime=06:00:00   # ONE round measures ~3.1h (fold varies 0.6-1.6h), so 3h was
+                            # under it -- a round-2 job died at step 0 of phase 5. Chained
+                            # runs override this: capacity allows up to 7 days.
 #PBS -l select=16
 #PBS -l place=scatter
 #PBS -l filesystems=home_fs:flare_fs

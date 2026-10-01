@@ -63,7 +63,7 @@ import torch
 from config import CFG, ESMFOLD_WEIGHTS, FOLDS_JSONL, SAMPLES_DIR
 from .dist import init_distributed
 from .metrics import kmer_counts, kmer_fractions, lcr_counts
-from . import xpu_linalg_guard
+from . import ipex_shim, xpu_linalg_guard
 
 try:
     import intel_extension_for_pytorch as ipex
@@ -607,7 +607,10 @@ def main():
                          "so it is safe to turn on mid-campaign. Leave it OFF for any directory "
                          "foldseek will read as a whole (the reference set).")
     ap.add_argument("--summarize", action="store_true", help="print the table and exit; no GPU")
-    ap.add_argument("--no-ipex", action="store_true")
+    ap.add_argument("--no-ipex", action="store_true",
+                    help="do not stand in for a missing intel_extension_for_pytorch "
+                         "(src/ipex_shim.py); use this to reproduce the ipex-absent "
+                         "failure deliberately, not in a production run")
     args = ap.parse_args()
 
     # Line-buffer stdout. Under PBS the job's output is a FILE, so Python block-buffers it, and
@@ -665,6 +668,11 @@ def main():
             summarize(args.out, ocfg)
         return
 
+    if dev.type == "xpu" and not args.no_ipex:
+        # EsmFold's resolve_device() still REQUIRES ipex to believe an XPU exists, and
+        # Aurora's 2026.1 image dropped it. Without this, every rank raises "XPU requested
+        # but intel_extension_for_pytorch is not installed" the moment the scorer is built.
+        ipex_shim.install(verbose=(rank == 0))
     from esmfold_scorer import StructureScorer
     t0 = time.perf_counter()
     scorer = StructureScorer(args.esmfold_weights, device=dev.type,

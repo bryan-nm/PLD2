@@ -11,8 +11,10 @@ exercises until a job is already running.
 
 REQUIRED means the pipeline cannot run. OPTIONAL means a phase degrades or is skipped -- notably
 intel_extension_for_pytorch, which newer Aurora frameworks drop because XPU support moved into
-torch itself. Every ipex.optimize call in this repo is already guarded; losing it costs whatever
-weight prepacking was worth and nothing else.
+torch itself. Every ipex.optimize call in this repo is guarded, so losing it costs whatever weight
+prepacking was worth -- but EsmFold reads a failed ipex import as "there is no XPU" and refuses to
+build a scorer at all, which killed all 192 fold ranks of round 3. src/ipex_shim.py covers that;
+the 'ipex shim' row below says whether it applies here.
 """
 from __future__ import annotations
 import argparse
@@ -42,6 +44,24 @@ def check(name, fn, required=True, detail=""):
         msg = f"{type(e).__name__}: {e}".replace("\n", " ")[:160]
         row(FAIL if required else WARN, name, msg)
         return False
+
+
+def _esmfold_device_check():
+    """Would EsmFold accept device='xpu' here?  Separates the two failures its own error message
+    runs together: a missing ipex (which src/ipex_shim.py fixes) from a missing GPU (which it must
+    not hide). On a login node the honest answer is the second one."""
+    from src import ipex_shim
+    dev = importlib.import_module("esmfold_scorer.device")
+    resolve = getattr(dev, "resolve_device", None)
+    if resolve is None:
+        return "no resolve_device() in this EsmFold build; nothing to shim"
+    installed = ipex_shim.install()
+    try:
+        return f"accepts xpu -> {resolve('xpu')}" + ("  (via the shim)" if installed else "")
+    except Exception as e:
+        if not ipex_shim.have_xpu():
+            return f"no XPU on this node, so untestable here: {type(e).__name__}: {e}"[:150]
+        raise
 
 
 def main():
@@ -78,7 +98,7 @@ def main():
     check("intel_extension_for_pytorch",
           lambda: importlib.import_module("intel_extension_for_pytorch").__version__,
           required=False,
-          detail="absent is fine: every ipex.optimize in this repo is guarded")
+          detail="absent is fine for this repo's own call sites; see the 'ipex shim' row")
     check("numpy", lambda: importlib.import_module("numpy").__version__)
 
     print("\nthis repo (generation, pairing, tuning)")
@@ -128,12 +148,18 @@ def main():
     check("foldseek runs", _foldseek, required=False)
 
     print("\nfolding (phase 0b, 2) -- the half a broken esm takes down")
+    # NOT a cosmetic row. Round 3 lost a 16-node job in two minutes because EsmFold's
+    # resolve_device() demands ipex before it will admit an XPU exists, and the image had
+    # dropped ipex. On a login node there is no XPU, so this can only report what WILL happen.
+    check("ipex shim", lambda: importlib.import_module("src.ipex_shim").status(),
+          required=False)
     check("esm", lambda: importlib.import_module("esm").__version__, required=False)
     check("transformers", lambda: importlib.import_module("transformers").__version__,
           required=False)
     if a.deep:
         check("esmfold_scorer.StructureScorer",
               lambda: importlib.import_module("esmfold_scorer").StructureScorer and "importable")
+        check("esmfold_scorer device check", _esmfold_device_check, required=False)
         check("src.filip_guidance (AMPLIFY stack)",
               lambda: importlib.import_module("src.filip_guidance") and "importable",
               required=False)
