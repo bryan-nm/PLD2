@@ -21,6 +21,7 @@ Set up or repair the environment with scripts/aurora_env.sh, then re-run this wi
 from __future__ import annotations
 import argparse
 import importlib
+import importlib.util
 import os
 import sys
 import traceback
@@ -46,6 +47,20 @@ def check(name, fn, required=True, detail=""):
         msg = f"{type(e).__name__}: {e}".replace("\n", " ")[:160]
         row(FAIL if required else WARN, name, msg)
         return False
+
+
+def _esmfold_on_path():
+    """Add ESMFOLD_REPO/src to sys.path the way a job's PYTHONPATH does. -> what it did."""
+    if importlib.util.find_spec("esmfold_scorer") is not None:
+        return "already importable; nothing added"
+    import config as _c
+    src = os.path.join(_c.ESMFOLD_REPO, "src")
+    if not os.path.isdir(os.path.join(src, "esmfold_scorer")):
+        raise FileNotFoundError(f"no esmfold_scorer under {src} "
+                                f"(config.ESMFOLD_REPO; set PLD2_ESMFOLD_REPO)")
+    sys.path.insert(0, src)
+    importlib.invalidate_caches()
+    return f"added {src}"
 
 
 def _transformers_version():
@@ -189,6 +204,12 @@ def main():
     check("foldseek runs", _foldseek, required=False)
 
     print("\nfolding (phase 0b, 2) -- no folds means no rewards, so no alignment at all")
+    # REPLICATE THE JOB'S sys.path, or this whole section is testing a different environment.
+    # esmfold_scorer is not a site-packages install: scripts/pbs_common.sh puts the sibling repo's
+    # src/ on PYTHONPATH, and that only happens inside a job. Without this, a login-node preflight
+    # reports the scorer missing no matter how healthy the venv is -- and then says REQUIRED
+    # checks failed, which is the opposite of useful.
+    check("esmfold_scorer on sys.path", _esmfold_on_path, required=False)
     # NOT a cosmetic row. Round 3 lost a 16-node job in two minutes because EsmFold's
     # resolve_device() demands ipex before it will admit an XPU exists, and the image had
     # dropped ipex. On a login node there is no XPU, so this can only report what WILL happen.

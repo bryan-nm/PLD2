@@ -116,11 +116,13 @@ export FI_PROVIDER=cxi
 export CCL_ZE_IPC_EXCHANGE=pidfd
 
 # --- ESMFold2-Fast structural eval (src/fold_fasta.py; harmless for training ranks) ---
-# The scorer lives in a sibling repo. Its deps (transformers>=4.57, esm --no-deps, biopython,
-# biotite, cloudpathlib) must already be in the venv above; see EsmFold/README.md. HF_HUB_OFFLINE
+# The scorer lives in a sibling repo. Its deps must already be in the venv above -- build it with
+# scripts/aurora_env.sh, which is the only place that recipe lives now. HF_HUB_OFFLINE
 # keeps the ESM-C 6B backbone resolving from ~/.cache/huggingface on compute nodes, which have no
 # network -- pre-cache it once from a login node.
-ESMFOLD_REPO=${ESMFOLD_REPO:-/flare/NLDesignProtein/bryan/Diffusion-dev-space/EsmFold}
+# config.py owns this path (ESMFOLD_REPO) like every other; duplicated here only because
+# PYTHONPATH must be set before any python runs. Override with PLD2_ESMFOLD_REPO in both.
+ESMFOLD_REPO=${PLD2_ESMFOLD_REPO:-${ESMFOLD_REPO:-/flare/NLDesignProtein/bryan/Diffusion-dev-space/EsmFold}}
 if [ -d "${ESMFOLD_REPO}/src" ]; then
     export PYTHONPATH="${ESMFOLD_REPO}/src${PYTHONPATH:+:$PYTHONPATH}"
 fi

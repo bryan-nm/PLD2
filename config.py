@@ -113,6 +113,15 @@ FOLDS_JSONL = os.environ.get("PLD2_FOLDS_JSONL", f"{RUNS_DIR}/folds.jsonl")  # E
 ESMFOLD_WEIGHTS = os.environ.get("PLD2_ESMFOLD_WEIGHTS",
                                  "/flare/NLDesignProtein/bryan/models/ESMFold2-Fast")
 
+# The scorer CODE (esmfold_scorer) lives in a sibling repo, not in site-packages, and reaches the
+# pipeline through PYTHONPATH. Owned here like every other path so that scripts/pbs_common.sh and
+# src/env_check.py agree on it: a preflight that cannot see the scorer is checking a different
+# environment than the job runs in, which is how job 8883902's real problem stayed hidden.
+ESMFOLD_REPO = os.environ.get("PLD2_ESMFOLD_REPO",
+                              os.environ.get("ESMFOLD_REPO",
+                                             "/flare/NLDesignProtein/bryan/Diffusion-dev-space"
+                                             "/EsmFold"))
+
 
 @dataclass
 class DataCfg:
@@ -643,6 +652,9 @@ if __name__ == "__main__":
     print("UNIREF_FASTA   :", UNIREF_FASTA, " exists:", os.path.exists(UNIREF_FASTA))
     print("BLOSUM_MAT     :", BLOSUM_MAT, " exists:", os.path.exists(BLOSUM_MAT))
     print("ESMFOLD_WEIGHTS:", ESMFOLD_WEIGHTS, " exists:", os.path.exists(ESMFOLD_WEIGHTS))
+    print("ESMFOLD_REPO   :", ESMFOLD_REPO,
+          " importable:", os.path.isdir(os.path.join(ESMFOLD_REPO, "src",
+                                                     "esmfold_scorer")))
     print("CKPT_DIR       :", CKPT_DIR)
     print("SAMPLES_DIR    :", SAMPLES_DIR)
     print("FOLDS_JSONL    :", FOLDS_JSONL)
