@@ -1,25 +1,39 @@
-# Packages that an Aurora venv does NOT get for free, and that a rebuild therefore drops silently.
+# esm's own dependencies, MINUS the two groups that must never be pip-installed on Aurora.
+# Installed separately because esm itself goes in with --no-deps; see scripts/aurora_env.sh, which
+# is the thing to run. Keeping the list explicit beats guessing which imports the ESMFold2 path
+# reaches: an under-installed dependency surfaces as an ImportError inside a fold rank.
 #
-#   module load frameworks
-#   python -m venv --system-site-packages $PLD2_VENV && . $PLD2_VENV/bin/activate
-#   python -m pip install -r requirements-aurora.txt
-#   python -m src.env_check --deep          # must end "No required check failed"
+# EXCLUDED, deliberately:
+#   torch        -- esm 3.4.1 asks for >=2.11,<2.12 and the frameworks module provides 2.13 with
+#                   XPU support compiled in. Letting pip satisfy that pin replaces a build tuned
+#                   for this machine with a generic wheel, and folding stops seeing a GPU at all.
+#   cuequivariance-torch, cuequivariance-ops-torch-cu13
+#                -- CUDA-only, and their markers match linux/x86_64, so Aurora qualifies on paper.
 #
-# NOT listed here, on purpose: torch, numpy, and the oneAPI stack. Those come from the frameworks
-# module through --system-site-packages, and pip-installing any of them replaces a build tuned for
-# this machine with a generic wheel. intel_extension_for_pytorch is likewise absent by design as of
-# image 26.181.0 -- XPU support lives in torch now, and src/ipex_shim.py covers the one package
-# that still asks for it by name.
-#
-# WHY THESE TWO ARE PINNED TO FORKS. EsmFold's StructureScorer needs an ESMFold2 model class, and
-# PyPI has no such thing: upstream transformers ships no models/esmfold2, so only Biohub's fork
-# resolves. Its _resolve_model_class() tries the esm package FIRST and that branch cannot succeed
-# -- esm.models.esmfold2 does not export EsmFold2Model in 3.3.0 -- so it falls through to
-# transformers every time. Its ImportError nonetheless tells you to install esm, which alone fixes
-# nothing. transformers is the one that matters; esm is pinned because the known-good environment
-# had it and the wrapper may reach for it elsewhere.
-#
-# Commits, not @main. Job 8883902 burned a queue slot on a venv that had neither, and a floating
-# @main would make the next rebuild a different experiment instead of a repeat of a working one.
-esm @ git+https://github.com/Biohub/esm.git@26b0bc2b771e3e419ea74f445a5f35cc094a1509
-transformers @ git+https://github.com/Biohub/transformers.git@ef32577f55da19a4989cd7b22e004dc43a4998cb
+# transformers is pinned below 5 because esm declares <5.0.0 and PyPI is already on 5.18. It does
+# NOT supply the ESMFold2 model class -- no transformers release does, at any version -- so do not
+# chase this pin when folding cannot find a model; that comes from esm.
+transformers>=4.57.6,<5
+accelerate
+attrs
+biopython
+biotite>=1.0.0
+boto3
+brotli
+cloudpathlib
+dna_features_viewer
+einops
+httpx
+huggingface_hub
+ipython
+ipywidgets
+msgpack-numpy
+pandas
+py3dmol
+pydssp
+pygtrie
+rdkit
+safetensors
+scikit-learn
+tenacity
+zstd

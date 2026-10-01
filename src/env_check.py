@@ -12,9 +12,11 @@ exercises until a job is already running.
 REQUIRED means the pipeline cannot run. OPTIONAL means a phase degrades or is skipped -- notably
 intel_extension_for_pytorch, which newer Aurora frameworks drop because XPU support moved into
 torch itself. Every ipex.optimize call in this repo is guarded, so losing it costs whatever weight
-prepacking was worth -- but EsmFold reads a failed ipex import as "there is no XPU" and refuses to
-build a scorer at all, which killed all 192 fold ranks of round 3. src/ipex_shim.py covers that;
-the 'ipex shim' row below says whether it applies here.
+prepacking was worth -- but EsmFold computes _ipex_available at IMPORT time and reads a failed
+import as "there is no XPU", refusing to build a scorer at all. That killed all 192 fold ranks of
+round 3. src/ipex_shim.py covers it; the 'ipex shim' row below says whether it applies here.
+
+Set up or repair the environment with scripts/aurora_env.sh, then re-run this with --deep.
 """
 from __future__ import annotations
 import argparse
@@ -46,11 +48,21 @@ def check(name, fn, required=True, detail=""):
         return False
 
 
+def _transformers_version():
+    v = importlib.import_module("transformers").__version__
+    if int(v.split(".")[0]) >= 5:
+        raise RuntimeError(f"{v} is outside esm's declared transformers<5.0.0; "
+                           f"pip install -r requirements-aurora.txt")
+    return v
+
+
 def _esmfold_model_class():
     """Can EsmFold find the ESMFold2 class at all?  The check job 8883902 needed: the venv rebuild
     left esmfold_scorer importable and ESMFOLD_WEIGHTS on disk, but nothing providing the model
     class, so _resolve_model_class() raised an ImportError after a queue slot was already spent.
-    Resolving the class touches no weights and no GPU -- a second on a login node."""
+    Resolving the class touches no weights and no GPU -- a second on a login node. The row also
+    says WHICH source resolved: esm.* is the supported one, transformers.* means someone is
+    relying on a fork that no release of transformers reproduces."""
     import inspect
     sc = importlib.import_module("esmfold_scorer.scorer")
     cls = sc.StructureScorer
@@ -69,9 +81,9 @@ def _esmfold_model_class():
         # EsmFold's own message here says to install esm, which alone fixes nothing: its
         # esm.models.esmfold2 branch cannot succeed (3.3.0 does not export EsmFold2Model), so the
         # Biohub transformers FORK is what actually resolves the class. Say so.
-        raise ImportError(f"{e}  <-- really: pip install -r requirements-aurora.txt "
-                          f"(the Biohub transformers fork; upstream PyPI has no "
-                          f"models/esmfold2)") from None
+        raise ImportError(f"{e}  <-- misleading: esm 3.3.0 HAS esm.models.esmfold2 and no "
+                          f"model in it. Run scripts/aurora_env.sh, which installs an esm "
+                          f"commit that exports EsmFold2Model.") from None
     return f"{getattr(mc, '__module__', '?')}.{getattr(mc, '__name__', mc)}"
 
 
@@ -182,12 +194,14 @@ def main():
     # dropped ipex. On a login node there is no XPU, so this can only report what WILL happen.
     check("ipex shim", lambda: importlib.import_module("src.ipex_shim").status(),
           required=False)
-    # Both of these must be Biohub forks, not PyPI -- see requirements-aurora.txt. Upstream
-    # transformers has no models/esmfold2 at any version, so a plain `pip install transformers`
-    # satisfies this row and still cannot fold.
-    check("esm", lambda: importlib.import_module("esm").__version__, required=False)
-    check("transformers (needs the Biohub fork)",
-          lambda: importlib.import_module("transformers").__version__, required=False)
+    # esm is where the ESMFold2 model class comes from, and ONLY after 3.3.0 -- which is the
+    # version that ships esm.models.esmfold2 with no model in it. A version row would call 3.3.0
+    # fine, so name what is required and let the model-class row below settle it.
+    check("esm (>3.3.0 for EsmFold2Model)",
+          lambda: importlib.import_module("esm").__version__, required=False)
+    # Not the fork anyone might assume: no transformers release supplies ESMFold2, so this row is
+    # only about staying inside esm's own `transformers>=4.57.6,<5` pin.
+    check("transformers (esm pins <5)", _transformers_version, required=False)
     if a.deep:
         check("esmfold_scorer.StructureScorer",
               lambda: importlib.import_module("esmfold_scorer").StructureScorer and "importable")
