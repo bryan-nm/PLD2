@@ -11,8 +11,10 @@ if [ ! -f config.py ] || [ ! -d src ]; then
     exit 1
 fi
 
-module load frameworks                                     # torch + IPEX + oneCCL on Aurora
-# Create once: python -m venv --system-site-packages, then pip install -e deps. Edit to your env.
+module load frameworks          # torch + oneCCL (NOT ipex: image 26.181.0 dropped it, see ipex_shim)
+# Create once: python -m venv --system-site-packages, then
+#   pip install -r requirements-aurora.txt    <- the two Biohub forks folding needs
+# and confirm with `python -m src.env_check --deep` BEFORE spending a queue slot.
 PLD2_VENV=${PLD2_VENV:-/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env}
 # shellcheck disable=SC1091
 source "${PLD2_VENV}/bin/activate"

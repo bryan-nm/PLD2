@@ -46,6 +46,35 @@ def check(name, fn, required=True, detail=""):
         return False
 
 
+def _esmfold_model_class():
+    """Can EsmFold find the ESMFold2 class at all?  The check job 8883902 needed: the venv rebuild
+    left esmfold_scorer importable and ESMFOLD_WEIGHTS on disk, but nothing providing the model
+    class, so _resolve_model_class() raised an ImportError after a queue slot was already spent.
+    Resolving the class touches no weights and no GPU -- a second on a login node."""
+    import inspect
+    sc = importlib.import_module("esmfold_scorer.scorer")
+    cls = sc.StructureScorer
+    probe = getattr(cls, "_resolve_model_class", None)
+    if probe is None:
+        return "no _resolve_model_class() in this EsmFold build; nothing to probe"
+    # It is a @staticmethod today, so it takes nothing; an instance method would want a self.
+    # Supply one with object.__new__, which skips __init__ -- __init__ pulls the weights onto a
+    # device to answer a question that is purely about which packages are installed.
+    static = isinstance(inspect.getattr_static(cls, "_resolve_model_class"),
+                        (staticmethod, classmethod))
+    args = () if static else (object.__new__(cls),)
+    try:
+        mc = probe(*args)
+    except ImportError as e:
+        # EsmFold's own message here says to install esm, which alone fixes nothing: its
+        # esm.models.esmfold2 branch cannot succeed (3.3.0 does not export EsmFold2Model), so the
+        # Biohub transformers FORK is what actually resolves the class. Say so.
+        raise ImportError(f"{e}  <-- really: pip install -r requirements-aurora.txt "
+                          f"(the Biohub transformers fork; upstream PyPI has no "
+                          f"models/esmfold2)") from None
+    return f"{getattr(mc, '__module__', '?')}.{getattr(mc, '__name__', mc)}"
+
+
 def _esmfold_device_check():
     """Would EsmFold accept device='xpu' here?  Separates the two failures its own error message
     runs together: a missing ipex (which src/ipex_shim.py fixes) from a missing GPU (which it must
@@ -147,24 +176,32 @@ def main():
 
     check("foldseek runs", _foldseek, required=False)
 
-    print("\nfolding (phase 0b, 2) -- the half a broken esm takes down")
+    print("\nfolding (phase 0b, 2) -- no folds means no rewards, so no alignment at all")
     # NOT a cosmetic row. Round 3 lost a 16-node job in two minutes because EsmFold's
     # resolve_device() demands ipex before it will admit an XPU exists, and the image had
     # dropped ipex. On a login node there is no XPU, so this can only report what WILL happen.
     check("ipex shim", lambda: importlib.import_module("src.ipex_shim").status(),
           required=False)
+    # Both of these must be Biohub forks, not PyPI -- see requirements-aurora.txt. Upstream
+    # transformers has no models/esmfold2 at any version, so a plain `pip install transformers`
+    # satisfies this row and still cannot fold.
     check("esm", lambda: importlib.import_module("esm").__version__, required=False)
-    check("transformers", lambda: importlib.import_module("transformers").__version__,
-          required=False)
+    check("transformers (needs the Biohub fork)",
+          lambda: importlib.import_module("transformers").__version__, required=False)
     if a.deep:
         check("esmfold_scorer.StructureScorer",
               lambda: importlib.import_module("esmfold_scorer").StructureScorer and "importable")
         check("esmfold_scorer device check", _esmfold_device_check, required=False)
+        check("esmfold_scorer model class", _esmfold_model_class)
         check("src.filip_guidance (AMPLIFY stack)",
               lambda: importlib.import_module("src.filip_guidance") and "importable",
               required=False)
     else:
-        row(WARN, "esmfold_scorer / filip_guidance", "not checked -- pass --deep")
+        # Be specific about what is being skipped. Job 8883902 died on a model class that only
+        # --deep looks for: esmfold_scorer imported, the weights were on disk, and the one thing
+        # missing from the rebuilt venv surfaced 23 seconds into a queue slot instead of here.
+        row(WARN, "esmfold_scorer / filip_guidance",
+            "not checked -- pass --deep after ANY venv rebuild or image change")
 
     print()
     n_ok = sum(1 for s, _, _ in _rows if s == OK)

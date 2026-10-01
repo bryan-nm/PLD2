@@ -1,0 +1,25 @@
+# Packages that an Aurora venv does NOT get for free, and that a rebuild therefore drops silently.
+#
+#   module load frameworks
+#   python -m venv --system-site-packages $PLD2_VENV && . $PLD2_VENV/bin/activate
+#   python -m pip install -r requirements-aurora.txt
+#   python -m src.env_check --deep          # must end "No required check failed"
+#
+# NOT listed here, on purpose: torch, numpy, and the oneAPI stack. Those come from the frameworks
+# module through --system-site-packages, and pip-installing any of them replaces a build tuned for
+# this machine with a generic wheel. intel_extension_for_pytorch is likewise absent by design as of
+# image 26.181.0 -- XPU support lives in torch now, and src/ipex_shim.py covers the one package
+# that still asks for it by name.
+#
+# WHY THESE TWO ARE PINNED TO FORKS. EsmFold's StructureScorer needs an ESMFold2 model class, and
+# PyPI has no such thing: upstream transformers ships no models/esmfold2, so only Biohub's fork
+# resolves. Its _resolve_model_class() tries the esm package FIRST and that branch cannot succeed
+# -- esm.models.esmfold2 does not export EsmFold2Model in 3.3.0 -- so it falls through to
+# transformers every time. Its ImportError nonetheless tells you to install esm, which alone fixes
+# nothing. transformers is the one that matters; esm is pinned because the known-good environment
+# had it and the wrapper may reach for it elsewhere.
+#
+# Commits, not @main. Job 8883902 burned a queue slot on a venv that had neither, and a floating
+# @main would make the next rebuild a different experiment instead of a repeat of a working one.
+esm @ git+https://github.com/Biohub/esm.git@26b0bc2b771e3e419ea74f445a5f35cc094a1509
+transformers @ git+https://github.com/Biohub/transformers.git@ef32577f55da19a4989cd7b22e004dc43a4998cb
