@@ -134,6 +134,8 @@ export RANK_MIN_RUN=${RANK_MIN_RUN:-30}
 export RANK_HARD=${RANK_HARD:-3}
 FOLD_STALL=${FOLD_STALL:-3}   # consecutive no-progress passes tolerated before escalating
 FOLD_BUDGET=${FOLD_BUDGET:-5400}
+# The tuner gets retries for the same reason folding does -- see the note at phase 5.
+TUNE_TRIES=${TUNE_TRIES:-2}
 
 # Recomputed per round: every path below is derived from it.
 set_round_paths() {
@@ -150,7 +152,7 @@ set_round_paths "${ROUND}"
 
 job_banner "PLD2 preference tuning, round ${ROUND}$([ "${ROUNDS}" -gt 1 ] && echo "..$((ROUND+ROUNDS-1))")" \
            ROUND ROUNDS N_PROMPTS N_GEN GAMMA LOSS ALPHA STEPS \
-           EPOCHS PROMPT_SEED REF_SPLIT PHASES PRUNE WALL_SECONDS RDIR CKPT
+           EPOCHS PROMPT_SEED REF_SPLIT PHASES PRUNE WALL_SECONDS TUNE_TRIES RDIR CKPT
 
 CKPT_FLAG=""; [ -n "${CKPT:-}" ] && CKPT_FLAG="--ckpt ${CKPT}"
 has() { [[ "${PHASES}" == *"$1"* ]]; }
@@ -381,12 +383,32 @@ print(min(${NRANKS}, recommended_ranks(${N_PAIRS}, ${STEPS}, ${EPOCHS}, ppn=${RA
     ALIGN_PPN=$(( ALIGN_RANKS < RANKS_PER_NODE ? ALIGN_RANKS : RANKS_PER_NODE ))
     echo "[align] phase 5/5: ${LOSS} for ${STEPS} steps on ${ALIGN_RANKS}/${NRANKS} ranks"\
          "(${N_PAIRS} pairs, target ${EPOCHS} epochs)"
-    # shellcheck disable=SC2086
-    mpiexec -n "${ALIGN_RANKS}" -ppn "${ALIGN_PPN}" --pmi=pmix --cpu-bind depth -d 8 \
-        python -m src.align --device xpu --dir "${RDIR}" --loss "${LOSS}" \
-        --steps "${STEPS}" --epochs "${EPOCHS}" ${ALPHA:+--alpha ${ALPHA}} \
-        ${CKPT_FLAG} ${ALIGN_ARGS:-}
-    rc=$?
+    # RETRY, BECAUSE ONE RANK SHOULD NOT COST A ROUND. Round 6 of job 8887436 reached step 445
+    # of 500 and then hit a Level Zero runtime abort -- "ur_die: urEventWait must not be called
+    # for an internal event" -- which took rank 4 to SIGABRT and had mpiexec SIGTERM the other 23.
+    # No step-499 checkpoint, so the chain guard below correctly refused to continue, and a
+    # completed hour of generating and folding was thrown away. Folding has had a per-rank
+    # supervisor against this same class of fault since round 2; the tuner had nothing. A retry
+    # restarts cleanly from CKPT -- pairs.jsonl is already on disk and deterministic -- and costs
+    # ~550s against the ~3,600s round it saves.
+    for (( attempt = 1; attempt <= TUNE_TRIES; attempt++ )); do
+        # shellcheck disable=SC2086
+        mpiexec -n "${ALIGN_RANKS}" -ppn "${ALIGN_PPN}" --pmi=pmix --cpu-bind depth -d 8 \
+            python -m src.align --device xpu --dir "${RDIR}" --loss "${LOSS}" \
+            --steps "${STEPS}" --epochs "${EPOCHS}" ${ALPHA:+--alpha ${ALPHA}} \
+            ${CKPT_FLAG} ${ALIGN_ARGS:-}
+        rc=$?
+        # Both conditions: a zero exit with no checkpoint is not a success, and a non-zero exit
+        # that still wrote the final checkpoint does not need redoing.
+        if [ $rc -eq 0 ] && [ -f "${FINAL_CKPT}" ]; then break; fi
+        if [ "${attempt}" -lt "${TUNE_TRIES}" ]; then
+            echo "[align] tune exited ${rc} and ${FINAL_CKPT} is absent;"\
+                 "attempt ${attempt}/${TUNE_TRIES} -- retrying from ${CKPT:-<base>}." >&2
+        else
+            echo "[align] tune exited ${rc} after ${TUNE_TRIES} attempt(s);"\
+                 "the chain guard below decides whether to continue." >&2
+        fi
+    done
     phase "r${r}-5-tune" $t0
 fi
 
