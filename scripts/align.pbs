@@ -263,7 +263,22 @@ for (( r = ROUND; r <= LAST_ROUND; r++ )); do
   ROUND_T0=$SECONDS
 
 # --- phase 0: the reference set, then the prompts ------------------------------------------------
-if has 0; then
+# IDEMPOTENT, BECAUSE REDOING IT HALFWAY IS WORSE THAN NOT REDOING IT. The reference artifacts are
+# append-only (reffolds.rankNNN.jsonl, refpdb/index.rankNNN.jsonl), so a second pass over a round
+# that already has them folds into the same files and mixes two reference sets -- which is exactly
+# how the resume of round 6 ended up with 2,870 records for 1,483 references. prompts.jsonl is the
+# honest completion marker: src/prompts.py writes it last, atomically, and only after every earlier
+# artifact it depends on resolved. If it is there with the right number of rows, phase 0 is done.
+PROMPTS_DONE=0
+if [ -f "${RDIR}/prompts.jsonl" ]; then
+    HAVE_P=$(wc -l < "${RDIR}/prompts.jsonl" | tr -d " ")
+    [ "${HAVE_P}" -ge "${N_PROMPTS}" ] && PROMPTS_DONE=1
+fi
+if has 0 && [ "${PROMPTS_DONE}" -eq 1 ]; then
+    echo "[align] phase 0/5: ${RDIR}/prompts.jsonl already has ${HAVE_P} prompts; skipping."\
+         "Delete the round's refs*/reffolds*/refpdb/prompts.jsonl to force a rebuild."
+fi
+if has 0 && [ "${PROMPTS_DONE}" -eq 0 ]; then
     t0=$SECONDS
     # SIZED, NOT MULTIPLIED. A reference yields at most one prompt, the eval holdout is carved out
     # before any prompt is built, and ~15% of references fail ref_min_plddt -- so N_REFS has to
@@ -276,8 +291,16 @@ if has 0; then
     # overlap by chance -- ~80 of 1,483 between any two draws from a ~28k split, and it compounds
     # over ten rounds. A round that re-scaffolds proteins an earlier round already trained on is
     # not the fresh prompt set on-policy data is supposed to be.
+    # FROM 1, NOT FROM ${ROUND}. This loop used to start at the JOB's first round, which made a
+    # round's reference draw depend on which submission produced it. Job 8887436 ran ROUND=3, so
+    # round 6 excluded rounds 3-5; the resume ran ROUND=6, excluded nothing, and `select` returned
+    # a DIFFERENT 1,483 proteins for the same seed. Phase 0/5b then folded the 1,387 it had no
+    # record of into an append-only directory (2,870 records for 1,483 references), 0/5c typed the
+    # old structures, and only the 96 proteins common to both draws survived with a 3Di track --
+    # which is how a resume exited on "n_eval=200 but only 86 references". The missing [ -f ] test
+    # below is what tolerates gaps, so scanning from 1 costs nothing when a round is absent.
     EXCL=""
-    for (( q = ROUND; q < r; q++ )); do
+    for (( q = 1; q < r; q++ )); do
         QDIR=$(python -c "from config import CFG; CFG.align.round=$q; print(CFG.align.round_dir)")
         [ -f "${QDIR}/refs.meta.jsonl" ] && EXCL="${EXCL}${EXCL:+:}${QDIR}/refs.meta.jsonl"
     done
@@ -289,7 +312,11 @@ if has 0; then
     fold_loop "${REF_FOLDS}" "${REF_PDB_DIR}" "" "${RDIR}/refs.fasta"
 
     echo "[align] phase 0/5c: foldseek 3Di off the reference structures"
-    python -m src.reference_set join --dir "${RDIR}" || exit 1
+    # --refresh IS REQUIRED HERE. join() reuses refs.3di.tsv whenever the file exists, which is
+    # right for a hand re-run and wrong for the pipeline: phase 0/5b has just written structures,
+    # so a cached table describes the previous ones. Reusing it is the second half of the failure
+    # above -- the stale table typed a reference set that no longer existed.
+    python -m src.reference_set join --dir "${RDIR}" --refresh || exit 1
 
     echo "[align] phase 0/5d: ${N_PROMPTS} partial-scaffold prompts (seed ${PROMPT_SEED_R})"
     python -m src.prompts --dir "${RDIR}" --n "${N_PROMPTS}" --seed "${PROMPT_SEED_R}" || exit 1
