@@ -845,6 +845,60 @@ check("fold_fasta scopes the shim to the esmfold_scorer import",
       (lambda src: 0 < src.index("ipex_shim.only_for_import")
        < src.index("from esmfold_scorer import"))(open("src/fold_fasta.py").read()))
 
+# ------------------------------------------------- 19. per-mask-rate stats
+# THE POOLED ROW CANNOT ANSWER THE QUESTION IT LOOKS LIKE IT ANSWERS. Prompts are stratified over
+# mask rates 0.5/0.7/0.85/1.0, so a round's pLDDT averages four different tasks -- and a pooled
+# gain is consistent with cold start (rate 1.0, no scaffold) standing still while the 50%-masked
+# bin improves. That would be the alignment buying the easy half of the distribution. These pin
+# that bin_stats separates the bins and that the flat-cold-start pattern is actually detectable.
+from src.preference import bin_stats as _bs
+
+_ACFG = CFG_ALIGN
+
+
+def _samp(pid, b, rate, plddt, tm, deg=0.0):
+    return {"pid": pid, "bin": b, "rate": rate, "plddt": plddt, "ptm": plddt - 0.05,
+            "tm": tm, "deg": deg, "lcr": deg, "k13": 0.0, "L": 250}
+
+
+# Two rounds: the three scaffolded bins gain, cold start does not.
+def _round_pool(gain):
+    pool = {}
+    for b, rate in ((0, 0.5), (1, 0.7), (2, 0.85), (3, 1.0)):
+        g = 0.0 if rate >= 1.0 else gain
+        for i in range(10):
+            pid = f"p{b}{i}"
+            pool[pid] = [_samp(pid, b, rate, 0.70 + g, 0.60 + g) for _ in range(4)]
+    return pool
+
+
+_b0, _b1 = _bs(_round_pool(0.0), _ACFG), _bs(_round_pool(0.10), _ACFG)
+check("bin_stats returns one row per bin, easiest first",
+      [r["bin"] for r in _b0] == [0, 1, 2, 3] and [r["rate"] for r in _b0] == [0.5, 0.7, 0.85, 1.0])
+check("every sample is counted exactly once",
+      sum(r["n"] for r in _b0) == sum(len(v) for v in _round_pool(0.0).values()))
+check("prompts are counted per bin, not pooled", all(r["prompts"] == 10 for r in _b0))
+check("cold_start marks rate 1.0 and nothing else",
+      [r["cold_start"] for r in _b0] == [False, False, False, True])
+check("per-bin pLDDT is that bin's mean, not the pooled one",
+      abs(_b0[0]["plddt"] - 0.70) < 1e-9 and abs(_b1[0]["plddt"] - 0.80) < 1e-9)
+
+# The point of the whole exercise: scaffolded bins move, cold start does not, and the POOLED
+# number rises anyway -- so only the split distinguishes the two explanations.
+_d = [b["reward"] - a["reward"] for a, b in zip(_b0, _b1)]
+check("the split sees the scaffolded bins gain", all(x > 0.15 for x in _d[:3]), f"{_d[:3]}")
+check("...and sees cold start flat", abs(_d[3]) < 1e-9, f"{_d[3]:+.4f}")
+_pooled = [sum(r["reward"] * r["n"] for r in bb) / sum(r["n"] for r in bb) for bb in (_b0, _b1)]
+check("...while the POOLED reward rises, which is the trap",
+      _pooled[1] - _pooled[0] > 0.10, f"pooled {_pooled[0]:.3f} -> {_pooled[1]:.3f}")
+
+check("a bin with no samples is omitted rather than reported as zero",
+      len(_bs({k: v for k, v in _round_pool(0.0).items() if not k.startswith("p3")}, _ACFG)) == 3)
+check("report.json carries by_bin so future rounds need no recompute",
+      '"by_bin": bin_stats(pool, acfg)' in open("src/preference.py").read())
+check("round_summary can split by bin without report.json",
+      "not rows and not a.by_bin" in open("src/round_summary.py").read())
+
 print(f"\n{checks - len(fails)}/{checks} checks pass")
 if fails:
     print("FAILURES:")

@@ -87,6 +87,39 @@ def load_pool(rdir, folds=None):
     return dict(pool), len(gen), len(fold), len(tm)
 
 
+def bin_stats(pool, acfg):
+    """Per mask-rate bin: what the model actually produced.  -> list of dicts, easiest rate first.
+
+    THE POOLED NUMBERS HIDE THE QUESTION. A round's prompts are stratified over mask rates
+    0.5/0.7/0.85/1.0, and the pooled pLDDT is an average over four quite different tasks. Rate 1.0
+    is cold start -- no scaffold, the model writes the whole chain -- and it is both the hardest
+    bin and the one that says whether the policy has learned to design rather than to inpaint. A
+    pooled gain is consistent with cold start standing still while the 50%-masked bin improves,
+    which would be the alignment buying the easy half of the distribution.
+
+    Bins come from the prompt manifest via the generation records, so this needs nothing on disk
+    that load_pool() has not already joined.
+    """
+    out = []
+    for b in sorted({x["bin"] for xs in pool.values() for x in xs}):
+        sel = [x for xs in pool.values() for x in xs if x["bin"] == b]
+        if not sel:
+            continue
+        pids = {x["pid"] for x in sel}
+        out.append({
+            "bin": int(b), "rate": float(sel[0]["rate"]), "n": len(sel), "prompts": len(pids),
+            "cold_start": bool(sel[0]["rate"] >= 1.0),
+            "plddt": float(np.mean([x["plddt"] for x in sel])),
+            "ptm": float(np.mean([x["ptm"] for x in sel])),
+            "tm": float(np.mean([x["tm"] for x in sel])),
+            "reward": float(np.mean([score(x, acfg) for x in sel])),
+            "success_rate": float(np.mean([succeeded(x, acfg) for x in sel])),
+            "above_deg_gate": float(np.mean([x["deg"] > acfg.deg_max_winner for x in sel])),
+            "len": float(np.mean([x["L"] for x in sel])),
+        })
+    return out
+
+
 def degeneracy_of(seq, k=None):
     """(LCR fraction, k-mer repeat coverage) for one sequence. ~0.12 ms, so ~2s a round.
 
@@ -452,11 +485,24 @@ def main():
           f"{'  (OFF)' if acfg.success_weight == 1.0 else ''}")
     print(f"[pref] mean reward gap {np.mean([p['gap'] for p in pairs]):.3f}, "
           f"median {np.median([p['gap'] for p in pairs]):.3f}")
+    # PAIRS PER BIN, THEN QUALITY PER BIN. The first says where the training signal comes from;
+    # the second says whether the pooled gain is real at the rate that matters.
     for b in sorted({p["bin"] for p in pairs}):
         sel = [p for p in pairs if p["bin"] == b]
         print(f"[pref]   mask rate {sel[0]['rate']:<5} {len(sel):>7,} pairs "
               f"({len(sel) / len(pairs):5.1%})"
               + ("   <- cold start" if sel[0]["rate"] >= 1.0 else ""))
+    bs = bin_stats(pool, acfg)
+    if len(bs) > 1:
+        print(f"[pref] generation quality BY MASK RATE -- the pooled row above averages these "
+              f"four different tasks:")
+        print(f"[pref]   {'rate':<6}{'n':>7} {'pLDDT':>7} {'pTM':>7} {'TM':>7} {'reward':>8}"
+              f" {'success':>8} {'gate%':>7} {'len':>6}")
+        for r_ in bs:
+            print(f"[pref]   {r_['rate']:<6}{r_['n']:>7,} {r_['plddt']:>7.3f} {r_['ptm']:>7.3f} "
+                  f"{r_['tm']:>7.3f} {r_['reward']:>8.3f} {r_['success_rate']:>7.1%} "
+                  f"{r_['above_deg_gate']:>6.1%} {r_['len']:>6.0f}"
+                  + ("   <- cold start" if r_["cold_start"] else ""))
     print(f"[pref] wrote {out}", flush=True)
 
     # A MACHINE-READABLE ROW PER ROUND, so a chain of them can be read as a curve instead of by
@@ -479,6 +525,9 @@ def main():
         "prompts_gated_out": n_gated,
         "winner_success_frac": n_succ_w / max(len(pairs), 1),
         "reward_deg": acfg.reward_deg, "deg_max_winner": acfg.deg_max_winner,
+        # Per bin, so a chain of rounds can be read as four curves instead of one average. The
+        # pooled row above cannot distinguish "cold start improved" from "inpainting improved".
+        "by_bin": bin_stats(pool, acfg),
     }
     rp = os.path.join(rdir, "report.json")
     tmp = rp + ".tmp"
