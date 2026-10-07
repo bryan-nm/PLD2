@@ -77,11 +77,12 @@ def bins_for(d):
         return [], f"{type(e).__name__}: {e}"
 
 
-def print_by_bin(dirs_rows):
+def print_by_bin(dirs_rows, cache=None):
     """One block per mask rate, each a round-over-round curve."""
+    cache = cache or {}
     per_round = []
     for name, d in dirs_rows:
-        by, src = bins_for(d)
+        by, src = (cache[name], "cached") if name in cache else bins_for(d)
         if by:
             per_round.append((name, by))
         else:
@@ -93,20 +94,27 @@ def print_by_bin(dirs_rows):
         cold = rate >= 1.0
         print(f"\n  mask rate {rate}{'   <- COLD START (no scaffold)' if cold else ''}")
         print(f"  {'round':<8} {'n':>7} {'reward':>8} {'d rew':>8} {'pLDDT':>7} {'pTM':>7} "
-              f"{'TM':>7} {'success':>8} {'gate%':>7} {'len':>6}")
-        print("  " + "-" * 80)
+              f"{'pTM>.5':>7} {'TM':>7} {'success':>8} {'gate%':>7} {'len':>6}")
+        print("  " + "-" * 88)
         prev = None
         for name, by in per_round:
             r = next((x for x in by if x["rate"] == rate), None)
             if r is None:
                 continue
             d = f"{r['reward'] - prev:+8.4f}" if prev is not None else " " * 8
+            pc = r.get("ptm_confident")
+            pcs = f"{pc:>6.1%}" if pc is not None else " " * 7
             print(f"  {name:<8} {r['n']:>7,} {r['reward']:>8.4f} {d} {r['plddt']:>7.3f} "
-                  f"{r['ptm']:>7.3f} {r['tm']:>7.3f} {r['success_rate']:>7.1%} "
+                  f"{r['ptm']:>7.3f} {pcs} {r['tm']:>7.3f} {r['success_rate']:>7.1%} "
                   f"{r['above_deg_gate']:>6.1%} {r['len']:>6.0f}")
             prev = r["reward"]
     print("\n[bins] Read the cold-start block against the others. If its reward curve is flat "
           "while the\n[bins] lower rates climb, the pooled gain is inpainting, not design.")
+    print("[bins] TM vs pTM: TM is foldseek against the prompt's reference -- the RIGHT fold. pTM "
+          "is\n[bins] ESMFold's own topology estimate, no reference involved. At rate 1.0 the "
+          "prompt gives\n[bins] only the length, so TM is pinned at the unrelated-fold floor by "
+          "construction and pTM is\n[bins] the only one of the two that can move. Only TM is in "
+          "the reward.")
 
 
 def main():
@@ -130,20 +138,46 @@ def main():
         print(f"[rounds] no round*/report.json under {a.dir}; the pooled table needs it. "
               f"Going straight to the per-bin split, which does not.")
 
+    # --by-bin recomputes the whole round anyway, so when it runs it can also backfill pooled
+    # pTM for rounds written before report.json carried it. Without it, those cells stay blank
+    # rather than being silently filled with something that is not what the round measured.
+    bins_by_round = {}
+    if a.by_bin:
+        for d in dirs:
+            by, _ = bins_for(d)
+            if by:
+                bins_by_round[os.path.basename(d)] = by
+
     if rows:
-        print_pooled(rows)
+        print_pooled(rows, bins_by_round)
 
     if a.by_bin:
-        print_by_bin([(os.path.basename(d), d) for d in dirs])
+        print_by_bin([(os.path.basename(d), d) for d in dirs], bins_by_round)
 
     if len(rows) > 1:
         print_trend(rows)
 
 
-def print_pooled(rows):
-    print(f"\n{'round':<8} {'reward':>8} {'d rew':>8} {'success':>8} {'pLDDT':>7} {'TM':>7} "
-          f"{'sigma':>7} {'gate%':>7} {'pairs':>7} {'nat dNLL':>9} {'h fin':>8}")
-    print("-" * 92)
+def pooled_ptm(name, rep, bins_by_round):
+    """Mean pTM for a round: from report.json, else weighted from the per-bin rows, else None.
+
+    The two routes agree by construction -- bin_stats and the pooled block average the same
+    samples -- so the weighted fallback is exact, not an approximation.
+    """
+    if rep.get("ptm") is not None:
+        return rep["ptm"]
+    by = bins_by_round.get(name)
+    if not by:
+        return None
+    tot = sum(r["n"] for r in by)
+    return sum(r["ptm"] * r["n"] for r in by) / tot if tot else None
+
+
+def print_pooled(rows, bins_by_round=None):
+    bins_by_round = bins_by_round or {}
+    print(f"\n{'round':<8} {'reward':>8} {'d rew':>8} {'success':>8} {'pLDDT':>7} {'pTM':>7} "
+          f"{'TM':>7} {'sigma':>7} {'gate%':>7} {'pairs':>7} {'nat dNLL':>9} {'h fin':>8}")
+    print("-" * 100)
     prev = None
     for name, r in rows:
         rep, met = r["rep"], r.get("met", {})
@@ -152,8 +186,10 @@ def print_pooled(rows):
         base = met.get("nat_nll_baseline")
         dn = f"{nat - base:+9.4f}" if (nat is not None and base is not None) else " " * 9
         hf = met.get("h_final")
+        pt = pooled_ptm(name, rep, bins_by_round)
+        pts = f"{pt:>7.3f}" if pt is not None else " " * 7
         print(f"{name:<8} {rep['reward']:>8.4f} {d} {rep['success_rate']:>7.2%} "
-              f"{rep['plddt']:>7.3f} {rep['tm']:>7.3f} {rep['within_prompt_sigma']:>7.4f} "
+              f"{rep['plddt']:>7.3f} {pts} {rep['tm']:>7.3f} {rep['within_prompt_sigma']:>7.4f} "
               f"{rep['above_deg_gate']:>6.1%} {rep['pairs']:>7,} {dn} "
               f"{(f'{hf:+8.4f}' if hf is not None else ' ' * 8)}")
         prev = rep["reward"]

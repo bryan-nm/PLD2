@@ -894,6 +894,27 @@ check("...while the POOLED reward rises, which is the trap",
 
 check("a bin with no samples is omitted rather than reported as zero",
       len(_bs({k: v for k, v in _round_pool(0.0).items() if not k.startswith("p3")}, _ACFG)) == 3)
+# pTM is NOT the reward's TM. tm = foldseek against the prompt's reference (the right fold);
+# ptm = ESMFold's own topology estimate (no reference). They diverge exactly at cold start, where
+# the prompt reveals only the length, so pinning both into the row is what lets the cold-start
+# bin be scored at all. These also pin the backfill, since rounds 1-10's report.json predates it.
+from src.round_summary import pooled_ptm as _pp
+
+_bb = _bs(_round_pool(0.0), _ACFG)
+check("bin_stats reports pTM separately from TM",
+      all(abs(r["ptm"] - (r["plddt"] - 0.05)) < 1e-9 for r in _bb)
+      and all(r["tm"] != r["ptm"] for r in _bb))
+check("...and the fraction of confident pTM", all("ptm_confident" in r for r in _bb))
+check("pooled_ptm prefers report.json when it has ptm",
+      _pp("round3", {"ptm": 0.321}, {"round3": _bb}) == 0.321)
+_exp = sum(r["ptm"] * r["n"] for r in _bb) / sum(r["n"] for r in _bb)
+check("...and backfills an n-weighted mean from the bins when it does not",
+      abs(_pp("round3", {}, {"round3": _bb}) - _exp) < 1e-12)
+check("...and reports nothing rather than guessing when neither is available",
+      _pp("round3", {}, {}) is None)
+check("report.json carries ptm, so future rounds need no backfill",
+      '"ptm": float(np.mean([x["ptm"] for x in allg]))' in open("src/preference.py").read())
+
 check("report.json carries by_bin so future rounds need no recompute",
       '"by_bin": bin_stats(pool, acfg)' in open("src/preference.py").read())
 check("round_summary can split by bin without report.json",

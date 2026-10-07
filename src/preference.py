@@ -111,6 +111,7 @@ def bin_stats(pool, acfg):
             "cold_start": bool(sel[0]["rate"] >= 1.0),
             "plddt": float(np.mean([x["plddt"] for x in sel])),
             "ptm": float(np.mean([x["ptm"] for x in sel])),
+            "ptm_confident": float(np.mean([x["ptm"] > CFG.opt.ptm_confident for x in sel])),
             "tm": float(np.mean([x["tm"] for x in sel])),
             "reward": float(np.mean([score(x, acfg) for x in sel])),
             "success_rate": float(np.mean([succeeded(x, acfg) for x in sel])),
@@ -516,6 +517,15 @@ def main():
         "per_prompt": float(np.mean(ns)), "min_per_prompt": int(min(ns)),
         "success_rate": float(np.mean([succeeded(x, acfg) for x in allg])),
         "plddt": float(np.mean([x["plddt"] for x in allg])),
+        # pTM IS NOT tm. `tm` is foldseek TM-align against the prompt's reference structure --
+        # did it build the RIGHT fold. `ptm` is ESMFold's own estimate of whether the chain has a
+        # coherent global topology at all, with no reference involved. They come apart exactly
+        # where it matters: at mask rate 1.0 the prompt reveals nothing but the length, so `tm`
+        # is pinned at the unrelated-fold floor by construction while `ptm` is free to move -- and
+        # over rounds 1-10 it moved 0.209 -> 0.447. Only `tm` is in the reward; `ptm` is the
+        # metric that can score the cold-start bin, so it belongs in the per-round row.
+        "ptm": float(np.mean([x["ptm"] for x in allg])),
+        "ptm_confident": float(np.mean([x["ptm"] > CFG.opt.ptm_confident for x in allg])),
         "tm": float(np.mean([x["tm"] for x in allg])),
         "reward": float(np.mean([score(x, acfg) for x in allg])),
         "within_prompt_sigma": float(np.mean(
