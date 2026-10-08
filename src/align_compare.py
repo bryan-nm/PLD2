@@ -169,8 +169,10 @@ def main():
     if not rows:
         raise SystemExit("nothing to compare")
     k = a.k
+    from src.preference import reward_formula
     print(f"\nGENERATION on the held-out prompts   (best-of-{k}; success = pLDDT > "
-          f"{acfg.plddt_success} AND {acfg.tm_field} > {acfg.tm_success})")
+          f"{acfg.plddt_success} AND pTM > {acfg.ptm_success} -- reference-free on purpose)")
+    print(f"reward = {reward_formula(acfg)}")
     print(f"{'variant':<10} {'prompts':>7} {'draw%':>7} {'pLDDT':>7} {'TM':>7} {'reward':>7} "
           f"{'LCR':>7} {'k13':>7} {'oracle@'+str(k):>9} {'plddt@'+str(k):>9} {'logl@'+str(k):>9} "
           f"{'gap':>8}")

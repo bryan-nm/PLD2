@@ -136,11 +136,42 @@ def degeneracy_of(seq, k=None):
     return lcr / max(tot, 1), c[k]["rep_pos"] / max(c[k]["n_pos"], 1)
 
 
+def struct_weights(s, acfg):
+    """-> (w_TM, w_pTM) for one sample, summing to acfg.reward_struct.
+
+    The split is the sample's own mask rate: at 0.5 the scaffold supplies half the structure and
+    TM is a real target; at 1.0 nothing links the generation to its nominal reference, so the
+    whole weight goes to the reference-free estimate. A sample with no recorded rate -- anything
+    generated before prompts carried one -- falls back to all-TM, which is the old behaviour.
+    """
+    if not acfg.reward_blend:
+        return acfg.reward_tm, 0.0
+    rate = float(s.get("rate", 0.0))
+    return acfg.reward_struct * (1.0 - rate), acfg.reward_struct * rate
+
+
 def score(s, acfg):
     """The RANKING reward. Its magnitude never reaches the loss -- DPO and IPO treat preference as
-    binary -- so this only has to order samples within a prompt correctly."""
-    return (acfg.reward_plddt * s["plddt"] + acfg.reward_tm * s["tm"]
+    binary -- so this only has to order samples within a prompt correctly. Pairs are built WITHIN
+    a prompt, so a rate-dependent reward introduces no cross-bin comparison: every pair it orders
+    shares one mask rate, hence one set of weights."""
+    w_tm, w_ptm = struct_weights(s, acfg)
+    return (acfg.reward_plddt * s["plddt"] + w_tm * s["tm"] + w_ptm * s.get("ptm", 0.0)
             - acfg.reward_deg * s.get("deg", 0.0))
+
+
+def reward_formula(acfg, rate=None):
+    """The reward as a readable string, for banners. A table that does not say which reward it
+    used cannot be compared with one that used another."""
+    if not acfg.reward_blend:
+        return (f"{acfg.reward_plddt}*pLDDT + {acfg.reward_tm}*TM "
+                f"- {acfg.reward_deg}*max(LCR, k{acfg.deg_kmer_k})")
+    if rate is None:
+        return (f"{acfg.reward_plddt}*pLDDT + {acfg.reward_struct}*[(1-rate)*TM + rate*pTM] "
+                f"- {acfg.reward_deg}*max(LCR, k{acfg.deg_kmer_k})")
+    w_tm, w_ptm = acfg.reward_struct * (1 - rate), acfg.reward_struct * rate
+    return (f"{acfg.reward_plddt}*pLDDT + {w_tm:.2f}*TM + {w_ptm:.2f}*pTM "
+            f"- {acfg.reward_deg}*max(LCR, k{acfg.deg_kmer_k})")
 
 
 def eligible_winner(s, acfg):
@@ -155,7 +186,29 @@ def eligible_winner(s, acfg):
 
 
 def succeeded(s, acfg):
-    return s["plddt"] > acfg.plddt_success and s["tm"] > acfg.tm_success
+    """The ABSOLUTE bar: pLDDT > plddt_success AND pTM > ptm_success. NO reference to TM, at any
+    mask rate.
+
+    THIS IS A DIFFERENT QUESTION FROM THE REWARD, deliberately. The reward ranks completions
+    WITHIN one prompt, so where the scaffold makes the target informative it should still ask
+    "did you rebuild this fold" -- which is why TM keeps its (1-rate) weight there. Success is an
+    ABSOLUTE bar, and the thing it should certify is "this is a well-formed protein", not "this
+    reproduced one particular SwissProt entry".
+
+    The case that settles it: at a mask rate of 0.85 with no guidance applied, a model that writes
+    a sequence folding into a coherent structure that is NOT the reference has done its job. The
+    reference is one sample from the space of folds compatible with that scaffold, not the only
+    acceptable answer, and penalising the difference would be scoring memorisation.
+
+    It also fixes what the old bar got wrong. pLDDT > 0.7 AND TM > 0.5 was met by 0.2-0.8% of
+    cold-start generations in every one of eleven rounds -- a bar nothing could clear, which is
+    why success_weight has been wired and switched OFF since the start. Against pTM, cold start
+    sits in the mid-20s to low-30s of a percent and the knob becomes usable.
+
+    Missing pTM reads as failure rather than falling back to TM: every record src/fold_fasta.py
+    writes carries one, so its absence is a data problem and should look like one.
+    """
+    return s["plddt"] > acfg.plddt_success and s.get("ptm", 0.0) > acfg.ptm_success
 
 
 # --------------------------------------------------------------------------------------
@@ -209,10 +262,11 @@ def report(pool, acfg, max_k=None, coverage=0.25):
         print(f"[pref] {short:,} prompt(s) ({short / len(pids):.0%}) have fewer than {n_max} "
               f"generations, so the best-of-n ceiling this round aims at is really best-of-"
               f"{np.mean(ns):.1f}. That is folding coverage, not generation.")
-    print(f"[pref] success = pLDDT > {acfg.plddt_success} AND {acfg.tm_field} > {acfg.tm_success}"
+    print(f"[pref] success = pLDDT > {acfg.plddt_success} AND pTM > {acfg.ptm_success} "
+          f"(NO TM: a coherent fold that is not the reference is still a good protein)"
           f"  ->  per-draw rate {np.mean(succ):.3%}")
-    print(f"[pref] reward = {acfg.reward_plddt}*pLDDT + {acfg.reward_tm}*TM "
-          f"- {acfg.reward_deg}*max(LCR, k{acfg.deg_kmer_k}) | winner gate: degeneracy <= "
+    print(f"[pref] reward = {reward_formula(acfg)} "
+          f"| winner gate: degeneracy <= "
           f"{acfg.deg_max_winner:.0%} ({np.mean([s['deg'] > acfg.deg_max_winner for s in all_s]):.1%} "
           f"of generations are above it)")
     print(f"[pref] pLDDT {np.mean([s['plddt'] for s in all_s]):.3f}"

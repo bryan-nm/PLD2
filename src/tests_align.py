@@ -159,7 +159,9 @@ check("IPO is minimised at the margin",
 
 # ---------------------------------------------------------------- 6. pairing
 class _P:
-    reward_plddt = reward_tm = 1.0
+    reward_plddt = reward_tm = reward_struct = 1.0
+    reward_blend = True
+    ptm_success = 0.5
     reward_deg = 0.0                  # this section tests the rank/matched geometry alone
     deg_max_winner, deg_kmer_k = 1.0, 13
     plddt_success, tm_success = 0.7, 0.5
@@ -362,7 +364,9 @@ check("sign test is nan when nothing differs", sign_test(0, 0) != sign_test(0, 0
 
 
 class _R:
-    reward_plddt = reward_tm = 1.0
+    reward_plddt = reward_tm = reward_struct = 1.0
+    reward_blend = True
+    ptm_success = 0.5
     reward_deg = 0.0
 
 
@@ -438,7 +442,9 @@ from src.preference import (build_pairs, clean_pairs, degeneracy_of, eligible_wi
 
 
 class _D:
-    reward_plddt = reward_tm = 1.0
+    reward_plddt = reward_tm = reward_struct = 1.0
+    reward_blend = True
+    ptm_success = 0.5
     reward_deg = 0.5
     deg_max_winner = 0.15
     deg_kmer_k = 13
@@ -465,10 +471,10 @@ check("degeneracy_of catches a repeat LCR cannot see",
       f"{degeneracy_of(_rep20)}")
 
 # the exact shape of the round 1 failure: the degenerate sample has the best pLDDT
-_deg = {"gid": "d", "plddt": 0.90, "tm": 0.20, "deg": 0.60, "seq": "A" * 200}
-_ok = {"gid": "c", "plddt": 0.70, "tm": 0.30, "deg": 0.02, "seq": "ACDE" * 50}
-_mid = {"gid": "m", "plddt": 0.68, "tm": 0.25, "deg": 0.05, "seq": "ACDF" * 50}
-_bad = {"gid": "b", "plddt": 0.30, "tm": 0.10, "deg": 0.03, "seq": "ACDG" * 50}
+_deg = {"gid": "d", "plddt": 0.90, "tm": 0.20, "ptm": 0.30, "deg": 0.60, "seq": "A" * 200}
+_ok = {"gid": "c", "plddt": 0.70, "tm": 0.30, "ptm": 0.60, "deg": 0.02, "seq": "ACDE" * 50}
+_mid = {"gid": "m", "plddt": 0.68, "tm": 0.25, "ptm": 0.55, "deg": 0.05, "seq": "ACDF" * 50}
+_bad = {"gid": "b", "plddt": 0.30, "tm": 0.10, "ptm": 0.20, "deg": 0.03, "seq": "ACDG" * 50}
 check("the degeneracy gate refuses a repetitive winner", not eligible_winner(_deg, _D))
 check("...and admits a clean one", eligible_winner(_ok, _D))
 _D.reward_deg = 0.0
@@ -500,6 +506,16 @@ check("build_pairs never promotes a gated sample",
       all(p["w"]["deg"] <= _D.deg_max_winner for p in _pairs))
 check("build_pairs reports pairs, winner-successes and gated prompts",
       isinstance(_ns, int) and isinstance(_ng, int))
+# The winner-success count drives success_weight, so it has to track the BAR and not just be an
+# int. Under the old pLDDT-and-TM bar this was 0 for every cold-start pool, which is why the knob
+# was never usable; a clean winner clearing pLDDT and pTM must now register.
+_win = {"gid": "w", "plddt": 0.85, "tm": 0.05, "ptm": 0.70, "deg": 0.01, "seq": "ACDE" * 50}
+_lose = {"gid": "l", "plddt": 0.40, "tm": 0.05, "ptm": 0.20, "deg": 0.01, "seq": "ACDF" * 50}
+_, _ns_hi, _ = build_pairs({"q0": [dict(_win, **_meta), dict(_lose, **_meta)]}, _D)
+check("a winner over the reference-free bar counts as a success", _ns_hi == 1, f"{_ns_hi}")
+_, _ns_lo, _ = build_pairs(
+    {"q1": [dict(_win, ptm=0.40, **_meta), dict(_lose, **_meta)]}, _D)
+check("...and one under it does not, even with TM irrelevant", _ns_lo == 0, f"{_ns_lo}")
 _allgated, _, _ng2 = build_pairs(
     {"p1": [dict(_deg, gid="z1", **_meta), dict(_deg, gid="z2", **_meta)]}, _D)
 check("a prompt with nothing promotable is dropped, not forced",
@@ -986,6 +1002,97 @@ _sh.rmtree(_fd2, ignore_errors=True)
 _rs = open("src/round_summary.py").read()
 check("round_summary explains an omitted round instead of dropping it",
       "no report.json --" in _rs and "PHASES=" in _rs)
+
+# ------------------------------------------------- 21. the rate-weighted reward and bar
+# TM is foldseek against the prompt's reference; at a mask rate of 1.0 the prompt reveals only the
+# length, so across eleven rounds TM sat at 0.245-0.261 (sd 0.006) while pTM went 0.209 -> 0.447.
+# A third of every round's pairs were ranked on pLDDT and degeneracy alone. These pin the split,
+# the invariant that makes it safe, and the ONE case that rules out thresholding the blend.
+from src.preference import reward_formula as _rf, score as _sc, struct_weights as _sw
+from src.preference import succeeded as _ok
+
+_A = CFG_ALIGN
+
+
+def _s(rate, plddt=0.75, tm=0.8, ptm=0.6, deg=0.0):
+    return {"plddt": plddt, "tm": tm, "ptm": ptm, "deg": deg, "rate": rate}
+
+
+check("the structural weights are the mask rate, split",
+      all(abs(_sw(_s(r), _A)[0] - _A.reward_struct * (1 - r)) < 1e-12
+          and abs(_sw(_s(r), _A)[1] - _A.reward_struct * r) < 1e-12
+          for r in (0.5, 0.7, 0.85, 1.0)))
+check("...and always sum to reward_struct, so the reward stays on ONE scale across bins",
+      all(abs(sum(_sw(_s(r), _A)) - _A.reward_struct) < 1e-12 for r in (0.5, 0.7, 0.85, 1.0)))
+check("cold start puts the whole structural weight on pTM and none on TM",
+      _sw(_s(1.0), _A) == (0.0, _A.reward_struct))
+check("...so TM cannot move a cold-start score at all",
+      _sc(_s(1.0, tm=0.0), _A) == _sc(_s(1.0, tm=1.0), _A))
+check("...while pTM can", _sc(_s(1.0, ptm=0.9), _A) > _sc(_s(1.0, ptm=0.1), _A))
+check("at rate 0.5 both still count",
+      _sc(_s(0.5, tm=0.9), _A) > _sc(_s(0.5, tm=0.1), _A)
+      and _sc(_s(0.5, ptm=0.9), _A) > _sc(_s(0.5, ptm=0.1), _A))
+# A sample with no rate -- anything from before prompts carried one -- must score as it used to.
+check("a sample with no rate falls back to the old all-TM reward",
+      abs(_sc({"plddt": 0.7, "tm": 0.6, "ptm": 0.1, "deg": 0.0}, _A)
+          - (_A.reward_plddt * 0.7 + _A.reward_tm * 0.6)) < 1e-12)
+
+
+class _Legacy:
+    reward_plddt = reward_tm = reward_struct = 1.0
+    reward_blend = False
+    reward_deg = 0.5
+    deg_kmer_k = 13
+    plddt_success, tm_success, ptm_success = 0.7, 0.5, 0.5
+
+
+check("reward_blend=False restores the pre-run-2 reward at every rate",
+      _sw(_s(1.0), _Legacy) == (1.0, 0.0) and _sw(_s(0.5), _Legacy) == (1.0, 0.0))
+check("the formula string names which reward is in force",
+      "rate*pTM" in _rf(_A) and "rate*pTM" not in _rf(_Legacy))
+check("...and resolves per rate for a banner",
+      "0.00*TM" in _rf(_A, 1.0) and "1.00*pTM" in _rf(_A, 1.0))
+
+# THE SUCCESS BAR IS REFERENCE-FREE AT EVERY RATE, and that is a separate decision from the
+# reward. A sequence that folds coherently into something other than the reference has done the
+# job -- the reference is one sample from the folds compatible with that scaffold, not the only
+# acceptable answer. So TM must not appear in the bar anywhere, including where it still carries
+# reward weight. The bar and the reward asking different questions is the point, not an oversight.
+check("success ignores TM at EVERY rate, however extreme",
+      all(_ok(_s(r, tm=0.0, ptm=0.6), _A) is True for r in (0.5, 0.7, 0.85, 1.0))
+      and all(_ok(_s(r, tm=1.0, ptm=0.4), _A) is False for r in (0.5, 0.7, 0.85, 1.0)))
+check("...while the REWARD still weights TM where the scaffold makes it informative",
+      _sc(_s(0.5, tm=0.9), _A) > _sc(_s(0.5, tm=0.1), _A))
+check("pTM is the structural gate", _ok(_s(1.0, ptm=0.6), _A) is True
+      and _ok(_s(1.0, ptm=0.4), _A) is False)
+check("pLDDT remains a hard gate at every rate",
+      all(_ok(_s(r, plddt=0.5), _A) is False for r in (0.5, 0.7, 0.85, 1.0)))
+check("a missing pTM reads as failure rather than falling back to TM",
+      _ok({"plddt": 0.9, "tm": 0.99, "deg": 0.0, "rate": 0.5}, _A) is False)
+check("the bar does not depend on the reward's blend switch",
+      _ok(_s(1.0, tm=0.0, ptm=0.6), _Legacy) is True)
+
+# ------------------------------------------------- 22. the plateau rule
+# Validated against run 1's ACTUAL pooled reward series, r3..r11. The best row is r8 (which scores
+# round 7's policy); everything after it added drift and gave reward back.
+from src.round_summary import plateau as _pl
+
+_RUN1 = [1.2128, 1.2101, 1.2655, 1.2801, 1.2859, 1.3008, 1.2695, 1.2687, 1.2842]
+check("a plateau cannot be called before patience+2 rounds",
+      _pl(_RUN1[:3], 2)[0] is False and "need 4" in _pl(_RUN1[:3], 2)[1])
+check("patience=2 fires on run 1 only after r11", _pl(_RUN1[:8], 2)[0] is False
+      and _pl(_RUN1, 2)[0] is True)
+check("patience=1 fires a round earlier, after r10",
+      _pl(_RUN1[:7], 1)[0] is False and _pl(_RUN1[:8], 1)[0] is True)
+check("a still-rising series never fires",
+      _pl([1.0, 1.1, 1.2, 1.3, 1.4, 1.5], 2)[0] is False)
+check("the reason names the best round and the gap", "round(s) back" in _pl(_RUN1, 2)[1])
+check("align.pbs consults the rule and can be told not to act on it",
+      (lambda t: "--plateau" in t and "STOP_ON_PLATEAU" in t
+       and "PHASES//5/" in t)(open("scripts/align.pbs").read()))
+check("the exclusion window is read from config, not hardcoded to all history",
+      "ref_exclude_window" in open("scripts/align.pbs").read()
+      and "EXCL_FROM=$(( r - REF_WINDOW ))" in open("scripts/align.pbs").read())
 
 print(f"\n{checks - len(fails)}/{checks} checks pass")
 if fails:

@@ -77,14 +77,16 @@ def bins_for(d):
         return [], f"{type(e).__name__}: {e}"
 
 
-def print_by_bin(dirs_rows, cache=None):
+def print_by_bin(dirs_rows, cache=None, cache_src=None):
     """One block per mask rate, each a round-over-round curve."""
-    cache = cache or {}
-    per_round = []
+    cache, cache_src = cache or {}, cache_src or {}
+    per_round, srcs = [], {}
     for name, d in dirs_rows:
-        by, src = (cache[name], "cached") if name in cache else bins_for(d)
+        by, src = ((cache[name], cache_src.get(name, "cached")) if name in cache
+                   else bins_for(d))
         if by:
             per_round.append((name, by))
+            srcs[name] = src
         else:
             print(f"[bins] {name}: no per-bin data ({src})")
     if not per_round:
@@ -110,21 +112,43 @@ def print_by_bin(dirs_rows, cache=None):
             prev = r["reward"]
     print("\n[bins] Read the cold-start block against the others. If its reward curve is flat "
           "while the\n[bins] lower rates climb, the pooled gain is inpainting, not design.")
+    if any(src == "recomputed" for src in srcs.values()):
+        from src.preference import reward_formula
+        rr = [k for k, v in srcs.items() if v == "recomputed"]
+        print(f"[bins] RECOMPUTED rows use the CURRENT reward -- {reward_formula(CFG.align)} -- "
+              f"which is\n[bins] not necessarily the reward those rounds trained on. "
+              f"{len(rr)} row(s) here: {', '.join(sorted(rr)[:8])}"
+              + (" ..." if len(rr) > 8 else "")
+              + ".\n[bins] The pooled table above reads each round's own report.json and is "
+                "therefore historical;\n[bins] the two will disagree for any round predating a "
+                "reward change. That is not a bug in\n[bins] either -- it is the reward having "
+                "changed, which only this line makes visible.")
     print("[bins] TM vs pTM: TM is foldseek against the prompt's reference -- the RIGHT fold. pTM "
           "is\n[bins] ESMFold's own topology estimate, no reference involved. At rate 1.0 the "
           "prompt gives\n[bins] only the length, so TM is pinned at the unrelated-fold floor by "
-          "construction and pTM is\n[bins] the only one of the two that can move. Only TM is in "
-          "the reward.")
+          "construction and pTM is\n[bins] the only one of the two that can move -- which is why "
+          "the reward weights them by\n[bins] mask rate rather than using TM alone.")
 
 
 def main():
     sys.stdout.reconfigure(line_buffering=True)
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--dir", default=CFG.align.dir, help="directory holding round*/")
+    ap.add_argument("--plateau", type=int, default=None, metavar="PATIENCE",
+                    help="print 'STOP' or 'CONTINUE' for the chain loop and exit; the rule is "
+                         "that the best round is more than PATIENCE rounds back")
     ap.add_argument("--by-bin", action="store_true",
                     help="split every round by mask rate; recomputes from gen/folds/tm when "
                          "report.json predates by_bin (slower, reads the whole round)")
     a = ap.parse_args()
+
+    if a.plateau is not None:
+        series = reward_series(a.dir)
+        stop, why = plateau([v for _, v in series], a.plateau)
+        names = ", ".join(f"{k.replace('round', 'r')}={v:.4f}" for k, v in series[-5:])
+        print(f"[plateau] {'STOP' if stop else 'CONTINUE'} -- {why}")
+        print(f"[plateau] last rounds: {names or '<none scored>'}")
+        return
 
     dirs = sorted(glob_.glob(os.path.join(a.dir, "round*")),
                   key=lambda p: int(re.sub(r"\D", "", os.path.basename(p)) or 0))
@@ -156,21 +180,60 @@ def main():
     # --by-bin recomputes the whole round anyway, so when it runs it can also backfill pooled
     # pTM for rounds written before report.json carried it. Without it, those cells stay blank
     # rather than being silently filled with something that is not what the round measured.
-    bins_by_round = {}
+    bins_by_round, bin_src = {}, {}
     if a.by_bin:
         for d in dirs:
-            by, _ = bins_for(d)
+            by, src = bins_for(d)
             if by:
                 bins_by_round[os.path.basename(d)] = by
+                bin_src[os.path.basename(d)] = src
 
     if rows:
         print_pooled(rows, bins_by_round)
 
     if a.by_bin:
-        print_by_bin([(os.path.basename(d), d) for d in dirs], bins_by_round)
+        print_by_bin([(os.path.basename(d), d) for d in dirs], bins_by_round, bin_src)
 
     if len(rows) > 1:
         print_trend(rows)
+
+
+def plateau(rewards, patience=2):
+    """-> (stop, reason) from the reward series, oldest first.
+
+    THE RULE IS "THE BEST ROUND IS MORE THAN `patience` ROUNDS BACK", not a threshold on the last
+    increment. Run 1's increments were +0.055, +0.015, +0.006, +0.015, -0.031, -0.001: any
+    two-round threshold test either fires on the +0.006 (noise) or waits for both of the negatives.
+    Distance-from-the-best is monotone in evidence and needs no scale, which matters because the
+    round-to-round noise here is 0.014-0.026 and the real increments are 0.01-0.05 -- a plateau
+    simply cannot be called from two rounds. patience=2 is conservative; 1 is more aggressive.
+    """
+    if len(rewards) < patience + 2:
+        return False, (f"only {len(rewards)} round(s); need {patience + 2} before a plateau can "
+                       f"be called at patience={patience}")
+    best = max(range(len(rewards)), key=lambda i: rewards[i])
+    back = len(rewards) - 1 - best
+    if back > patience:
+        return True, (f"best reward {rewards[best]:.4f} was {back} round(s) back and nothing since "
+                      f"has beaten it (latest {rewards[-1]:.4f}); patience={patience}")
+    return False, (f"best reward {rewards[best]:.4f} is {back} round(s) back, within "
+                   f"patience={patience} (latest {rewards[-1]:.4f})")
+
+
+def reward_series(align_dir):
+    """Each round's pooled reward from its report.json, in round order. Rounds without one are
+    skipped: a round that has not been scored cannot argue either way."""
+    out = []
+    for d in sorted(glob_.glob(os.path.join(align_dir, "round*")),
+                    key=lambda p_: int(re.sub(r"\D", "", os.path.basename(p_)) or 0)):
+        rp = os.path.join(d, "report.json")
+        if not os.path.exists(rp):
+            continue
+        try:
+            out.append((os.path.basename(d), float(json.load(open(rp))["reward"])))
+        except Exception:
+            continue
+    return out
 
 
 def pooled_ptm(name, rep, bins_by_round):

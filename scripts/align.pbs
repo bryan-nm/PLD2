@@ -134,6 +134,20 @@ FOLD_STALL=${FOLD_STALL:-3}   # consecutive no-progress passes tolerated before 
 FOLD_BUDGET=${FOLD_BUDGET:-5400}
 # The tuner gets retries for the same reason folding does -- see the note at phase 5.
 TUNE_TRIES=${TUNE_TRIES:-2}
+# Reference exclusion window (config.py owns the default): how many PRECEDING rounds a
+# round's reference draw must avoid. See AlignCfg.ref_exclude_window for why it is not all
+# of history -- all-history caps a 10-round run at ~1,630 prompts out of a 22,610 split.
+REF_WINDOW=${REF_WINDOW:-$(python -c "from config import CFG; print(CFG.align.ref_exclude_window)")}
+# STOP WHEN IT HAS PLATEAUED. Run 1 spent rounds 9-11 adding +0.55 nats of drift -- 52% of
+# its total -- while reward went 1.3008 -> 1.2842, i.e. down. Stopping at the plateau is a
+# bigger drift intervention than any per-round knob, and it is free. Patience is in ROUNDS:
+# stop once the best round is more than this many rounds back. 2 is conservative because the
+# round-to-round noise is ~0.014-0.026 in reward; 1 is more aggressive.
+STOP_PATIENCE=${STOP_PATIENCE:-2}
+STOP_ON_PLATEAU=${STOP_ON_PLATEAU:-1}    # 0 = diagnose only, keep going
+# One extra round after the last tune, phases 0-4 only, so the FINAL policy gets a measured
+# row. Run 1 needed a separate submission for exactly this, on the round that most wanted it.
+MEASURE_FINAL=${MEASURE_FINAL:-1}
 
 # Recomputed per round: every path below is derived from it.
 set_round_paths() {
@@ -150,10 +164,13 @@ set_round_paths "${ROUND}"
 
 job_banner "PLD2 preference tuning, round ${ROUND}$([ "${ROUNDS}" -gt 1 ] && echo "..$((ROUND+ROUNDS-1))")" \
            ROUND ROUNDS N_PROMPTS N_GEN GAMMA LOSS ALPHA STEPS \
-           EPOCHS PROMPT_SEED REF_SPLIT PHASES PRUNE WALL_SECONDS TUNE_TRIES RDIR CKPT
+           EPOCHS PROMPT_SEED REF_SPLIT PHASES PRUNE WALL_SECONDS TUNE_TRIES \
+           REF_WINDOW STOP_PATIENCE STOP_ON_PLATEAU MEASURE_FINAL RDIR CKPT
 
 CKPT_FLAG=""; [ -n "${CKPT:-}" ] && CKPT_FLAG="--ckpt ${CKPT}"
-has() { [[ "${PHASES}" == *"$1"* ]]; }
+# PER-ROUND, so the appended measurement round can run 0-4 while the tuning rounds run 0-5.
+PHASES_R="${PHASES}"
+has() { [[ "${PHASES_R}" == *"$1"* ]]; }
 rc=0
 
 # PHASE TIMINGS, because the whole scaling decision rests on the fold rate and it has so far been
@@ -229,9 +246,19 @@ fold_loop() {                 # $1 = out jsonl, $2 = pdb dir, $3 = extra flags, 
 # ================================================================================================
 LAST_ROUND=$(( ROUND + ROUNDS - 1 ))
 CHAIN_LOG="${RDIR%/*}/chain.log"
-for (( r = ROUND; r <= LAST_ROUND; r++ )); do
+LOOP_LAST=$(( LAST_ROUND + (MEASURE_FINAL ? 1 : 0) ))
+for (( r = ROUND; r <= LOOP_LAST; r++ )); do
   set_round_paths "${r}"
   PROMPT_SEED_R=$(( PROMPT_SEED + r - ROUND ))
+  # THE APPENDED MEASUREMENT ROUND. Generate and score with the final policy, do not tune. The
+  # row a round prints describes the PREVIOUS round's policy, so without this the last policy the
+  # chain produces is the one policy nobody measured -- which in run 1 took a separate submission
+  # on the round that most wanted a number.
+  PHASES_R="${PHASES}"
+  if [ "${r}" -gt "${LAST_ROUND}" ]; then
+      PHASES_R="${PHASES//5/}"
+      echo "[chain] MEASUREMENT round ${r}: phases ${PHASES_R} on the final policy; no tuning."
+  fi
   FINAL_CKPT="${POLICY_DIR}/$(printf "${CHAIN_CKPT}" $(( STEPS - 1 )))"
 
   # RESUME. A finished round is one whose policy checkpoint exists; re-submitting after a walltime
@@ -298,7 +325,8 @@ if has 0 && [ "${PROMPTS_DONE}" -eq 0 ]; then
     # which is how a resume exited on "n_eval=200 but only 86 references". The missing [ -f ] test
     # below is what tolerates gaps, so scanning from 1 costs nothing when a round is absent.
     EXCL=""
-    for (( q = 1; q < r; q++ )); do
+    EXCL_FROM=$(( r - REF_WINDOW )); [ "${EXCL_FROM}" -lt 1 ] && EXCL_FROM=1
+    for (( q = EXCL_FROM; q < r; q++ )); do
         QDIR=$(python -c "from config import CFG; CFG.align.round=$q; print(CFG.align.round_dir)")
         [ -f "${QDIR}/refs.meta.jsonl" ] && EXCL="${EXCL}${EXCL:+:}${QDIR}/refs.meta.jsonl"
     done
@@ -450,6 +478,24 @@ fi
   fi
   printf '%s\troundtime=%ss\tckpt=%s\n' "round ${r}" "$(( SECONDS - ROUND_T0 ))" "${CKPT:-<base>}" \
       | tee -a "${CHAIN_LOG}"
+
+  # PLATEAU. Diagnosed every round and acted on only when STOP_ON_PLATEAU; the rule and the
+  # evidence for its shape are in src/round_summary.plateau(). Skipped on the measurement round,
+  # which has no tuning to stop.
+  if has 4 && [ "${r}" -le "${LAST_ROUND}" ]; then
+      PLAT=$(python -m src.round_summary --dir "${RDIR%/*}" --plateau "${STOP_PATIENCE}" 2>&1)
+      echo "${PLAT}"
+      if [ "${STOP_ON_PLATEAU}" -eq 1 ] && echo "${PLAT}" | grep -q "STOP"; then
+          echo "[chain] plateaued at round ${r}; stopping the chain here."\
+               "Every later round in run 1 bought drift and no reward."\
+               "Set STOP_ON_PLATEAU=0 to push past it."
+          if [ "${MEASURE_FINAL}" -eq 1 ]; then
+              LAST_ROUND=${r}; LOOP_LAST=$(( r + 1 ))      # still measure what we ended on
+          else
+              break
+          fi
+      fi
+  fi
 done
 # ================================================================================================
 

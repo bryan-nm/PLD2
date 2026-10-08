@@ -513,12 +513,40 @@ class AlignCfg:
     # The success criterion, measured: pLDDT > 70 AND TM > 0.5 to the ESMFolded query. TM is what
     # makes this safe to optimise -- a poly-alanine helix scores well on pLDDT and nowhere on TM, so
     # the degenerate solution is not on the reward's frontier.
+    # THE SUCCESS BAR IS REFERENCE-FREE: pLDDT > plddt_success AND pTM > ptm_success, at every
+    # mask rate. It answers "is this a well-formed protein", which is not the question the reward
+    # answers -- the reward ranks completions within one prompt and so still weights TM where the
+    # scaffold makes the target informative. At a mask rate of 0.85 with no guidance, a sequence
+    # that folds coherently into something OTHER than the reference has done the job: the
+    # reference is one sample from the folds compatible with that scaffold, not the only
+    # acceptable answer, and penalising the difference would be scoring memorisation.
     plddt_success: float = 0.70
+    ptm_success: float = 0.50
+    # Kept for the pre-run-2 reward (reward_blend=False) and for reading old logs. NOT used by
+    # succeeded() any more.
     tm_success: float = 0.50
     tm_field: str = "ttmscore"       # normalised by the TARGET, which is the natural query
-    # reward = w_plddt*pLDDT + w_tm*TM - w_deg*degeneracy, for RANKING only.
+    # reward = w_plddt*pLDDT + w_struct*[(1-rate)*TM + rate*pTM] - w_deg*degeneracy, RANKING only.
+    #
+    # WHY THE STRUCTURAL TERM IS SPLIT BY MASK RATE. TM is foldseek against the prompt's reference
+    # -- did it build the RIGHT fold. At a mask rate of 1.0 the prompt reveals only the length, so
+    # nothing links a generation to that reference and TM is pinned at the unrelated-fold floor:
+    # measured across eleven rounds it sat at 0.245-0.261, sd 0.006, while pLDDT went 0.449->0.728
+    # and pTM went 0.209->0.447. A third of every round's prompts were therefore ranked on
+    # pLDDT and degeneracy alone, with TM contributing noise.
+    #
+    # The weight IS the mask rate because the mask rate is the fraction of the structure the model
+    # is responsible for: weight the reference-free term by how much of the chain it wrote. The
+    # two weights sum to w_struct at every rate, so the reward stays on one scale across bins and
+    # min_gap keeps meaning the same thing.
+    #
+    # pTM ALSO HARDENS THE REWARD. The sampler sweep's no-gumbel configuration scored pLDDT 80.4
+    # against natural's 83.2 -- 97% of it -- with 91.1% LCR and 87.0% k13, while its pTM was 0.363
+    # against natural's 0.712. The degenerate decode that nearly fools pLDDT does not fool pTM.
     reward_plddt: float = 1.0
-    reward_tm: float = 1.0
+    reward_struct: float = 1.0
+    reward_blend: bool = True        # False -> the pre-run-2 reward, w_tm*TM at every rate
+    reward_tm: float = 1.0           # only read when reward_blend is False
     # DEGENERACY HAS TO BE IN THE REWARD, and round 1 is the measurement that says so. TM is the
     # half of the reward that cannot be gamed -- but only where TM carries signal, and at a mask
     # rate of 1.0 it does not: measured over 2,217 cold-start generations, TM's spread is sd 0.061
@@ -538,6 +566,15 @@ class AlignCfg:
     # generations eligible -- 25% of them have LCR exactly 0%. Clean samples were always there; the
     # ranking simply was not choosing them.
     deg_max_winner: float = 0.15
+    # REFERENCE EXCLUSION IS A WINDOW, NOT ALL HISTORY. Excluding every earlier round protects one
+    # thing: a round's gen row is meant to measure the previous policy on scaffolds it never
+    # trained on, and reusing an old round's references leaks that. Training diversity is NOT the
+    # concern -- the binding constraint there is pairs per round (~6,500 at 1.9 epochs), not
+    # scaffold novelty. So only the recent rounds need to be disjoint, and the budget arithmetic
+    # changes completely: all-history caps 10 rounds at ~1,630 prompts out of a 22,610-protein
+    # split, while a window of W needs only (W+1) x refs_needed(n) and so allows ~5,900 prompts at
+    # W=2 for any number of rounds. Past ~2,500 prompts the limit is generation time, not the pool.
+    ref_exclude_window: int = 2
     # max(LCR, k-mer repeat coverage): whichever detector fires. They see different things -- a
     # repeated 20-mer is INVISIBLE to LCR (it is longer than the SEG window) and reads 100% at k13.
     deg_kmer_k: int = 13
