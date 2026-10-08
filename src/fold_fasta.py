@@ -248,6 +248,7 @@ def summarize(out_path, ocfg, partial=False, world=None):
     # pLDDT with 66% of samples over 70, and 98.7% of its residues inside a repeated 13-mer. On
     # pLDDT alone that reads as a 34-point win. Rows are flagged against the `natural` row's own
     # k-mer rate where it exists, so the bar is what real proteins do rather than a guess.
+    stale = set()
     nat = groups.get("natural")
     ref = (kmer_fractions(kmer_counts([r["seq"] for r in nat if "seq" in r], ks))[ks[0]]["rep_frac"]
            if nat else 0.01)
@@ -263,6 +264,11 @@ def summarize(out_path, ocfg, partial=False, world=None):
         kf = kmer_fractions(kmer_counts(seqs, ks))
         row = "".join(f"{kf[k]['rep_frac']:>7.1%} " for k in ks)
         flag = "  <-- DEGENERATE" if kf[ks[0]]['rep_frac'] > limit else ""
+        # A group none of whose records came from this job is a carry-over: its numbers describe
+        # whatever model wrote them, which on a sweep against a new checkpoint is the OLD one.
+        if not any(r.get("run") == _run_id() for r in g):
+            flag += "  <-- EARLIER RUN"
+            stale.add(name)
         print(f"{name:<26} {n:>5} {100.0 * sum(r['plddt'] for r in g) / n:>7.1f} "
               f"{sum(1 for r in g if r['plddt'] > ocfg.plddt_confident) / n:>5.0%} "
               f"{sum(r['ptm'] for r in g) / n:>7.3f} "
@@ -273,6 +279,13 @@ def summarize(out_path, ocfg, partial=False, world=None):
     print("Read every step row against the 'natural' and 'shuffled' rows (src.make_baselines): "
           "natural is the ceiling, shuffled the composition-matched floor. A step whose pLDDT sits "
           "at or below shuffled has learned composition and not structure.", flush=True)
+    if stale:
+        print(f"EARLIER RUN marks {len(stale)} group(s) with no record from this job "
+              f"({_run_id()}): {', '.join(sorted(stale)[:6])}"
+              + (" ..." if len(stale) > 6 else "")
+              + ".\nThose rows describe whichever checkpoint generated them, NOT the one this job "
+                "ran. Re-generate a configuration to refresh it; folding alone will skip it, "
+                "because scoring is keyed on sequence content.", flush=True)
     print(f"DEGENERATE marks k{ks[0]} repeat coverage above {limit:.1%} "
           f"({'5x the natural row' if nat else 'absolute fallback'}): repetitive sequences fold "
           f"CONFIDENTLY, so a high pLDDT there is the metric being gamed, not a better model. Also "
@@ -591,9 +604,15 @@ def fold_all(todo, scorer, out_path, ocfg, t0, tag="", pdb_dir=None, rank=0, pdb
             else:
                 r = scorer.score([seq], num_sampling_steps=ocfg.fold_steps,
                                  num_loops=ocfg.fold_loops)
+            # STAMP THE JOB. Scoring is skipped on content, which is right for resuming but
+            # means a row can be carried over from whatever checkpoint produced it -- a sweep
+            # against a new checkpoint still prints rows for every configuration it did NOT
+            # regenerate, indistinguishable from the fresh ones. One field makes summarize() able
+            # to say which is which. Records written before this field existed read as "earlier",
+            # which is the right answer for them.
             fh.write(json.dumps({"id": sid, "length": len(seq), "seq": seq,
                                  "plddt": r.per_sequence_plddt[0],
-                                 "ptm": r.per_sequence_ptm[0]}) + "\n")
+                                 "ptm": r.per_sequence_ptm[0], "run": _run_id()}) + "\n")
             # Flush AND fsync every record. A GPU fault aborts the process outright -- no atexit, no
             # buffer drain -- so anything still in userspace or the page cache is simply lost.
             fh.flush()

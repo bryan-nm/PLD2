@@ -948,6 +948,39 @@ check("the record count is taken from the caller, not re-read",
       "n_recs=len(recs)" in open("src/fold_fasta.py").read())
 _sh.rmtree(_fd, ignore_errors=True)
 
+# A SWEEP AGAINST A NEW CHECKPOINT STILL PRINTS ROWS FOR EVERY CONFIGURATION IT DID NOT
+# REGENERATE, because scoring is skipped on sequence content. Job 8913824 wrote 18 FASTAs and
+# folded 45: the 27 carried-over ones -- every filip row -- described the pre-alignment model and
+# read as a guidance study of the aligned one. The run stamp is what makes that visible.
+_fd2 = _tf.mkdtemp(prefix="pld2run")
+_fb2 = _os.path.join(_fd2, "folds.jsonl")
+_os.environ["PBS_JOBID"] = "now.aurora"
+with open(f"{_fb2[:-6]}.rank000.jsonl", "w") as _fh:
+    for _grp, _run in (("fresh", "now.aurora"), ("old", "before.aurora"), ("legacy", None)):
+        for _i in range(3):
+            _rec = {"id": f"{_grp}|s{_i}", "length": 20, "seq": "ACDEFGHIKLMNPQRSTVWY",
+                    "plddt": 0.6, "ptm": 0.4}
+            if _run:
+                _rec["run"] = _run
+            _fh.write(_json.dumps(_rec) + "\n")
+
+import io as _io
+import contextlib as _ctx
+from src.fold_fasta import summarize as _summ
+
+_buf = _io.StringIO()
+with _ctx.redirect_stdout(_buf):
+    _summ(_fb2, _CFG.opt)
+_txt = _buf.getvalue()
+_line = lambda nm: next(l for l in _txt.splitlines() if l.startswith(nm))
+check("a group folded by THIS job is not marked", "EARLIER RUN" not in _line("fresh"))
+check("a group from another job IS marked", "EARLIER RUN" in _line("old"))
+check("...as is one predating the run stamp entirely", "EARLIER RUN" in _line("legacy"))
+check("...and the footer names them and says folding alone will not refresh them",
+      "EARLIER RUN marks 2 group(s)" in _txt and "keyed on sequence content" in _txt)
+check("fold records carry the run stamp", '"run": _run_id()' in open("src/fold_fasta.py").read())
+_sh.rmtree(_fd2, ignore_errors=True)
+
 # round_summary must NAME a round it is dropping. A round run with PHASES=012 has no report.json,
 # and silently omitting it makes the table look identical to the previous run's.
 _rs = open("src/round_summary.py").read()
