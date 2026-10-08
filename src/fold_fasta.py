@@ -193,7 +193,35 @@ def done_pairs(base):
     return {(r["id"], r.get("seq", "")) for r in read_records(base) if "id" in r}
 
 
-def summarize(out_path, ocfg, partial=False):
+def coverage(out_path, world=None, n_recs=None):
+    """One line saying what a table is built from: records, rank files, ranks reported.
+
+    WITHOUT THIS A TABLE CANNOT BE AUDITED FROM THE LOG. Twelve ranks share one stdout, so a
+    rank's "scored N sequence(s)" can land after rank 0's final table even when every record was
+    already on disk -- which reads as the summary having been printed before folding finished.
+    Stating the count, the number of shards it globbed, and how many ranks posted their done
+    sentinel makes the question answerable instead of inferrable.
+    """
+    paths = result_paths(out_path)
+    # n_recs comes from the caller, which has already read them -- re-reading a round's worth of
+    # JSONL to print its own length is the kind of thing that turns a summary into a phase.
+    n = len(read_records(out_path)) if n_recs is None else n_recs
+    msg = f"{n:,} record(s) from {len(paths)} file(s)"
+    if world and world > 1:
+        done = 0
+        for r in range(world):
+            try:
+                with open(done_path(out_path, r)) as f:
+                    done += int(f.read().strip() == _run_id())
+            except OSError:
+                pass
+        msg += f", {done}/{world} rank(s) reported done"
+        if done < world:
+            msg += "  <- INCOMPLETE"
+    return msg
+
+
+def summarize(out_path, ocfg, partial=False, world=None):
     recs = read_records(out_path)
     if not recs:
         print(f"[fold] {out_path}: nothing scored yet", flush=True)
@@ -213,6 +241,8 @@ def summarize(out_path, ocfg, partial=False):
     if partial:
         print("\n[fold] PARTIAL -- other ranks are still folding; the final table follows when "
               "they finish.", flush=True)
+    print(f"[fold] {'partial' if partial else 'final'} table: "
+          f"{coverage(out_path, world, n_recs=len(recs))}", flush=True)
     # Degeneracy reference. A repetitive sequence folds CONFIDENTLY -- ESMFold is happy with simple
     # repeats -- so the highest-pLDDT row can be the worst one. Measured: a configuration scored 69.0
     # pLDDT with 66% of samples over 70, and 98.7% of its residues inside a repeated 13-mer. On
@@ -702,7 +732,7 @@ def main():
             # Only rank 0 prints the table; every rank's records are in it, because summarize()
             # globs all the per-rank files. Twelve copies of the same table would bury the log.
             if rank == 0:
-                summarize(args.out, ocfg, partial=(world > 1))
+                summarize(args.out, ocfg, partial=(world > 1), world=world)
         if not args.watch:
             break
         if args.max_idle and time.perf_counter() - last_progress > args.max_idle:
@@ -720,9 +750,9 @@ def main():
             print(f"[fold] waiting for {world} rank(s) to finish before the final table...",
                   flush=True)
             if not wait_for_ranks(args.out, world):
-                print(f"[fold] WARNING: not all ranks reported; the table below is INCOMPLETE.",
+                print("[fold] WARNING: not all ranks reported; the table below is INCOMPLETE.",
                       flush=True)
-        summarize(args.out, ocfg)
+        summarize(args.out, ocfg, world=world)
     if dev.type == "xpu" and rank == 0:
         print(xpu_linalg_guard.report("[fold]"), flush=True)
 

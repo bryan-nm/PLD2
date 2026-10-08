@@ -920,6 +920,40 @@ check("report.json carries by_bin so future rounds need no recompute",
 check("round_summary can split by bin without report.json",
       "not rows and not a.by_bin" in open("src/round_summary.py").read())
 
+# ------------------------------------------------- 20. a fold table that can be audited
+# TWELVE RANKS SHARE ONE STDOUT. A rank's "scored N sequence(s)" can land after rank 0's final
+# table even when every record was already on disk, which reads as the summary having been printed
+# before folding finished. coverage() makes the question answerable from the log instead.
+import tempfile as _tf
+
+from src.fold_fasta import coverage as _cov, mark_done as _md
+
+_fd = _tf.mkdtemp(prefix="pld2cov")
+_fb = _os.path.join(_fd, "folds.jsonl")
+for _r in range(3):
+    with open(f"{_fb[:-6]}.rank{_r:03d}.jsonl", "w") as _fh:
+        for _i in range(4):
+            _fh.write(_json.dumps({"id": f"g|s{_r}_{_i}", "length": 9, "seq": "A" * 9,
+                                   "plddt": 0.8, "ptm": 0.7}) + "\n")
+check("coverage counts records across every rank shard", "12 record(s) from 3 file(s)" in _cov(_fb))
+check("...and flags a table whose ranks have not all reported",
+      "0/3 rank(s) reported done" in _cov(_fb, world=3) and "INCOMPLETE" in _cov(_fb, world=3))
+_md(_fb, 0); _md(_fb, 1)
+check("...and counts partial completion honestly", "2/3" in _cov(_fb, world=3))
+_md(_fb, 2)
+_all = _cov(_fb, world=3)
+check("...and stops warning once every rank is in", "3/3" in _all and "INCOMPLETE" not in _all)
+check("single-rank runs say nothing about ranks", "rank(s) reported" not in _cov(_fb))
+check("the record count is taken from the caller, not re-read",
+      "n_recs=len(recs)" in open("src/fold_fasta.py").read())
+_sh.rmtree(_fd, ignore_errors=True)
+
+# round_summary must NAME a round it is dropping. A round run with PHASES=012 has no report.json,
+# and silently omitting it makes the table look identical to the previous run's.
+_rs = open("src/round_summary.py").read()
+check("round_summary explains an omitted round instead of dropping it",
+      "no report.json --" in _rs and "PHASES=" in _rs)
+
 print(f"\n{checks - len(fails)}/{checks} checks pass")
 if fails:
     print("FAILURES:")

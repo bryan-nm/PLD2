@@ -12,10 +12,14 @@ if [ ! -f config.py ] || [ ! -d src ]; then
 fi
 
 module load frameworks          # torch + oneCCL (NOT ipex: image 26.181.0 dropped it, see ipex_shim)
-# Create once: python -m venv --system-site-packages, then
-#   pip install -r requirements-aurora.txt    <- the two Biohub forks folding needs
-# and confirm with `python -m src.env_check --deep` BEFORE spending a queue slot.
-PLD2_VENV=${PLD2_VENV:-/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env}
+# Create once: python -m venv --system-site-packages, activate it, then run
+#   scripts/aurora_env.sh
+# which installs the deps and ends in `env_check --deep`. Do that BEFORE spending a queue slot.
+# DEFAULT TO THE ENV THAT WORKS UNDER THE CURRENT IMAGE. This used to name ProLoopDiff-env,
+# which was built against frameworks 2025.3.1 and cannot import torch under 26.181.0 -- so
+# every submission that forgot PLD2_VENV died in env_preflight with a missing libmkl, which
+# reads as "the script ignored my arguments" because the banner never gets to print them.
+PLD2_VENV=${PLD2_VENV:-/flare/NLDesignProtein/bryan/envs/ProLoopDiff-env-2026.09}
 # shellcheck disable=SC1091
 source "${PLD2_VENV}/bin/activate"
 
@@ -67,8 +71,7 @@ PYEOF
         echo "      module load frameworks"
         echo "      python -m venv --system-site-packages <NEW_ENV>"
         echo "      source <NEW_ENV>/bin/activate"
-        echo "      pip install 'transformers>=4.57' biopython biotite cloudpathlib"
-        echo "      pip install --no-deps esm"
+        echo "      scripts/aurora_env.sh     # installs the deps and runs env_check --deep"
         echo "  then re-run with PLD2_VENV=<NEW_ENV>. Keep the old env until the new one works."
         echo '  python -m src.env_check --deep  reports exactly which phases survive.' 
     } >&2

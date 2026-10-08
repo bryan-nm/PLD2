@@ -129,6 +129,21 @@ def main():
     dirs = sorted(glob_.glob(os.path.join(a.dir, "round*")),
                   key=lambda p: int(re.sub(r"\D", "", os.path.basename(p)) or 0))
     rows = [(os.path.basename(d), load(d)) for d in dirs]
+    # SAY WHICH ROUNDS ARE BEING LEFT OUT, AND WHY. report.json is written by phase 4, so a round
+    # run with PHASES=012 has generations and folds on disk and no row here -- and the table then
+    # looks identical to the previous run's, which reads as "the summary ignored my new round".
+    for name, r in rows:
+        if r.get("rep"):
+            continue
+        d = os.path.join(a.dir, name)
+        has_gen = bool(glob_.glob(os.path.join(d, "gen.rank*.jsonl")))
+        has_tm = bool(glob_.glob(os.path.join(d, "tm.rank*.jsonl")))
+        why = ("phase 4 (pairs) has not run" if has_gen and has_tm else
+               "phase 3 (tm) has not run either" if has_gen else
+               "no generations on disk")
+        print(f"[rounds] {name}: no report.json -- {why}. "
+              f"Re-run that round with PHASES={'4' if has_tm else '34'} to score it; "
+              f"phases 0-2 are already on disk and will be skipped.")
     rows = [(n, r) for n, r in rows if r.get("rep")]
     if not rows and not a.by_bin:
         raise SystemExit(f"no round*/report.json under {a.dir}. Rounds written before "
